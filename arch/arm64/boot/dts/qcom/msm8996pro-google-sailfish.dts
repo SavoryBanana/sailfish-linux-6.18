@@ -1,0 +1,182 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (c) 2026, Linux Android Porting Team
+ * Device Tree Source for Google Pixel (sailfish) - MSM8996 Pro
+ */
+
+/dts-v1/;
+
+#include "msm8996pro.dtsi"
+#include "pm8994.dtsi"
+#include "pmi8994.dtsi"
+#include "pmi8996.dtsi"
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
+
+/ {
+	model = "Google Pixel (Sailfish)";
+	compatible = "google,sailfish", "qcom,msm8996pro", "qcom,msm8996";
+	chassis-type = "handset";
+	qcom,msm-id = <420 0x10001>, <421 0x10001>;
+	qcom,board-id = <0x80 0>, <3 0>;
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		stdout-path = "serial0:115200n8";
+
+		framebuffer0: framebuffer@c0001000 {
+			compatible = "simple-framebuffer";
+			reg = <0x0 0xc0001000 0x0 (1080 * 1920 * 4)>;
+			width = <1080>;
+			height = <1920>;
+			stride = <(1080 * 4)>;
+			format = "a8r8g8b8";
+
+			/* DSI0 and MDP SMMU clocks */
+			clocks = <&mmcc MDSS_MDP_CLK>,
+				 <&mmcc MMSS_MMAGIC_AHB_CLK>,
+				 <&mmcc MDSS_AHB_CLK>,
+				 <&mmcc MDSS_AXI_CLK>,
+				 <&mmcc MMSS_MISC_AHB_CLK>,
+				 <&mmcc MDSS_BYTE0_CLK>,
+				 <&mmcc MDSS_PCLK0_CLK>,
+				 <&mmcc MDSS_ESC0_CLK>,
+				 <&mmcc SMMU_MDP_AHB_CLK>,
+				 <&mmcc SMMU_MDP_AXI_CLK>;
+
+			power-domains = <&mmcc MDSS_GDSC>;
+		};
+	};
+
+	aliases {
+		serial0 = &blsp2_uart2;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		cont_splash_mem: memory@c0001000 {
+			reg = <0x0 0xc0001000 0x0 0x31ff000>;
+			no-map;
+		};
+
+		ramoops@83500000 {
+			compatible = "ramoops";
+			reg = <0x0 0x83500000 0x0 0x100000>;
+			record-size = <0x8000>;
+			console-size = <0x80000>;
+			pmsg-size = <0x40000>;
+			ftrace-size = <0x20000>;
+		};
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		key-vol-up {
+			label = "Volume Up";
+			gpios = <&pm8994_gpios 2 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_VOLUMEUP>;
+			wakeup-source;
+			debounce-interval = <15>;
+		};
+	};
+};
+
+/* Keep native display drivers disabled during early bringup so simplefb works */
+&mdp_smmu {
+	status = "disabled";
+};
+
+&mdss {
+	status = "disabled";
+};
+
+&blsp2_uart2 {
+	status = "okay";
+};
+
+&ufshc {
+	vcc-supply = <&vreg_l20a_2p95>;
+	vccq-supply = <&vreg_l25a_1p2>;
+	vccq2-supply = <&vreg_s4a_1p8>;
+	vdd-hba-supply = <&vreg_l25a_1p2>;
+
+	vcc-max-microamp = <600000>;
+	vccq-max-microamp = <450000>;
+	vccq2-max-microamp = <450000>;
+
+	status = "okay";
+};
+
+&ufsphy {
+	status = "okay";
+	vdda-phy-supply = <&vreg_l28a_0p925>;
+	vdda-pll-supply = <&vreg_l12a_1p8>;
+};
+
+&usb3 {
+	status = "okay";
+};
+
+&usb3_dwc3 {
+	dr_mode = "peripheral";
+	maximum-speed = "high-speed";
+	phys = <&hsusb_phy1>;
+	phy-names = "usb2-phy";
+	snps,is-utmi-l1-suspend;
+	snps,usb2-gadget-lpm-disable;
+};
+
+&hsusb_phy1 {
+	status = "okay";
+	vdda-pll-supply = <&vreg_l12a_1p8>;
+	vdda-phy-dpdm-supply = <&vreg_l24a_3p075>;
+};
+
+&rpm_requests {
+	regulators-0 {
+		compatible = "qcom,rpm-pm8994-regulators";
+
+		vreg_s4a_1p8: s4 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-always-on;
+		};
+
+		vreg_l12a_1p8: l12 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+		};
+
+		vreg_l20a_2p95: l20 {
+			regulator-min-microvolt = <2950000>;
+			regulator-max-microvolt = <2950000>;
+			regulator-allow-set-load;
+		};
+
+		vreg_l24a_3p075: l24 {
+			regulator-min-microvolt = <3075000>;
+			regulator-max-microvolt = <3075000>;
+		};
+
+		vreg_l25a_1p2: l25 {
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+			regulator-allow-set-load;
+		};
+
+		vreg_l28a_0p925: l28 {
+			regulator-min-microvolt = <925000>;
+			regulator-max-microvolt = <925000>;
+			regulator-allow-set-load;
+		};
+	};
+};
+
