@@ -61,7 +61,7 @@ sudo apt install -y build-essential bison flex libssl-dev libelf-dev bc clang ll
 To build the kernel `Image.gz`, compile the DTB, build the minimal test ramdisk, and package `out/boot.img`:
 
 ```bash
-./tools/build.sh
+./tools/sailfish/build.sh
 ```
 
 The script will automatically shallow-clone `android17-6.18` from Google's Android Common Kernel if not already present, apply the device tree and configs, compile with Clang 22 (`LLVM=1`), and produce:
@@ -78,7 +78,7 @@ This method tests booting directly from RAM without modifying your existing part
    * Power off, then hold **Volume Down + Power**.
 3. Run:
    ```bash
-   ./tools/test_boot.sh
+   ./tools/sailfish/test_boot.sh
    ```
    *(Or run manually: `fastboot boot out/boot.img`)*
 
