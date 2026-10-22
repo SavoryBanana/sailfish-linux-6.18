@@ -2,12 +2,12 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+KERNEL_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-BOOT_IMG="$PROJECT_DIR/out/boot.img"
+BOOT_IMG="$KERNEL_DIR/out/boot.img"
 
 if [ ! -f "$BOOT_IMG" ]; then
-    echo "Error: $BOOT_IMG not found. Run build first."
+    echo "Error: $BOOT_IMG not found. Run ./tools/sailfish/build.sh first."
     exit 1
 fi
 
@@ -30,4 +30,3 @@ echo "Boot image transferred! Watch the phone screen."
 echo "If the phone reboots, you can extract the ramoops log with:"
 echo "  fastboot oem ramoops"
 echo "=============================================="
-
