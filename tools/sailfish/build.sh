@@ -27,14 +27,23 @@ if [ ! -f "$OUT_DIR/initramfs.cpio.gz" ] || [ "$SCRIPT_DIR/init.c" -nt "$OUT_DIR
     (cd "$OUT_DIR/initramfs_root" && find . | cpio -o -H newc | gzip -9 > "$OUT_DIR/initramfs.cpio.gz")
 fi
 
-echo "=== 4. Packaging Image.lz4-dtb ==="
+echo "=== 4. Packaging Qualcomm Device Tree Table (QCDT dt.img) ==="
 cp "$KERNEL_DIR/arch/arm64/boot/dts/qcom/msm8996pro-google-sailfish.dtb" "$OUT_DIR/msm8996pro-google-sailfish.dtb"
+
+python3 "$SCRIPT_DIR/dtbtool.py" \
+  -o "$OUT_DIR/dt.img" \
+  -s 4096 \
+  -p "$KERNEL_DIR/scripts/dtc/" \
+  -3 \
+  "$OUT_DIR/"
+
 cat "$KERNEL_DIR/arch/arm64/boot/Image.lz4" "$OUT_DIR/msm8996pro-google-sailfish.dtb" > "$OUT_DIR/Image.lz4-dtb"
 
 echo "=== 5. Packaging boot.img ==="
 python3 "$SCRIPT_DIR/mkbootimg.py" \
-  --kernel "$OUT_DIR/Image.lz4-dtb" \
+  --kernel "$KERNEL_DIR/arch/arm64/boot/Image.lz4" \
   --ramdisk "$OUT_DIR/initramfs.cpio.gz" \
+  --dt "$OUT_DIR/dt.img" \
   --base 0x80000000 \
   --kernel_offset 0x00080000 \
   --ramdisk_offset 0x02800000 \

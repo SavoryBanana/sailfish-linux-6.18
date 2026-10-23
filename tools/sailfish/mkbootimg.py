@@ -116,6 +116,7 @@ def write_header(args):
     args.output.write(pack('8s', BOOT_MAGIC))
     final_ramdisk_offset = (args.base + args.ramdisk_offset) if filesize(args.ramdisk) > 0 else 0
     final_second_offset = (args.base + args.second_offset) if filesize(args.second) > 0 else 0
+    dt_size = filesize(args.dt) if hasattr(args, 'dt') and args.dt else args.header_version
     args.output.write(pack(
         '10I',
         filesize(args.kernel),                          # size in bytes
@@ -126,7 +127,7 @@ def write_header(args):
         final_second_offset,                            # physical load addr
         args.base + args.tags_offset,                   # physical addr for kernel tags
         args.pagesize,                                  # flash page size we assume
-        args.header_version,                            # version of bootimage header
+        dt_size,                                        # dt_size in bytes / header_version
         (args.os_version << 11) | args.os_patch_level)) # os version and patch level
     args.output.write(pack('16s', args.board.encode())) # asciiz product name
     args.output.write(pack('512s', args.cmdline[:512].encode()))
@@ -140,6 +141,8 @@ def write_header(args):
         update_sha(sha, args.recovery_dtbo)
     if args.header_version > 1:
         update_sha(sha, args.dtb)
+    if hasattr(args, 'dt') and args.dt:
+        update_sha(sha, args.dt)
 
     img_id = pack('32s', sha.digest())
 
@@ -231,6 +234,7 @@ def parse_cmdline():
     parser.add_argument('--ramdisk', help='path to the ramdisk', type=FileType('rb'))
     parser.add_argument('--second', help='path to the 2nd bootloader', type=FileType('rb'))
     parser.add_argument('--dtb', help='path to dtb', type=FileType('rb'))
+    parser.add_argument('--dt', help='path to Qualcomm dt.img', type=FileType('rb'))
     recovery_dtbo_group = parser.add_mutually_exclusive_group()
     recovery_dtbo_group.add_argument('--recovery_dtbo', help='path to the recovery DTBO',
                                      type=FileType('rb'))
@@ -279,6 +283,8 @@ def write_data(args, pagesize):
         write_padded_file(args.output, args.recovery_dtbo, pagesize)
     if args.header_version == 2:
         write_padded_file(args.output, args.dtb, pagesize)
+    if hasattr(args, 'dt') and args.dt:
+        write_padded_file(args.output, args.dt, pagesize)
 
 
 def write_vendor_boot_data(args):
