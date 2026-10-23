@@ -8,9 +8,6 @@ cd "$KERNEL_DIR"
 OUT_DIR="$KERNEL_DIR/out"
 mkdir -p "$OUT_DIR"
 
-# Ensure custom tools are in PATH
-export PATH="$KERNEL_DIR/tools/bin:$PATH"
-
 echo "=== 1. Configuring Kernel (sailfish_defconfig) ==="
 if [ ! -f "$KERNEL_DIR/.config" ]; then
     make sailfish_defconfig ARCH=arm64 LLVM=1
@@ -19,15 +16,37 @@ fi
 echo "=== 2. Building Kernel Image & DTB ==="
 make -j$(nproc) ARCH=arm64 LLVM=1 Image qcom/msm8996pro-google-sailfish.dtb
 
-echo "=== 3. Compressing Kernel with Standard LZ4 Frame ==="
-# Stock Google Pixel aboot expects standard LZ4 frame (magic 0x184D2204)
-"$KERNEL_DIR/tools/bin/lz4" -12 --favor-decSpeed -f "$KERNEL_DIR/arch/arm64/boot/Image" "$OUT_DIR/Image.lz4"
-
-echo "=== 4. Packaging Appended DTB (Image.lz4-dtb) ==="
+echo "=== 3. Packaging Appended DTB (Image-dtb with Qualcomm 0x2C Offset) ==="
 cp "$KERNEL_DIR/arch/arm64/boot/dts/qcom/msm8996pro-google-sailfish.dtb" "$OUT_DIR/msm8996pro-google-sailfish.dtb"
-cat "$OUT_DIR/Image.lz4" "$OUT_DIR/msm8996pro-google-sailfish.dtb" > "$OUT_DIR/Image.lz4-dtb"
 
-echo "=== 5. Building Minimal Bring-up initramfs ==="
+python3 -c "
+import struct
+
+with open('$KERNEL_DIR/arch/arm64/boot/Image', 'rb') as f:
+    kdata = bytearray(f.read())
+
+with open('$OUT_DIR/msm8996pro-google-sailfish.dtb', 'rb') as f:
+    dtbdata = f.read()
+
+# Pad kernel to page boundary
+pad = 4096 - (len(kdata) % 4096)
+if pad != 4096:
+    kdata += b'\x00' * pad
+
+dtb_offset = len(kdata)
+
+# Write dtb_offset at 0x2C (Qualcomm LK DTB_OFFSET macro)
+struct.pack_into('<I', kdata, 0x2C, dtb_offset)
+
+image_dtb = kdata + dtbdata
+
+with open('$OUT_DIR/Image-dtb', 'wb') as f:
+    f.write(image_dtb)
+
+print(f'[+] Created Image-dtb ({len(image_dtb)} bytes, DTB at offset {dtb_offset:#x})')
+"
+
+echo "=== 4. Building Minimal Bring-up initramfs ==="
 if [ ! -f "$OUT_DIR/initramfs.cpio.gz" ] || [ "$SCRIPT_DIR/init.c" -nt "$OUT_DIR/initramfs.cpio.gz" ]; then
     mkdir -p "$OUT_DIR/initramfs_root"
     clang -target aarch64-linux-gnu -static -O2 "$SCRIPT_DIR/init.c" -o "$OUT_DIR/initramfs_root/init"
@@ -35,9 +54,9 @@ if [ ! -f "$OUT_DIR/initramfs.cpio.gz" ] || [ "$SCRIPT_DIR/init.c" -nt "$OUT_DIR
     (cd "$OUT_DIR/initramfs_root" && find . | cpio -o -H newc | gzip -9 > "$OUT_DIR/initramfs.cpio.gz")
 fi
 
-echo "=== 6. Packaging boot.img (Stock Header & Offsets) ==="
+echo "=== 5. Packaging boot.img (Stock Header & Offsets) ==="
 python3 "$SCRIPT_DIR/mkbootimg.py" \
-  --kernel "$OUT_DIR/Image.lz4-dtb" \
+  --kernel "$OUT_DIR/Image-dtb" \
   --ramdisk "$OUT_DIR/initramfs.cpio.gz" \
   --base 0x80000000 \
   --kernel_offset 0x00008000 \
