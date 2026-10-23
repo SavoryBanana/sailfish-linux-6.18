@@ -22,25 +22,27 @@
 	qcom,board-id = <0x80 0>, <3 0>;
 	qcom,pmic-id = <0x20009 0x10013 0x0 0x0>;
 
+	/* 4GB LPDDR4 physical memory map */
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x0 0x80000000>,
+		      <0x1 0x00000000 0x0 0x7e550000>;
+	};
+
 	chosen {
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
 
-		stdout-path = "serial0:115200n8";
-
-		framebuffer0: framebuffer@c0000000 {
+		framebuffer0: framebuffer@83401000 {
 			compatible = "simple-framebuffer";
-			reg = <0x0 0xc0000000 0x0 (1080 * 1920 * 4)>;
+			reg = <0x0 0x83401000 0x0 (1080 * 1920 * 4)>;
 			width = <1080>;
 			height = <1920>;
 			stride = <(1080 * 4)>;
 			format = "a8r8g8b8";
+			memory-region = <&cont_splash_mem>;
 		};
-	};
-
-	aliases {
-		serial0 = &blsp2_uart2;
 	};
 
 	reserved-memory {
@@ -48,8 +50,8 @@
 		#size-cells = <2>;
 		ranges;
 
-		cont_splash_mem: memory@c0000000 {
-			reg = <0x0 0xc0000000 0x0 0x3200000>;
+		cont_splash_mem: memory@83401000 {
+			reg = <0x0 0x83401000 0x0 0x3100000>;
 			no-map;
 		};
 
@@ -76,6 +78,16 @@
 	};
 };
 
+&soc {
+	watchdog@9830000 {
+		compatible = "qcom,kpss-wdt";
+		reg = <0x0 0x09830000 0x0 0x1000>;
+		clocks = <&sleep_clk>;
+		interrupts = <GIC_SPI 0 IRQ_TYPE_EDGE_RISING>;
+		timeout-sec = <30>;
+	};
+};
+
 /* Keep native display drivers disabled during early bringup so simplefb works */
 &mdp_smmu {
 	status = "disabled";
@@ -86,7 +98,7 @@
 };
 
 &blsp2_uart2 {
-	status = "okay";
+	status = "disabled";
 };
 
 &ufshc {

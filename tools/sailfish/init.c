@@ -13,6 +13,11 @@ void print_msg(const char *msg) {
         write(fd, msg, strlen(msg));
         close(fd);
     }
+    int tfd = open("/dev/tty0", O_WRONLY);
+    if (tfd >= 0) {
+        write(tfd, msg, strlen(msg));
+        close(tfd);
+    }
     int kfd = open("/dev/kmsg", O_WRONLY);
     if (kfd >= 0) {
         write(kfd, msg, strlen(msg));
