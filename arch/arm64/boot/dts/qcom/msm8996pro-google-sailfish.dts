@@ -20,6 +20,7 @@
 	chassis-type = "handset";
 	qcom,msm-id = <420 0x10001>, <421 0x10001>;
 	qcom,board-id = <0x80 0>, <3 0>;
+	qcom,pmic-id = <0x20009 0x10013 0x0 0x0>;
 
 	chosen {
 		#address-cells = <2>;
@@ -28,27 +29,13 @@
 
 		stdout-path = "serial0:115200n8";
 
-		framebuffer0: framebuffer@c0001000 {
+		framebuffer0: framebuffer@c0000000 {
 			compatible = "simple-framebuffer";
-			reg = <0x0 0xc0001000 0x0 (1080 * 1920 * 4)>;
+			reg = <0x0 0xc0000000 0x0 (1080 * 1920 * 4)>;
 			width = <1080>;
 			height = <1920>;
 			stride = <(1080 * 4)>;
 			format = "a8r8g8b8";
-
-			/* DSI0 and MDP SMMU clocks */
-			clocks = <&mmcc MDSS_MDP_CLK>,
-				 <&mmcc MMSS_MMAGIC_AHB_CLK>,
-				 <&mmcc MDSS_AHB_CLK>,
-				 <&mmcc MDSS_AXI_CLK>,
-				 <&mmcc MMSS_MISC_AHB_CLK>,
-				 <&mmcc MDSS_BYTE0_CLK>,
-				 <&mmcc MDSS_PCLK0_CLK>,
-				 <&mmcc MDSS_ESC0_CLK>,
-				 <&mmcc SMMU_MDP_AHB_CLK>,
-				 <&mmcc SMMU_MDP_AXI_CLK>;
-
-			power-domains = <&mmcc MDSS_GDSC>;
 		};
 	};
 
@@ -61,8 +48,8 @@
 		#size-cells = <2>;
 		ranges;
 
-		cont_splash_mem: memory@c0001000 {
-			reg = <0x0 0xc0001000 0x0 0x31ff000>;
+		cont_splash_mem: memory@c0000000 {
+			reg = <0x0 0xc0000000 0x0 0x3200000>;
 			no-map;
 		};
 

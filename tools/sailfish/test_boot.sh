@@ -15,9 +15,6 @@ echo "=============================================="
 echo " Google Pixel (sailfish) Kernel 6.18 Boot Test"
 echo "=============================================="
 
-echo "Waiting for fastboot device..."
-fastboot wait-for-device
-
 echo "Found device in fastboot mode:"
 fastboot devices
 
