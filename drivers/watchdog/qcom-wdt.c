@@ -344,7 +344,18 @@ static struct platform_driver qcom_watchdog_driver = {
 		.pm		= &qcom_wdt_pm_ops,
 	},
 };
-module_platform_driver(qcom_watchdog_driver);
+
+static int __init qcom_wdt_init(void)
+{
+	return platform_driver_register(&qcom_watchdog_driver);
+}
+arch_initcall(qcom_wdt_init);
+
+static void __exit qcom_wdt_exit(void)
+{
+	platform_driver_unregister(&qcom_watchdog_driver);
+}
+module_exit(qcom_wdt_exit);
 
 MODULE_DESCRIPTION("QCOM KPSS Watchdog Driver");
 MODULE_LICENSE("GPL v2");
