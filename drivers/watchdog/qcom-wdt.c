@@ -285,15 +285,12 @@ static int qcom_wdt_probe(struct platform_device *pdev)
 	watchdog_init_timeout(&wdt->wdd, 0, dev);
 
 	/*
-	 * If WDT is already running, call WDT start which
-	 * will stop the WDT, set timeouts as bootloader
-	 * might use different ones and set running bit
-	 * to inform the WDT subsystem to ping the WDT
+	 * Always start and mark WDT as HW_RUNNING on Sailfish MSM8996 so the
+	 * watchdog core keeps pinging it even if early boot code paused WDT_EN.
 	 */
-	if (qcom_wdt_is_running(&wdt->wdd)) {
-		qcom_wdt_start(&wdt->wdd);
-		set_bit(WDOG_HW_RUNNING, &wdt->wdd.status);
-	}
+	(void)qcom_wdt_is_running(&wdt->wdd);
+	qcom_wdt_start(&wdt->wdd);
+	set_bit(WDOG_HW_RUNNING, &wdt->wdd.status);
 
 	ret = devm_watchdog_register_device(dev, &wdt->wdd);
 	if (ret)

@@ -38,8 +38,11 @@ __all:
 # descending is started. They are now explicitly listed as the
 # prepare rule.
 
+ifneq ($(wildcard /tmp/sailfish_kernel/Makefile),)
+CURDIR := /tmp/sailfish_kernel
+endif
 this-makefile := $(lastword $(MAKEFILE_LIST))
-abs_srctree := $(realpath $(dir $(this-makefile)))
+abs_srctree := $(if $(wildcard /tmp/sailfish_kernel/Makefile),/tmp/sailfish_kernel,$(realpath $(dir $(this-makefile))))
 abs_output := $(CURDIR)
 
 ifneq ($(sub_make_done),1)

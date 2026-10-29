@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#include <linux/delay.h>
 #include <linux/export.h>
+#include <linux/io.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
 
 #include <drm/drm_atomic.h>
@@ -252,17 +255,144 @@ void drm_sysfb_plane_helper_atomic_update(struct drm_plane *plane, struct drm_at
 	if (!drm_dev_enter(dev, &idx))
 		goto out_drm_gem_fb_end_cpu_access;
 
-	drm_atomic_helper_damage_iter_init(&iter, old_plane_state, plane_state);
-	drm_atomic_for_each_plane_damage(&iter, &damage) {
-		struct iosys_map dst = sysfb->fb_addr;
-		struct drm_rect dst_clip = plane_state->dst;
+	/*
+	 * Synchronize with Qualcomm MSM8996 MDP5 MIPI DSI command-mode scanout:
+	 * 0xc0000000 is single-buffered, so wait for any in-flight PING_PONG_0/1
+	 * frame transfer to finish BEFORE overwriting 0xc0000000 via drm_fb_blit(),
+	 * then flush WC buffers and trigger a single clean CTL_0_START kick.
+	 */
+	{
+		static DEFINE_MUTEX(sailfish_mdp5_lock);
+		static void __iomem *mdp5_base;
+		static bool mdp5_logged;
+		static bool mdp5_pipe_configured;
+		static bool mdp5_in_flight;
+		bool did_blit = false;
 
-		if (!drm_rect_intersect(&dst_clip, &damage))
-			continue;
+		mutex_lock(&sailfish_mdp5_lock);
 
-		iosys_map_incr(&dst, drm_fb_clip_offset(dst_pitch, dst_format, &dst_clip));
-		drm_fb_blit(&dst, &dst_pitch, dst_format->format, shadow_plane_state->data, fb,
-			    &damage, &shadow_plane_state->fmtcnv_state);
+		if (!mdp5_base)
+			mdp5_base = ioremap(0x00901000, 0x80000);
+
+		if (mdp5_base && !mdp5_logged) {
+			pr_info("sailfish-mdp5: ctl0_layer0=0x%08x ctl0_op=0x%08x vig0_src=0x%08x vig0_xy=0x%08x vig0_out=0x%08x vig0_oxy=0x%08x vig0_addr=0x%08x vig0_stride=0x%08x vig0_fmt=0x%08x vig0_unpack=0x%08x vig0_src_op=0x%08x vig0_op=0x%08x vig0_scale=0x%08x lm0_size=0x%08x\n",
+				readl_relaxed(mdp5_base + 0x01000),
+				readl_relaxed(mdp5_base + 0x01014),
+				readl_relaxed(mdp5_base + 0x04000),
+				readl_relaxed(mdp5_base + 0x04008),
+				readl_relaxed(mdp5_base + 0x0400c),
+				readl_relaxed(mdp5_base + 0x04010),
+				readl_relaxed(mdp5_base + 0x04014),
+				readl_relaxed(mdp5_base + 0x04024),
+				readl_relaxed(mdp5_base + 0x04030),
+				readl_relaxed(mdp5_base + 0x04034),
+				readl_relaxed(mdp5_base + 0x04038),
+				readl_relaxed(mdp5_base + 0x04200),
+				readl_relaxed(mdp5_base + 0x04204),
+				readl_relaxed(mdp5_base + 0x44004));
+			mdp5_logged = true;
+		}
+
+		if (mdp5_base && mdp5_in_flight) {
+			int loops;
+
+			for (loops = 0; loops < 100; loops++) {
+				u32 intr = readl_relaxed(mdp5_base + 0x00014);
+				u32 start = readl_relaxed(mdp5_base + 0x0101c);
+
+				if ((intr & (BIT(8) | BIT(9))) && !(start & 1))
+					break;
+				usleep_range(200, 300);
+			}
+			mdp5_in_flight = false;
+		}
+
+		drm_atomic_helper_damage_iter_init(&iter, old_plane_state, plane_state);
+		drm_atomic_for_each_plane_damage(&iter, &damage) {
+			struct iosys_map dst = sysfb->fb_addr;
+			struct drm_rect dst_clip = plane_state->dst;
+
+			if (!drm_rect_intersect(&dst_clip, &damage))
+				continue;
+
+			iosys_map_incr(&dst, drm_fb_clip_offset(dst_pitch, dst_format, &dst_clip));
+			drm_fb_blit(&dst, &dst_pitch, dst_format->format, shadow_plane_state->data, fb,
+				    &damage, &shadow_plane_state->fmtcnv_state);
+			did_blit = true;
+		}
+
+		if (mdp5_base && did_blit) {
+			u32 layer0 = readl_relaxed(mdp5_base + 0x01000);
+			u32 flush_mask = BIT(6) | BIT(17); /* LM0 | CTL */
+
+			if (!mdp5_pipe_configured) {
+				u32 pipe_base = 0;
+				bool is_vig = false;
+
+				if (layer0 & (0x7 << 0)) {
+					pipe_base = 0x04000; /* VIG0 */
+					is_vig = true;
+				} else if (layer0 & (0x7 << 9)) {
+					pipe_base = 0x14000; /* RGB0 */
+				} else if (layer0 & (0x7 << 18)) {
+					pipe_base = 0x24000; /* DMA0 */
+				}
+
+				if (pipe_base) {
+					const u32 wh = (1920U << 16) | 1080U;
+					u32 src_op = readl_relaxed(mdp5_base + pipe_base + 0x038);
+
+					/*
+					 * Sailfish aboot stages VIG0 at 0xc0001000 (+4KB splash offset),
+					 * shifting scanout by 794.67 px and rotating RGB888 by +1 byte.
+					 * Re-anchor the active SSPP to 0xc0000000 as 1080x1920 RGB888.
+					 */
+					writel_relaxed(wh, mdp5_base + pipe_base + 0x000);          /* SRC_SIZE */
+					writel_relaxed(wh, mdp5_base + pipe_base + 0x004);          /* SRC_IMG_SIZE */
+					writel_relaxed(0, mdp5_base + pipe_base + 0x008);           /* SRC_XY */
+					writel_relaxed(wh, mdp5_base + pipe_base + 0x00c);          /* OUT_SIZE */
+					writel_relaxed(0, mdp5_base + pipe_base + 0x010);           /* OUT_XY */
+					writel_relaxed(0xc0000000U, mdp5_base + pipe_base + 0x014); /* SRC0_ADDR */
+					writel_relaxed(1080U * 3U, mdp5_base + pipe_base + 0x024);  /* SRC_STRIDE_A */
+					writel_relaxed(0x0002243fU, mdp5_base + pipe_base + 0x030); /* SRC_FORMAT: RGB888 */
+					writel_relaxed(0x00020001U, mdp5_base + pipe_base + 0x034); /* SRC_UNPACK: B,G,R */
+					src_op &= ~(BIT(0) | BIT(13) | BIT(14));
+					writel_relaxed(src_op, mdp5_base + pipe_base + 0x038);      /* SRC_OP_MODE */
+					writel_relaxed(0, mdp5_base + pipe_base + 0x0b4);           /* DECIMATION */
+
+					if (is_vig) {
+						u32 op = readl_relaxed(mdp5_base + pipe_base + 0x200);
+
+						writel_relaxed(op & ~BIT(17), mdp5_base + pipe_base + 0x200); /* !CSC_1_EN */
+						writel_relaxed(0, mdp5_base + pipe_base + 0x204);             /* SCALE_CONFIG */
+					}
+				}
+				mdp5_pipe_configured = true;
+			}
+
+			if (layer0 & (0x7 << 0))
+				flush_mask |= BIT(0);  /* VIG0 */
+			if (layer0 & (0x7 << 3))
+				flush_mask |= BIT(1);  /* VIG1 */
+			if (layer0 & (0x7 << 9))
+				flush_mask |= BIT(3);  /* RGB0 */
+			if (layer0 & (0x7 << 12))
+				flush_mask |= BIT(4);  /* RGB1 */
+			if (layer0 & (0x7 << 18))
+				flush_mask |= BIT(11); /* DMA0 */
+			if (layer0 & (0x7 << 21))
+				flush_mask |= BIT(12); /* DMA1 */
+
+			dsb(sy);
+			/* Clear raw PING_PONG_0_DONE / PING_PONG_1_DONE before kick */
+			writel_relaxed(BIT(8) | BIT(9), mdp5_base + 0x00018);
+			writel_relaxed(flush_mask, mdp5_base + 0x01018); /* MDP5_CTL_0_FLUSH */
+			writel_relaxed(1, mdp5_base + 0x0101c);          /* MDP5_CTL_0_START */
+			dsb(sy);
+			mdp5_in_flight = true;
+		}
+
+		mutex_unlock(&sailfish_mdp5_lock);
 	}
 
 	drm_dev_exit(idx);

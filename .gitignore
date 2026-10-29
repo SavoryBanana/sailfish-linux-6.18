@@ -189,3 +189,4 @@ sphinx_*/
 !kernel/time/timeconst.bc
 /out/
 /tools/bin/
+*.code-workspace

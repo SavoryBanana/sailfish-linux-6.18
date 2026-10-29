@@ -35,6 +35,7 @@
 
 #include <asm/acpi.h>
 #include <asm/fixmap.h>
+#include <asm/early_ioremap.h>
 #include <asm/cpu.h>
 #include <asm/cputype.h>
 #include <asm/daifflags.h>
@@ -167,6 +168,127 @@ static void __init smp_build_mpidr_hash(void)
 		pr_warn("Large number of MPIDR hash buckets detected\n");
 }
 
+static void __init early_fb_bar(int start_line, int num_lines, u32 color)
+{
+	phys_addr_t fb_phys = 0xC0000000 + (phys_addr_t)start_line * 1080 * 3;
+	size_t size = (size_t)num_lines * 1080 * 3;
+	u8 *fb = early_memremap_prot(fb_phys, size,
+				     pgprot_val(pgprot_writecombine(PAGE_KERNEL)));
+	void __iomem *ctl0;
+
+	if (fb) {
+		int i;
+		u8 b = color & 0xff;
+		u8 g = (color >> 8) & 0xff;
+		u8 r = (color >> 16) & 0xff;
+
+		for (i = 0; i < num_lines * 1080; i++) {
+			fb[i * 3 + 0] = b;
+			fb[i * 3 + 1] = g;
+			fb[i * 3 + 2] = r;
+		}
+		dsb(sy);
+		early_memunmap(fb, size);
+	}
+
+	/* Kick Qualcomm MSM8996 MDP5 CTL_0_START for MIPI DSI command-mode panel */
+	ctl0 = early_ioremap(0x00902000, 0x1000);
+	if (ctl0) {
+		volatile int d;
+
+		writel_relaxed(0x20849, ctl0 + 0x18); /* MDP5_CTL_0_FLUSH */
+		writel_relaxed(1, ctl0 + 0x1c);       /* MDP5_CTL_0_START */
+		dsb(sy);
+		for (d = 0; d < 25000000; d++)
+			cpu_relax();
+		writel_relaxed(0x20849, ctl0 + 0x18);
+		writel_relaxed(1, ctl0 + 0x1c);
+		dsb(sy);
+		for (d = 0; d < 25000000; d++)
+			cpu_relax();
+		early_iounmap(ctl0, 0x1000);
+	}
+}
+
+static void __init early_ramoops_log(const char *msg)
+{
+	u32 *hdr = early_memremap_prot(0x83540000, 0x1000,
+				       pgprot_val(pgprot_writecombine(PAGE_KERNEL)));
+
+	if (hdr) {
+		char *buf = (char *)&hdr[3];
+		u32 pos;
+
+		if (hdr[0] != 0x43474244) {
+			hdr[0] = 0x43474244; /* 'DBGC' */
+			hdr[1] = 0;
+			hdr[2] = 0;
+		}
+		pos = hdr[1];
+		if (pos > 3900)
+			pos = 0;
+		while (*msg && pos < 4000)
+			buf[pos++] = *msg++;
+		hdr[1] = pos;
+		hdr[2] = pos;
+		dsb(sy);
+		early_memunmap(hdr, 0x1000);
+	}
+}
+
+bool sailfish_early_ramoops_disabled;
+EXPORT_SYMBOL_GPL(sailfish_early_ramoops_disabled);
+
+static void sailfish_early_ramoops_write(struct console *con, const char *s,
+					 unsigned int count)
+{
+	u32 *hdr;
+	char *buf;
+	u32 pos, max_sz = 0x80000 - 16;
+	unsigned int i;
+	unsigned long flush_start;
+
+	if (sailfish_early_ramoops_disabled || !count)
+		return;
+
+	hdr = (u32 *)phys_to_virt(0x83540000);
+	buf = (char *)&hdr[3];
+	if (hdr[0] != 0x43474244) {
+		hdr[0] = 0x43474244;
+		hdr[1] = 0;
+		hdr[2] = 0;
+	}
+	pos = hdr[1];
+	if (pos >= max_sz)
+		pos = 0;
+	flush_start = (unsigned long)&buf[pos];
+	for (i = 0; i < count && pos < max_sz; i++)
+		buf[pos++] = s[i];
+	hdr[1] = pos;
+	if (pos > hdr[2])
+		hdr[2] = pos;
+	dcache_clean_inval_poc((unsigned long)hdr, (unsigned long)hdr + 64);
+	dcache_clean_inval_poc(flush_start & ~63UL,
+			       ((unsigned long)&buf[pos] + 63UL) & ~63UL);
+}
+
+static struct console sailfish_early_ramoops_con = {
+	.name	= "earlyramoops",
+	.write	= sailfish_early_ramoops_write,
+	.flags	= CON_PRINTBUFFER | CON_ENABLED | CON_ANYTIME,
+	.index	= -1,
+};
+
+static void __init early_wdt_pet(void)
+{
+	void __iomem *wdt = early_ioremap(0x09830000, 0x1000);
+	if (wdt) {
+		writel_relaxed(0, wdt + 0x8); /* WDT_EN = 0 */
+		writel_relaxed(1, wdt + 0x4); /* WDT_RST = 1 */
+		early_iounmap(wdt, 0x1000);
+	}
+}
+
 static void __init setup_machine_fdt(phys_addr_t dt_phys)
 {
 	int size = 0;
@@ -181,6 +303,8 @@ static void __init setup_machine_fdt(phys_addr_t dt_phys)
 	 * Pass dt_phys directly.
 	 */
 	if (!early_init_dt_scan(dt_virt, dt_phys)) {
+		/* Visual Diagnostic: MAGENTA bar = FDT scan failed! */
+		early_fb_bar(80, 40, 0xFFFF00FF);
 		pr_crit("\n"
 			"Error: invalid device tree blob: PA=%pa, VA=%px, size=%d bytes\n"
 			"The dtb must be 8-byte aligned and must not exceed 2 MB in size.\n"
@@ -290,7 +414,12 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	early_fixmap_init();
 	early_ioremap_init();
 
+	early_wdt_pet();
+	early_ramoops_log("[6.18:setup_arch:entry]\n");
+
 	setup_machine_fdt(__fdt_pointer);
+
+	early_ramoops_log("[6.18:setup_arch:fdt_ok]\n");
 
 	/*
 	 * Initialise the static keys early as they may be enabled by the
@@ -332,7 +461,13 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 
 	arm64_memblock_init();
 
+	early_wdt_pet();
+	early_ramoops_log("[6.18:setup_arch:memblock_ok]\n");
+
 	paging_init();
+
+	early_wdt_pet();
+	early_ramoops_log("[6.18:setup_arch:paging_ok]\n");
 
 	acpi_table_upgrade();
 
@@ -348,7 +483,11 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 
 	request_standard_resources();
 
+	early_wdt_pet();
+	early_ramoops_log("[6.18:setup_arch:done]\n");
+
 	early_ioremap_reset();
+	register_console(&sailfish_early_ramoops_con);
 
 	if (acpi_disabled)
 		psci_dt_init();

@@ -68,6 +68,7 @@ struct msm_pinctrl {
 	int irq;
 
 	bool intr_target_use_scm;
+	bool gpio_init_done;
 
 	raw_spinlock_t lock;
 
@@ -590,6 +591,9 @@ static int msm_gpio_get_direction(struct gpio_chip *chip, unsigned int offset)
 	struct msm_pinctrl *pctrl = gpiochip_get_data(chip);
 	const struct msm_pingroup *g;
 	u32 val;
+
+	if (!pctrl->gpio_init_done)
+		return GPIO_LINE_DIRECTION_IN;
 
 	g = &pctrl->soc->groups[offset];
 
@@ -1443,6 +1447,7 @@ static int msm_gpio_init(struct msm_pinctrl *pctrl)
 		dev_err(pctrl->dev, "Failed register gpiochip\n");
 		return ret;
 	}
+	pctrl->gpio_init_done = true;
 
 	/*
 	 * For DeviceTree-supported systems, the gpio core checks the

@@ -21,6 +21,9 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/mm.h>
+#include <asm/cacheflush.h>
+
+extern bool sailfish_early_ramoops_disabled;
 
 #include "internal.h"
 #include "ram_internal.h"
@@ -791,6 +794,14 @@ static int ramoops_probe(struct platform_device *pdev)
 				&cxt->max_dump_cnt, 0, 0);
 	if (err)
 		goto fail_init;
+
+	sailfish_early_ramoops_disabled = true;
+	if (cxt->console_size && pfn_valid(paddr >> PAGE_SHIFT)) {
+		void *va = phys_to_virt(paddr);
+
+		dcache_clean_inval_poc((unsigned long)va,
+				       (unsigned long)va + cxt->console_size);
+	}
 
 	err = ramoops_init_prz("console", dev, cxt, &cxt->cprz, &paddr,
 			       cxt->console_size, 0);

@@ -86,6 +86,35 @@ SYM_CODE_START(primary_entry)
 	bl	record_mmu_state
 	bl	preserve_boot_args
 
+	/* Early hardware WDT disable & pet for Qualcomm MSM8996 */
+	movz	x2, #0x0983, lsl #16
+	str	wzr, [x2, #0x8]		// WDT_EN = 0 (disable)
+	mov	w3, #1
+	str	w3, [x2, #0x4]		// WDT_RST = 1 (pet)
+
+	/* Early ramoops breadcrumb at 0x83540000 (RAMOOPS.BIN console zone) */
+	movz	x2, #0x8354, lsl #16
+	movz	w3, #0x4244
+	movk	w3, #0x4347, lsl #16	// 0x43474244 ('DBGC')
+	str	w3, [x2, #0x0]
+	mov	w3, #16
+	str	w3, [x2, #0x4]		// start = 16
+	str	w3, [x2, #0x8]		// size = 16
+	movz	w3, #0x365b		// "[6.1"
+	movk	w3, #0x312e, lsl #16
+	str	w3, [x2, #0xc]
+	movz	w3, #0x3a38		// "8:he"
+	movk	w3, #0x6568, lsl #16
+	str	w3, [x2, #0x10]
+	movz	w3, #0x6461		// "ad.S"
+	movk	w3, #0x532e, lsl #16
+	str	w3, [x2, #0x14]
+	movz	w3, #0x0a5d		// "]\n  "
+	movk	w3, #0x2020, lsl #16
+	str	w3, [x2, #0x18]
+	dc	civac, x2
+	dsb	sy
+
 	adrp	x1, early_init_stack
 	mov	sp, x1
 	mov	x29, xzr
