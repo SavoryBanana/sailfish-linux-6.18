@@ -261,15 +261,58 @@
 };
 
 &mdp_smmu {
-	status = "disabled";
+	status = "okay";
+};
+
+&mdp {
+	status = "okay";
 };
 
 &mdss {
-	status = "disabled";
+	status = "okay";
+};
+
+&mdss_dsi0 {
+	vdda-supply = <&vreg_l2a_1p25>;
+	vcca-supply = <&vreg_l28a_0p925>;
+	status = "okay";
+
+	panel: panel@0 {
+		compatible = "samsung,ea8064tg";
+		reg = <0>;
+
+		vddio-supply = <&vreg_lvs2a_1p8>;
+		vci-supply = <&vreg_l29a_3p0>;
+		reset-gpios = <&tlmm 39 GPIO_ACTIVE_LOW>;
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&mdss_dsi0_out>;
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	remote-endpoint = <&panel_in>;
+	data-lanes = <0 1 2 3>;
+};
+
+&mdss_dsi0_phy {
+	vcca-supply = <&vreg_l28a_0p925>;
+	status = "okay";
 };
 
 &adreno_smmu {
-	status = "disabled";
+	status = "okay";
+};
+
+&gpu {
+	status = "okay";
+
+	zap-shader {
+		firmware-name = "qcom/msm8996/sailfish/a530_zap.mbn";
+	};
 };
 
 &venus_smmu {
@@ -344,6 +387,11 @@
 			regulator-min-microvolt = <1800000>;
 			regulator-max-microvolt = <1800000>;
 			regulator-always-on;
+		};
+
+		vreg_l2a_1p25: l2 {
+			regulator-min-microvolt = <1250000>;
+			regulator-max-microvolt = <1250000>;
 		};
 
 		vreg_l6a_1p8: l6 {
@@ -442,5 +490,24 @@
 			regulator-always-on;
 		};
 	};
+};
+
+&pmi8994_charger {
+	qcom,fast-charge-safe-current = <1500000>;
+	qcom,fast-charge-safe-voltage = <4350000>;
+	status = "okay";
+};
+
+&pmi8994_spmi_regulators {
+	vdd_gfx: s2 {
+		regulator-name = "vdd_gfx";
+		regulator-min-microvolt = <300000>;
+		regulator-max-microvolt = <1065000>;
+		regulator-enable-ramp-delay = <1600>;
+	};
+};
+
+&mmcc {
+	vdd-gfx-supply = <&vdd_gfx>;
 };
 

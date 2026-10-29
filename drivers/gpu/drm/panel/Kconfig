@@ -867,6 +867,17 @@ config DRM_PANEL_SAMSUNG_S6E8AA5X01_AMS561RA01
 	  ~5.6 inch AMOLED display, and the controller is driven by the MIPI
 	  DSI protocol with 4 lanes.
 
+config DRM_PANEL_SAMSUNG_EA8064TG
+	tristate "Samsung EA8064TG 1080x1920 AMOLED DSI command mode panel"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	select VIDEOMODE_HELPERS
+	help
+	  Say Y or M here if you want to enable support for the Samsung
+	  EA8064TG 5.0" 1080x1920 AMOLED command mode panel found on the
+	  Google Pixel 1st Gen (sailfish).
+
 config DRM_PANEL_SAMSUNG_SOFEF00
 	tristate "Samsung sofef00/s6e3fc2x01 OnePlus 6/6T DSI cmd mode panels"
 	depends on OF

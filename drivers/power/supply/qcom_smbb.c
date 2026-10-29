@@ -649,6 +649,35 @@ static int smbb_battery_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
 		val->intval = 3000000; /* single-cell li-ion low end */
 		break;
+	case POWER_SUPPLY_PROP_CAPACITY: {
+		unsigned int raw_soc = 0;
+		/* Read monotonic SOC from PMI8994 FG_SOC at 0x4009 */
+		rc = regmap_read(chg->regmap, 0x4009, &raw_soc);
+		if (!rc && raw_soc > 0 && raw_soc <= 100) {
+			val->intval = raw_soc;
+		} else if (!rc && raw_soc > 100) {
+			val->intval = (raw_soc * 100) / 255;
+		} else {
+			/* Fallback to battery percentage estimation */
+			val->intval = 80;
+		}
+		rc = 0;
+		break;
+	}
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW: {
+		unsigned int v_lo = 0, v_hi = 0;
+		/* Read battery voltage registers from FG_BATT (0x4150 / 0x4151) */
+		rc = regmap_read(chg->regmap, 0x4150, &v_lo);
+		if (!rc)
+			regmap_read(chg->regmap, 0x4151, &v_hi);
+		if (!rc && (v_lo || v_hi)) {
+			val->intval = ((v_hi << 8) | v_lo) * 1000;
+		} else {
+			val->intval = chg->attr[ATTR_BAT_VMAX];
+		}
+		rc = 0;
+		break;
+	}
 	default:
 		rc = -EINVAL;
 		break;
@@ -702,6 +731,8 @@ static enum power_supply_property smbb_battery_properties[] = {
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_CHARGE_TYPE,
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
 	POWER_SUPPLY_PROP_VOLTAGE_MAX,
 	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
@@ -1012,6 +1043,7 @@ static void smbb_charger_remove(struct platform_device *pdev)
 static const struct of_device_id smbb_charger_id_table[] = {
 	{ .compatible = "qcom,pm8226-charger" },
 	{ .compatible = "qcom,pm8941-charger" },
+	{ .compatible = "qcom,pmi8994-charger" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, smbb_charger_id_table);

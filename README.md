@@ -18,7 +18,8 @@ This repository contains the complete board support package, device tree source,
 | **Storage (UFS)** | 32 GB Toshiba UFS 2.0 (`624000.ufshc`) | **Working** | All 6 LUNs enumerated; mounts `system_a` & `vendor_a` (ext4) |
 | **USB Peripheral** | DWC3 High-Speed (`6a00000.usb`) ConfigFS | **Working** | Interactive high-speed CDC-ACM serial shell (`18d1:d001`) |
 | **Crash Logging** | `pstore` / ramoops (`0x83500000`, 1 MB) | **Working** | `earlyramoops` console & `/sys/fs/pstore` accessible live |
-| **GPU / KMS** | Adreno 530 + Native MDP5 DSI Host | *Planned* | `ea8064tg` DSI command-mode panel native DRM driver |
+| **Battery & Charging** | PMI8994 Switch-Mode Charger & Fuel Gauge | **Working** | 1.5A fast charging, USB status, monotonic SoC & voltage reporting |
+| **GPU / KMS** | Adreno 530 + Native MDP5 DSI Host | **Working** | Native DRM `panel-samsung-ea8064tg` driver + Freedreno Adreno 530 GPU |
 
 ---
 
@@ -66,8 +67,24 @@ This repository contains the complete board support package, device tree source,
    - `gpio0..3` (`blsp_spi1`) are locked by TrustZone for the fingerprint sensor. Querying direction on these registers causes `CNOC ERROR` / `RPM:TZ ABORT!`.
    - A guard in [`drivers/pinctrl/qcom/pinctrl-msm.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/pinctrl/qcom/pinctrl-msm.c) skips direction reads on reserved GPIO ranges during chip initialization.
 
-5. **Interactive USB CDC-ACM Diagnostic Shell:**
-   - [`tools/sailfish/init.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/init.c) binds a high-speed USB CDC-ACM serial console (`18d1:d001`) with non-blocking write draining, live multi-touch monitoring (`input`), I2C bus scanning (`i2c`), stock DTB extraction (`dump_dtb`), live kernel logging (`dmesg [filter]`), `/sys/fs/pstore` inspection (`ramoops`), and fastboot reboot (`bootloader`).
+5. **Battery Management & PMI8994 Switch-Mode Charger:**
+   - Supported via [`drivers/power/supply/qcom_smbb.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/power/supply/qcom_smbb.c) using compatible `"qcom,pmi8994-charger"` at SPMI USID 2 base `0x1000`.
+   - **Fuel Gauge Monotonic State of Charge:** Directly reads real-time battery percentage from PMI8994 `FG_SOC` (register `0x4009`) and battery voltage from `FG_BATT` (registers `0x4150` / `0x4151`), exposing `/sys/class/power_supply/battery/capacity` and `/sys/class/power_supply/battery/voltage_now`.
+   - **Continuous USB Charging:** The driver clears and disables the charger hardware watchdog and enumeration timer, and raises the USB input current limit up to 1.5A/2.5A to ensure the battery remains charged while running Linux workloads.
+
+6. **Native DRM KMS Display Engine & Freedreno Adreno 530 GPU:**
+   - **Samsung EA8064TG AMOLED Panel Driver:** Authored [`drivers/gpu/drm/panel/panel-samsung-ea8064tg.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/gpu/drm/panel/panel-samsung-ea8064tg.c) driving the 5.0" 1080x1920 command-mode DSI display with 4 lanes at 60Hz.
+   - **Power Routing & Reset:** Powered from PM8994 `LVS2` (1.8V VDDIO) and `L29` (3.0V VCI), with active-low hardware reset on `gpio39` and tearing-effect (TE) sync on `gpio10` (`mdp_vsync`).
+   - **Freedreno Adreno 530 GPU:** Enabled `&gpu` and `&adreno_smmu` with `a530_zap.mbn` TrustZone microcode loading from `/vendor/firmware/` via `firmware_class.path`.
+
+7. **Interactive USB CDC-ACM Diagnostic Shell:**
+   - [`tools/sailfish/init.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/init.c) binds a high-speed USB CDC-ACM serial console (`18d1:d001`) with commands:
+     - `battery` / `power`: inspect battery SoC %, voltage, health, and charger state.
+     - `display` / `drm`: inspect DRM KMS connectors, CRTCs, and backlight brightness.
+     - `input` / `touch`: test live multi-touch events and pressure readings.
+     - `dmesg [filter]`: search live kernel log.
+     - `ramoops`: inspect `/sys/fs/pstore`.
+     - `bootloader`: reboot directly to fastboot.
 
 ---
 

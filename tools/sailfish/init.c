@@ -827,6 +827,69 @@ static void test_touch_hardware(void) {
     usb_write("\n[+] Done touch hardware test.\n");
 }
 
+static void dump_battery_info(void) {
+    char out[256];
+    usb_write("[+] Power Supply Subsystem (/sys/class/power_supply):\n");
+    dump_sysfs_dir("power_supply", "/sys/class/power_supply", true);
+
+    char val[64];
+    if (read_first_line("/sys/class/power_supply/battery/status", val, sizeof(val)) == 0) {
+        snprintf(out, sizeof(out), "  Battery Status: %s\n", val);
+        usb_write(out);
+    }
+    if (read_first_line("/sys/class/power_supply/battery/capacity", val, sizeof(val)) == 0) {
+        snprintf(out, sizeof(out), "  Battery Capacity: %s%%\n", val);
+        usb_write(out);
+    }
+    if (read_first_line("/sys/class/power_supply/battery/voltage_now", val, sizeof(val)) == 0) {
+        snprintf(out, sizeof(out), "  Battery Voltage: %s uV\n", val);
+        usb_write(out);
+    }
+    if (read_first_line("/sys/class/power_supply/battery/health", val, sizeof(val)) == 0) {
+        snprintf(out, sizeof(out), "  Battery Health: %s\n", val);
+        usb_write(out);
+    }
+    if (read_first_line("/sys/class/power_supply/usb/online", val, sizeof(val)) == 0) {
+        snprintf(out, sizeof(out), "  USB Charger Online: %s\n", val);
+        usb_write(out);
+    }
+    if (read_first_line("/sys/class/power_supply/usb/charge_control_limit", val, sizeof(val)) == 0) {
+        snprintf(out, sizeof(out), "  USB Input Current Limit: %s uA\n", val);
+        usb_write(out);
+    }
+}
+
+static void dump_display_info(void) {
+    char out[256];
+    usb_write("[+] DRM / KMS Subsystem (/sys/class/drm):\n");
+    dump_sysfs_dir("drm", "/sys/class/drm", true);
+    usb_write("[+] Backlight Subsystem (/sys/class/backlight):\n");
+    dump_sysfs_dir("backlight", "/sys/class/backlight", true);
+
+    char val[64];
+    DIR *d = opendir("/sys/class/backlight");
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            char path[128];
+            snprintf(path, sizeof(path), "/sys/class/backlight/%s/brightness", de->d_name);
+            if (read_first_line(path, val, sizeof(val)) == 0) {
+                snprintf(out, sizeof(out), "  Backlight %s brightness: %s", de->d_name, val);
+                snprintf(path, sizeof(path), "/sys/class/backlight/%s/max_brightness", de->d_name);
+                char max_v[64];
+                if (read_first_line(path, max_v, sizeof(max_v)) == 0) {
+                    snprintf(out + strlen(out), sizeof(out) - strlen(out), " / %s\n", max_v);
+                } else {
+                    strcat(out, "\n");
+                }
+                usb_write(out);
+            }
+        }
+        closedir(d);
+    }
+}
+
 static void handle_usb_cmd(char *cmd) {
     while (*cmd == ' ' || *cmd == '\t')
         cmd++;
@@ -847,6 +910,8 @@ static void handle_usb_cmd(char *cmd) {
                   "  dmesg [filter]    - Dump kernel log (optional substring filter)\n"
                   "  ramoops [filter]  - Dump /sys/fs/pstore/console-ramoops-0\n"
                   "  input / touch     - List input devices & monitor events for 10s\n"
+                  "  battery           - Show battery capacity, voltage, and charger state\n"
+                  "  display / drm     - Show DRM/KMS connectors, CRTCs, and backlight\n"
                   "  touch_test        - Sweep switch & reset GPIOs and test I2C ACK\n"
                   "  i2c / i2c_scan    - Scan /dev/i2c-0 for responsive slave addresses\n"
                   "  usb               - Show UDC status & speed\n"
@@ -881,6 +946,10 @@ static void handle_usb_cmd(char *cmd) {
         dump_file_lines("/sys/fs/pstore/console-ramoops-0", 4000, flt, true);
     } else if (strcmp(cmd, "input") == 0 || strcmp(cmd, "touch") == 0) {
         test_input_events(10);
+    } else if (strcmp(cmd, "battery") == 0 || strcmp(cmd, "power") == 0) {
+        dump_battery_info();
+    } else if (strcmp(cmd, "display") == 0 || strcmp(cmd, "drm") == 0) {
+        dump_display_info();
     } else if (strcmp(cmd, "usb") == 0) {
         char state[64], speed[64];
         get_udc_state(state, sizeof(state));
