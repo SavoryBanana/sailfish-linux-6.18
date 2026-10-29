@@ -384,12 +384,12 @@ done:
 static int qup_i2c_poll_state_mask(struct qup_i2c_dev *qup,
 				   u32 req_state, u32 req_mask)
 {
-	int retries = 1;
+	int retries = 1000;
 	u32 state;
 
 	/*
 	 * State transition takes 3 AHB clocks cycles + 3 I2C master clock
-	 * cycles. So retry once after a 1uS delay.
+	 * cycles. Give adequate retries for state to settle.
 	 */
 	do {
 		state = readl(qup->base + QUP_STATE);
@@ -401,6 +401,8 @@ static int qup_i2c_poll_state_mask(struct qup_i2c_dev *qup,
 		udelay(1);
 	} while (retries--);
 
+	dev_err(qup->dev, "poll_state_mask timed out! req=0x%x mask=0x%x state=0x%x\n",
+		req_state, req_mask, state);
 	return -ETIMEDOUT;
 }
 
@@ -1619,6 +1621,10 @@ static int qup_i2c_xfer_v2(struct i2c_adapter *adap,
 
 	if (!ret)
 		qup_i2c_change_state(qup, QUP_RESET_STATE);
+	else {
+		writel(1, qup->base + QUP_SW_RESET);
+		qup_i2c_change_state(qup, QUP_RESET_STATE);
+	}
 
 	if (ret == 0)
 		ret = num;
@@ -1929,6 +1935,9 @@ nodma:
 	ret = i2c_add_adapter(&qup->adap);
 	if (ret)
 		goto fail_runtime;
+
+	dev_info(qup->dev, "QUP I2C initialized: src_clk=%u Hz, bus_freq=%u Hz, clk_ctl=0x%08x\n",
+		 qup->src_clk_freq, clk_freq, qup->clk_ctl);
 
 	return 0;
 

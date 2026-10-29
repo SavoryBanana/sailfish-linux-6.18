@@ -8,6 +8,7 @@
 #include <linux/rmi.h>
 #include <linux/of.h>
 #include <linux/delay.h>
+#include <linux/gpio/consumer.h>
 #include <linux/regulator/consumer.h>
 #include "rmi_driver.h"
 
@@ -246,28 +247,49 @@ static int rmi_i2c_probe(struct i2c_client *client)
 	if (error)
 		return error;
 
-	of_property_read_u32(client->dev.of_node, "syna,startup-delay-ms",
-			     &rmi_i2c->startup_delay);
+	{
+		struct gpio_desc *reset_gpio = devm_gpiod_get_optional(&client->dev, "reset", GPIOD_ASIS);
+		struct gpio_desc *switch_gpio = devm_gpiod_get_optional(&client->dev, "switch", GPIOD_ASIS);
 
-	msleep(rmi_i2c->startup_delay);
+		if (IS_ERR(reset_gpio))
+			return dev_err_probe(&client->dev, PTR_ERR(reset_gpio), "Failed to get reset GPIO\n");
+		if (IS_ERR(switch_gpio))
+			return dev_err_probe(&client->dev, PTR_ERR(switch_gpio), "Failed to get switch GPIO\n");
 
-	rmi_i2c->client = client;
-	mutex_init(&rmi_i2c->page_mutex);
+		/* Set switch to AP mode (low) if multiplexed */
+		if (switch_gpio) {
+			gpiod_direction_output_raw(switch_gpio, 0);
+			msleep(10);
+		}
 
-	rmi_i2c->xport.dev = &client->dev;
-	rmi_i2c->xport.proto_name = "i2c";
-	rmi_i2c->xport.ops = &rmi_i2c_ops;
+		/* Pulse hardware reset line */
+		if (reset_gpio) {
+			gpiod_direction_output_raw(reset_gpio, 0);
+			msleep(5);
+			gpiod_set_raw_value_cansleep(reset_gpio, 1);
+			msleep(100);
+		}
 
-	i2c_set_clientdata(client, rmi_i2c);
+		of_property_read_u32(client->dev.of_node, "syna,startup-delay-ms",
+				     &rmi_i2c->startup_delay);
 
-	/*
-	 * Setting the page to zero will (a) make sure the PSR is in a
-	 * known state, and (b) make sure we can talk to the device.
-	 */
-	error = rmi_set_page(rmi_i2c, 0);
-	if (error) {
-		dev_err(&client->dev, "Failed to set page select to 0\n");
-		return error;
+		if (rmi_i2c->startup_delay)
+			msleep(rmi_i2c->startup_delay);
+
+		rmi_i2c->client = client;
+		mutex_init(&rmi_i2c->page_mutex);
+
+		rmi_i2c->xport.dev = &client->dev;
+		rmi_i2c->xport.proto_name = "i2c";
+		rmi_i2c->xport.ops = &rmi_i2c_ops;
+
+		i2c_set_clientdata(client, rmi_i2c);
+
+		error = rmi_set_page(rmi_i2c, 0);
+		if (error) {
+			dev_err(&client->dev, "Failed to set page select to 0\n");
+			return error;
+		}
 	}
 
 	dev_info(&client->dev, "registering I2C-connected sensor\n");

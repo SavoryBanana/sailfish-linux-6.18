@@ -125,6 +125,96 @@
 &tlmm {
 	/* gpio0..3 (blsp_spi1) are XPU-locked by TrustZone for the fingerprint sensor */
 	gpio-reserved-ranges = <0 4>;
+
+	touch_switch_default: touch-switch-default-state {
+		pins = "gpio80";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-low;
+	};
+
+	touch_rst_default: touch-rst-default-state {
+		pins = "gpio89";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-high;
+	};
+
+	touch_int_default: touch-int-default-state {
+		pins = "gpio125";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	touch_suspend: touch-suspend-state {
+		pins = "gpio89", "gpio125";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	i2c3_active: i2c3-active-state {
+		pins = "gpio47", "gpio48";
+		function = "blsp_i2c3";
+		drive-strength = <8>;
+		bias-pull-up;
+	};
+
+	i2c3_sleep: i2c3-sleep-state {
+		pins = "gpio47", "gpio48";
+		function = "blsp_i2c3";
+		drive-strength = <8>;
+		bias-pull-up;
+	};
+};
+
+&blsp1_i2c3 {
+	/delete-property/ dmas;
+	/delete-property/ dma-names;
+	clock-frequency = <400000>;
+	assigned-clocks = <&gcc GCC_BLSP1_QUP3_I2C_APPS_CLK>;
+	assigned-clock-rates = <19200000>;
+	pinctrl-names = "default", "sleep";
+	pinctrl-0 = <&i2c3_active>;
+	pinctrl-1 = <&i2c3_sleep>;
+	status = "okay";
+
+	touchscreen: touchscreen@20 {
+		compatible = "syna,rmi4-i2c";
+		reg = <0x20>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		interrupts-extended = <&tlmm 125 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&tlmm 89 GPIO_ACTIVE_LOW>;
+		switch-gpios = <&tlmm 80 GPIO_ACTIVE_HIGH>;
+		vdd-supply = <&vreg_l29a_3p0>;
+		vio-supply = <&vreg_lvs2a_1p8>;
+
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&touch_rst_default &touch_int_default &touch_switch_default>;
+		pinctrl-1 = <&touch_suspend>;
+
+		syna,startup-delay-ms = <100>;
+
+		rmi4-f01@1 {
+			reg = <0x01>;
+			syna,nosleep-mode = <1>;
+		};
+
+		rmi4-f12@12 {
+			reg = <0x12>;
+			touchscreen-x-mm = <62>;
+			touchscreen-y-mm = <111>;
+			syna,sensor-type = <1>;
+		};
+	};
+};
+
+&blsp2_i2c6 {
+	status = "disabled";
 };
 
 &pm8994_resin {
@@ -256,15 +346,63 @@
 			regulator-always-on;
 		};
 
+		vreg_l6a_1p8: l6 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-always-on;
+		};
+
 		vreg_l12a_1p8: l12 {
 			regulator-min-microvolt = <1800000>;
 			regulator-max-microvolt = <1800000>;
+		};
+
+		vreg_l14a_1p8: l14 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-always-on;
+		};
+
+		vreg_l17a_3p3: l17 {
+			regulator-min-microvolt = <3300000>;
+			regulator-max-microvolt = <3300000>;
+			regulator-always-on;
+		};
+
+		vreg_l18a_1p8: l18 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-always-on;
+		};
+
+		vreg_l19a_2p85: l19 {
+			regulator-min-microvolt = <2850000>;
+			regulator-max-microvolt = <2850000>;
+			regulator-always-on;
 		};
 
 		vreg_l20a_2p95: l20 {
 			regulator-min-microvolt = <2950000>;
 			regulator-max-microvolt = <2950000>;
 			regulator-allow-set-load;
+		};
+
+		vreg_l21a_3p0: l21 {
+			regulator-min-microvolt = <3000000>;
+			regulator-max-microvolt = <3000000>;
+			regulator-always-on;
+		};
+
+		vreg_l22a_3p0: l22 {
+			regulator-min-microvolt = <3000000>;
+			regulator-max-microvolt = <3300000>;
+			regulator-always-on;
+		};
+
+		vreg_l23a_2p8: l23 {
+			regulator-min-microvolt = <2800000>;
+			regulator-max-microvolt = <2800000>;
+			regulator-always-on;
 		};
 
 		vreg_l24a_3p075: l24 {
@@ -282,6 +420,26 @@
 			regulator-min-microvolt = <925000>;
 			regulator-max-microvolt = <925000>;
 			regulator-allow-set-load;
+		};
+
+		vreg_l29a_3p0: l29 {
+			regulator-min-microvolt = <3000000>;
+			regulator-max-microvolt = <3000000>;
+			regulator-always-on;
+		};
+
+		vreg_l30a_1p8: l30 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-always-on;
+		};
+
+		vreg_lvs1a_1p8: lvs1 {
+			regulator-always-on;
+		};
+
+		vreg_lvs2a_1p8: lvs2 {
+			regulator-always-on;
 		};
 	};
 };
