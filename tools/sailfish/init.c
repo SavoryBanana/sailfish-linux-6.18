@@ -224,6 +224,32 @@ static void dump_sysfs_dir(const char *label, const char *path, bool usb_only) {
     closedir(d);
 }
 
+static void dump_file_raw(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        char err[192];
+        snprintf(err, sizeof(err), "[-] Cannot open %s: %s\n", path, strerror(errno));
+        usb_write(err);
+        return;
+    }
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        size_t off = 0;
+        while (off < (size_t)n) {
+            ssize_t rc = write(g_ttygs_fd, buf + off, n - off);
+            if (rc > 0) {
+                off += rc;
+            } else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                usleep(2000);
+            } else {
+                break;
+            }
+        }
+    }
+    close(fd);
+}
+
 static void dump_file_lines(const char *path, int max_lines, const char *filter, bool usb_only) {
     FILE *fp = fopen(path, "r");
     if (!fp) {
@@ -832,28 +858,39 @@ static void dump_battery_info(void) {
     usb_write("[+] Power Supply Subsystem (/sys/class/power_supply):\n");
     dump_sysfs_dir("power_supply", "/sys/class/power_supply", true);
 
-    char val[64];
-    if (read_first_line("/sys/class/power_supply/battery/status", val, sizeof(val)) == 0) {
+    const char *bat = (access("/sys/class/power_supply/smbb-bif", F_OK) == 0) ?
+                      "/sys/class/power_supply/smbb-bif" : "/sys/class/power_supply/battery";
+    const char *usb = (access("/sys/class/power_supply/smbb-usbin", F_OK) == 0) ?
+                      "/sys/class/power_supply/smbb-usbin" : "/sys/class/power_supply/usb";
+
+    char val[64], path[128];
+    snprintf(path, sizeof(path), "%s/status", bat);
+    if (read_first_line(path, val, sizeof(val))) {
         snprintf(out, sizeof(out), "  Battery Status: %s\n", val);
         usb_write(out);
     }
-    if (read_first_line("/sys/class/power_supply/battery/capacity", val, sizeof(val)) == 0) {
+    snprintf(path, sizeof(path), "%s/capacity", bat);
+    if (read_first_line(path, val, sizeof(val))) {
         snprintf(out, sizeof(out), "  Battery Capacity: %s%%\n", val);
         usb_write(out);
     }
-    if (read_first_line("/sys/class/power_supply/battery/voltage_now", val, sizeof(val)) == 0) {
+    snprintf(path, sizeof(path), "%s/voltage_now", bat);
+    if (read_first_line(path, val, sizeof(val))) {
         snprintf(out, sizeof(out), "  Battery Voltage: %s uV\n", val);
         usb_write(out);
     }
-    if (read_first_line("/sys/class/power_supply/battery/health", val, sizeof(val)) == 0) {
+    snprintf(path, sizeof(path), "%s/health", bat);
+    if (read_first_line(path, val, sizeof(val))) {
         snprintf(out, sizeof(out), "  Battery Health: %s\n", val);
         usb_write(out);
     }
-    if (read_first_line("/sys/class/power_supply/usb/online", val, sizeof(val)) == 0) {
+    snprintf(path, sizeof(path), "%s/online", usb);
+    if (read_first_line(path, val, sizeof(val))) {
         snprintf(out, sizeof(out), "  USB Charger Online: %s\n", val);
         usb_write(out);
     }
-    if (read_first_line("/sys/class/power_supply/usb/charge_control_limit", val, sizeof(val)) == 0) {
+    snprintf(path, sizeof(path), "%s/charge_control_limit", usb);
+    if (read_first_line(path, val, sizeof(val))) {
         snprintf(out, sizeof(out), "  USB Input Current Limit: %s uA\n", val);
         usb_write(out);
     }
@@ -874,11 +911,11 @@ static void dump_display_info(void) {
             if (de->d_name[0] == '.') continue;
             char path[128];
             snprintf(path, sizeof(path), "/sys/class/backlight/%s/brightness", de->d_name);
-            if (read_first_line(path, val, sizeof(val)) == 0) {
+            if (read_first_line(path, val, sizeof(val))) {
                 snprintf(out, sizeof(out), "  Backlight %s brightness: %s", de->d_name, val);
                 snprintf(path, sizeof(path), "/sys/class/backlight/%s/max_brightness", de->d_name);
                 char max_v[64];
-                if (read_first_line(path, max_v, sizeof(max_v)) == 0) {
+                if (read_first_line(path, max_v, sizeof(max_v))) {
                     snprintf(out + strlen(out), sizeof(out) - strlen(out), " / %s\n", max_v);
                 } else {
                     strcat(out, "\n");
@@ -943,7 +980,10 @@ static void handle_usb_cmd(char *cmd) {
         const char *flt = (strlen(cmd) > 8) ? cmd + 8 : NULL;
         while (flt && *flt == ' ') flt++;
         dump_sysfs_dir("pstore", "/sys/fs/pstore", true);
-        dump_file_lines("/sys/fs/pstore/console-ramoops-0", 4000, flt, true);
+        if (flt && *flt)
+            dump_file_lines("/sys/fs/pstore/console-ramoops-0", 4000, flt, true);
+        else
+            dump_file_raw("/sys/fs/pstore/console-ramoops-0");
     } else if (strcmp(cmd, "input") == 0 || strcmp(cmd, "touch") == 0) {
         test_input_events(10);
     } else if (strcmp(cmd, "battery") == 0 || strcmp(cmd, "power") == 0) {
@@ -977,7 +1017,7 @@ static void handle_usb_cmd(char *cmd) {
     } else if (strncmp(cmd, "cat ", 4) == 0) {
         const char *path = cmd + 4;
         while (*path == ' ') path++;
-        dump_file_lines(path, 2000, NULL, true);
+        dump_file_raw(path);
     } else if (strcmp(cmd, "mount_sys") == 0) {
         mkdir("/mnt", 0755);
         mkdir("/mnt/system_a", 0755);
@@ -1083,10 +1123,16 @@ int main(void) {
             if (prc > 0) {
                 if (pfd.revents & POLLIN) {
                     char rx[64];
+                    static char last_c = 0;
                     ssize_t n = read(g_ttygs_fd, rx, sizeof(rx));
                     if (n > 0) {
                         for (ssize_t i = 0; i < n; i++) {
                             char c = rx[i];
+                            if (c == '\n' && last_c == '\r') {
+                                last_c = c;
+                                continue;
+                            }
+                            last_c = c;
                             if (c == '\r' || c == '\n') {
                                 usb_write("\r\n");
                                 cmd_buf[cmd_len] = '\0';

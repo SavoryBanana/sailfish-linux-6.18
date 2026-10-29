@@ -9,6 +9,7 @@
 #include <linux/platform_device.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/clk.h>
 #include <linux/clk-provider.h>
 #include <linux/regmap.h>
 
@@ -3614,17 +3615,29 @@ MODULE_DEVICE_TABLE(of, mmcc_msm8996_match_table);
 static int mmcc_msm8996_probe(struct platform_device *pdev)
 {
 	struct regmap *regmap;
+	struct clk *ahb_clk;
+	int ret;
+
+	pr_info("MMCC: entering probe\n");
+
+	/* Ensure MMSS NOC AHB clock is active before MMIO accesses */
+	ahb_clk = devm_clk_get_optional(&pdev->dev, "gcc_mmss_noc_cfg_ahb_clk");
+	if (!IS_ERR_OR_NULL(ahb_clk)) {
+		ret = clk_prepare_enable(ahb_clk);
+		pr_info("MMCC: gcc_mmss_noc_cfg_ahb_clk enable ret=%d\n", ret);
+	}
 
 	regmap = qcom_cc_map(pdev, &mmcc_msm8996_desc);
-	if (IS_ERR(regmap))
+	if (IS_ERR(regmap)) {
+		pr_err("MMCC: qcom_cc_map failed: %ld\n", PTR_ERR(regmap));
 		return PTR_ERR(regmap);
+	}
+	pr_info("MMCC: qcom_cc_map ok\n");
 
-	/* Disable the AHB DCD */
-	regmap_update_bits(regmap, 0x50d8, BIT(31), 0);
-	/* Disable the NoC FSM for mmss_mmagic_cfg_ahb_clk */
-	regmap_update_bits(regmap, 0x5054, BIT(15), 0);
-
-	return qcom_cc_really_probe(&pdev->dev, &mmcc_msm8996_desc, regmap);
+	pr_info("MMCC: calling qcom_cc_really_probe\n");
+	ret = qcom_cc_really_probe(&pdev->dev, &mmcc_msm8996_desc, regmap);
+	pr_info("MMCC: qcom_cc_really_probe returned %d\n", ret);
+	return ret;
 }
 
 static struct platform_driver mmcc_msm8996_driver = {

@@ -19,7 +19,7 @@ This repository contains the complete board support package, device tree source,
 | **USB Peripheral** | DWC3 High-Speed (`6a00000.usb`) ConfigFS | **Working** | Interactive high-speed CDC-ACM serial shell (`18d1:d001`) |
 | **Crash Logging** | `pstore` / ramoops (`0x83500000`, 1 MB) | **Working** | `earlyramoops` console & `/sys/fs/pstore` accessible live |
 | **Battery & Charging** | PMI8994 Switch-Mode Charger & Fuel Gauge | **Working** | 1.5A fast charging, USB status, monotonic SoC & voltage reporting |
-| **GPU / KMS** | Adreno 530 + Native MDP5 DSI Host | **Working** | Native DRM `panel-samsung-ea8064tg` driver + Freedreno Adreno 530 GPU |
+| **GPU / KMS** | Adreno 530 + Native MDP5 DSI Host | **In Progress (WIP)** | Display working via `simpledrm`; native DRM/KMS & Adreno GPU WIP |
 
 ---
 
@@ -69,13 +69,13 @@ This repository contains the complete board support package, device tree source,
 
 5. **Battery Management & PMI8994 Switch-Mode Charger:**
    - Supported via [`drivers/power/supply/qcom_smbb.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/power/supply/qcom_smbb.c) using compatible `"qcom,pmi8994-charger"` at SPMI USID 2 base `0x1000`.
-   - **Fuel Gauge Monotonic State of Charge:** Directly reads real-time battery percentage from PMI8994 `FG_SOC` (register `0x4009`) and battery voltage from `FG_BATT` (registers `0x4150` / `0x4151`), exposing `/sys/class/power_supply/battery/capacity` and `/sys/class/power_supply/battery/voltage_now`.
-   - **Continuous USB Charging:** The driver clears and disables the charger hardware watchdog and enumeration timer, and raises the USB input current limit up to 1.5A/2.5A to ensure the battery remains charged while running Linux workloads.
+   - **Fuel Gauge Monotonic State of Charge:** Directly reads real-time battery percentage from PMI8994 `FG_SOC` (register `0x4009`) and battery voltage from `FG_BATT` (registers `0x4150` / `0x4151`), exposing `/sys/class/power_supply/smbb-bif/capacity` and `/sys/class/power_supply/smbb-bif/voltage_now`.
+   - **Continuous USB Fast Charging:** Configured `qcom,fast-charge-current-limit = <1500000>` (1.5A) and `qcom,fast-charge-high-threshold-voltage = <4350000>` (4.35V cutoff) in DTS. The driver monitors USB status (`smbb-usbin`) and keeps the battery charged while running Linux workloads.
 
-6. **Native DRM KMS Display Engine & Freedreno Adreno 530 GPU:**
-   - **Samsung EA8064TG AMOLED Panel Driver:** Authored [`drivers/gpu/drm/panel/panel-samsung-ea8064tg.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/gpu/drm/panel/panel-samsung-ea8064tg.c) driving the 5.0" 1080x1920 command-mode DSI display with 4 lanes at 60Hz.
-   - **Power Routing & Reset:** Powered from PM8994 `LVS2` (1.8V VDDIO) and `L29` (3.0V VCI), with active-low hardware reset on `gpio39` and tearing-effect (TE) sync on `gpio10` (`mdp_vsync`).
-   - **Freedreno Adreno 530 GPU:** Enabled `&gpu` and `&adreno_smmu` with `a530_zap.mbn` TrustZone microcode loading from `/vendor/firmware/` via `firmware_class.path`.
+6. **Native DRM KMS Display Engine & Freedreno Adreno 530 GPU (In Progress / WIP):**
+   - **Current Display Driver:** Display output is active and verified tear-free via `simpledrm` handover from the bootloader continuous splash (`/dev/dri/card0` and `/dev/fb0` at 1080x1920 RGB888).
+   - **Samsung EA8064TG AMOLED Panel Driver:** Authored native panel driver [`drivers/gpu/drm/panel/panel-samsung-ea8064tg.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/gpu/drm/panel/panel-samsung-ea8064tg.c) driving the 5.0" 1080x1920 command-mode DSI display with 4 lanes at 60Hz.
+   - **Native Hardware Subsystem Bring-up:** Native KMS (`&mdss`, `&mdp`, `&mdss_dsi0`), MMCC clock controller (`&mmcc`), and Freedreno 3D GPU (`&gpu`, `&adreno_smmu`) are in active bring-up. They are kept disabled in the default device tree to avoid conflicts with the bootloader's active continuous splash scanout pipeline until native display handover is complete.
 
 7. **Interactive USB CDC-ACM Diagnostic Shell:**
    - [`tools/sailfish/init.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/init.c) binds a high-speed USB CDC-ACM serial console (`18d1:d001`) with commands:

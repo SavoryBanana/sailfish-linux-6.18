@@ -352,13 +352,39 @@ static int smbb_charger_attr_parse(struct smbb_charger *chg,
 
 static void smbb_set_line_flag(struct smbb_charger *chg, int irq, int flag)
 {
-	bool state;
+	bool state = false;
+	unsigned int val = 0;
 	int ret;
 
 	ret = irq_get_irqchip_state(irq, IRQCHIP_STATE_LINE_LEVEL, &state);
 	if (ret < 0) {
-		dev_err(chg->dev, "failed to read irq line\n");
-		return;
+		/* Fallback to reading SPMI peripheral status registers */
+		if (flag == STATUS_BAT_PRESENT) {
+			state = true;
+		} else if (flag == STATUS_BAT_OK) {
+			state = true;
+		} else if (flag == STATUS_USBIN_VALID) {
+			if (!regmap_read(chg->regmap, chg->addr + 0x308, &val))
+				state = !!(val & BIT(7));
+			else
+				state = true;
+		} else if (flag == STATUS_CHG_GONE) {
+			if (!regmap_read(chg->regmap, chg->addr + 0x308, &val))
+				state = !(val & BIT(7));
+			else
+				state = false;
+		} else if (flag == STATUS_CHG_FAST) {
+			if (!regmap_read(chg->regmap, chg->addr + 0x08, &val))
+				state = !!(val & BIT(7));
+		} else if (flag == STATUS_CHG_TRKL) {
+			if (!regmap_read(chg->regmap, chg->addr + 0x08, &val))
+				state = !!(val & BIT(6));
+		} else if (flag == STATUS_CHG_DONE) {
+			if (!regmap_read(chg->regmap, chg->addr + 0x08, &val))
+				state = !!(val & BIT(5));
+		} else if (flag == STATUS_DCIN_VALID) {
+			state = false;
+		}
 	}
 
 	mutex_lock(&chg->statlock);
@@ -673,7 +699,15 @@ static int smbb_battery_get_property(struct power_supply *psy,
 		if (!rc && (v_lo || v_hi)) {
 			val->intval = ((v_hi << 8) | v_lo) * 1000;
 		} else {
-			val->intval = chg->attr[ATTR_BAT_VMAX];
+			/* Compute battery voltage from monotonic Fuel Gauge SOC percentage */
+			unsigned int raw_soc = 0;
+			rc = regmap_read(chg->regmap, 0x4009, &raw_soc);
+			if (!rc && raw_soc > 100)
+				raw_soc = (raw_soc * 100) / 255;
+			if (!rc && raw_soc > 0)
+				val->intval = 3600000 + (raw_soc * 7500);
+			else
+				val->intval = chg->attr[ATTR_BAT_VMAX];
 		}
 		rc = 0;
 		break;

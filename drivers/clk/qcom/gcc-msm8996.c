@@ -1232,7 +1232,7 @@ static struct clk_branch gcc_mmss_noc_cfg_ahb_clk = {
 		.enable_mask = BIT(0),
 		.hw.init = &(struct clk_init_data){
 			.name = "gcc_mmss_noc_cfg_ahb_clk",
-			.flags = CLK_IGNORE_UNUSED,
+			.flags = CLK_IS_CRITICAL | CLK_IGNORE_UNUSED,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -1240,6 +1240,7 @@ static struct clk_branch gcc_mmss_noc_cfg_ahb_clk = {
 
 static struct clk_branch gcc_mmss_bimc_gfx_clk = {
 	.halt_reg = 0x9010,
+	.halt_check = BRANCH_HALT_SKIP,
 	.clkr = {
 		.enable_reg = 0x9010,
 		.enable_mask = BIT(0),

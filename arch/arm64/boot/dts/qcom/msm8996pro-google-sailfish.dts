@@ -228,6 +228,14 @@
  * continuous splash stays intact and TZ XPU regions are untouched.
  */
 &mmcc {
+	clocks = <&xo_board>,
+		 <&gcc GPLL0>,
+		 <&gcc GCC_MMSS_NOC_CFG_AHB_CLK>;
+	clock-names = "xo",
+		      "gpll0",
+		      "gcc_mmss_noc_cfg_ahb_clk";
+	/delete-property/ assigned-clocks;
+	/delete-property/ assigned-clock-rates;
 	status = "disabled";
 };
 
@@ -261,15 +269,23 @@
 };
 
 &mdp_smmu {
-	status = "okay";
+	status = "disabled";
 };
 
 &mdp {
-	status = "okay";
+	status = "disabled";
 };
 
 &mdss {
-	status = "okay";
+	status = "disabled";
+};
+
+&adreno_smmu {
+	status = "disabled";
+};
+
+&gpu {
+	status = "disabled";
 };
 
 &mdss_dsi0 {
@@ -301,18 +317,6 @@
 &mdss_dsi0_phy {
 	vcca-supply = <&vreg_l28a_0p925>;
 	status = "okay";
-};
-
-&adreno_smmu {
-	status = "okay";
-};
-
-&gpu {
-	status = "okay";
-
-	zap-shader {
-		firmware-name = "qcom/msm8996/sailfish/a530_zap.mbn";
-	};
 };
 
 &venus_smmu {
@@ -493,7 +497,9 @@
 };
 
 &pmi8994_charger {
+	qcom,fast-charge-current-limit = <1500000>;
 	qcom,fast-charge-safe-current = <1500000>;
+	qcom,fast-charge-high-threshold-voltage = <4350000>;
 	qcom,fast-charge-safe-voltage = <4350000>;
 	status = "okay";
 };
