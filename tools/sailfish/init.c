@@ -968,6 +968,46 @@ static void dump_display_info(void) {
     }
 }
 
+static void test_android_primitives(void) {
+    char out[256];
+    usb_write("[+] Android 17 Kernel Infrastructure Status:\n");
+
+    /* 1. Binder */
+    usb_write("  [1] Binder IPC nodes (/dev/binderfs):\n");
+    dump_sysfs_dir("binderfs", "/dev/binderfs", true);
+
+    /* 2. DMA-BUF Heaps */
+    usb_write("  [2] DMA-BUF Heaps (/dev/dma_heap):\n");
+    dump_sysfs_dir("dma_heap", "/dev/dma_heap", true);
+
+    /* 3. PSI (Pressure Stall Information) */
+    usb_write("  [3] Pressure Stall Information (/proc/pressure):\n");
+    dump_sysfs_dir("pressure", "/proc/pressure", true);
+    char psi[128];
+    if (read_first_line("/proc/pressure/memory", psi, sizeof(psi))) {
+        snprintf(out, sizeof(out), "      PSI Memory: %s\n", psi);
+        usb_write(out);
+    }
+    if (read_first_line("/proc/pressure/cpu", psi, sizeof(psi))) {
+        snprintf(out, sizeof(out), "      PSI CPU:    %s\n", psi);
+        usb_write(out);
+    }
+
+    /* 4. SELinux */
+    char se_enforce[32];
+    if (read_first_line("/sys/fs/selinux/enforce", se_enforce, sizeof(se_enforce))) {
+        snprintf(out, sizeof(out), "  [4] SELinux Enforce: %s (%s)\n",
+                 se_enforce, se_enforce[0] == '1' ? "enforcing" : "permissive");
+        usb_write(out);
+    } else {
+        usb_write("  [4] SELinux: ready\n");
+    }
+
+    /* 5. Cgroups */
+    usb_write("  [5] Cgroups (/proc/cgroups):\n");
+    dump_file_lines("/proc/cgroups", 20, NULL, true);
+}
+
 static void test_gpu(void) {
     char out[256];
     usb_write("[+] DRM DRI nodes (/dev/dri):\n");
@@ -1041,6 +1081,7 @@ static void handle_usb_cmd(char *cmd) {
                   "  battery           - Show battery capacity, voltage, and charger state\n"
                   "  display / drm     - Show DRM/KMS connectors, CRTCs, and backlight\n"
                   "  gpu / freedreno   - Test DRI nodes & trigger GPU firmware load\n"
+                  "  android / aosp    - Check Binder, DMA-BUF heaps, PSI, and SELinux\n"
                   "  touch_test        - Sweep switch & reset GPIOs and test I2C ACK\n"
                   "  i2c / i2c_scan    - Scan /dev/i2c-0 for responsive slave addresses\n"
                   "  usb               - Show UDC status & speed\n"
@@ -1086,6 +1127,8 @@ static void handle_usb_cmd(char *cmd) {
         dump_display_info();
     } else if (strcmp(cmd, "gpu") == 0 || strcmp(cmd, "freedreno") == 0) {
         test_gpu();
+    } else if (strcmp(cmd, "android") == 0 || strcmp(cmd, "aosp") == 0) {
+        test_android_primitives();
     } else if (strcmp(cmd, "usb") == 0) {
         char state[64], speed[64];
         get_udc_state(state, sizeof(state));
@@ -1206,6 +1249,11 @@ int main(void) {
     mount("none", "/sys", "sysfs", 0, NULL);
     mkdir("/sys/fs/pstore", 0755);
     mount("pstore", "/sys/fs/pstore", "pstore", 0, NULL);
+    mkdir("/dev/binderfs", 0755);
+    mount("binder", "/dev/binderfs", "binder", 0, "stats=global");
+    symlink("/dev/binderfs/binder", "/dev/binder");
+    symlink("/dev/binderfs/hwbinder", "/dev/hwbinder");
+    symlink("/dev/binderfs/vndbinder", "/dev/vndbinder");
 
     print_msg("\n======================================================\n");
     print_msg("  Google Pixel (sailfish) Linux 6.18 Bring-up         \n");
