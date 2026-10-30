@@ -3507,7 +3507,7 @@ static struct clk_regmap *mmcc_msm8996_clocks[] = {
 static struct gdsc *mmcc_msm8996_gdscs[] __maybe_unused = {
 	[MMAGIC_BIMC_GDSC] = NULL, /* 0x529c is locked by TrustZone XPU on retail Pixel */
 	[MMAGIC_VIDEO_GDSC] = NULL,
-	[MMAGIC_MDSS_GDSC] = &mmagic_mdss_gdsc,
+	[MMAGIC_MDSS_GDSC] = NULL,
 	[MMAGIC_CAMSS_GDSC] = NULL,
 	[VENUS_GDSC] = NULL,
 	[VENUS_CORE0_GDSC] = NULL,
@@ -3518,7 +3518,7 @@ static struct gdsc *mmcc_msm8996_gdscs[] __maybe_unused = {
 	[JPEG_GDSC] = NULL,
 	[CPP_GDSC] = NULL,
 	[FD_GDSC] = NULL,
-	[MDSS_GDSC] = &mdss_gdsc,
+	[MDSS_GDSC] = NULL,
 	[GPU_GDSC] = NULL,
 	[GPU_GX_GDSC] = NULL,
 };
@@ -3637,6 +3637,28 @@ static int mmcc_msm8996_probe(struct platform_device *pdev)
 	pr_info("MMCC: calling qcom_cc_really_probe\n");
 	ret = qcom_cc_really_probe(&pdev->dev, &mmcc_msm8996_desc, regmap);
 	pr_info("MMCC: qcom_cc_really_probe returned %d\n", ret);
+	if (ret == 0) {
+		u32 val = 0;
+		/*
+		 * Un-collapse GPU_GDSC (0x4034) so GPU_AHB_CLK and Adreno SMMU
+		 * registers are accessible without power collapse or -16 errors.
+		 */
+		regmap_update_bits(regmap, 0x4034, BIT(0), 0);
+		udelay(100);
+		regmap_read(regmap, 0x4038, &val);
+		pr_info("MMCC: GPU_GDSC uncollapsed, status(0x4038)=0x%08x\n", val);
+
+		/*
+		 * Un-collapse GPU_GX_GDSC (0x4024) and deassert clamp IO (0x4300)
+		 * so GPU core logic and graphics clocks (GPU_GX_GFX3D_CLK) are active.
+		 */
+		regmap_update_bits(regmap, 0x4300, BIT(0), 0);
+		regmap_update_bits(regmap, 0x4024, BIT(0), 0);
+		regmap_update_bits(regmap, 0x4028, BIT(14) | BIT(13), BIT(14) | BIT(13));
+		udelay(100);
+		regmap_read(regmap, 0x4024, &val);
+		pr_info("MMCC: GPU_GX_GDSC uncollapsed, status(0x4024)=0x%08x\n", val);
+	}
 	return ret;
 }
 

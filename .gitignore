@@ -190,3 +190,5 @@ sphinx_*/
 /out/
 /tools/bin/
 *.code-workspace
+console-ramoops*.txt
+ramoops_latest/

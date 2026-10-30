@@ -311,11 +311,20 @@
 };
 
 &adreno_smmu {
-	status = "disabled";
+	/delete-property/ power-domains;
+	status = "okay";
 };
 
 &gpu {
-	status = "disabled";
+	/delete-property/ power-domains;
+	/delete-property/ interconnects;
+	/delete-property/ interconnect-names;
+	vdd-supply = <&vdd_gfx>;
+	status = "okay";
+
+	zap-shader {
+		firmware-name = "qcom/a530_zap_signed.mdt";
+	};
 };
 
 &mdss_dsi0 {
@@ -354,6 +363,18 @@
 };
 
 &venus_smmu {
+	status = "disabled";
+};
+
+&venus {
+	status = "disabled";
+};
+
+&camss {
+	status = "disabled";
+};
+
+&cci {
 	status = "disabled";
 };
 
@@ -544,6 +565,8 @@
 		regulator-min-microvolt = <300000>;
 		regulator-max-microvolt = <1065000>;
 		regulator-enable-ramp-delay = <1600>;
+		regulator-always-on;
+		regulator-boot-on;
 	};
 };
 

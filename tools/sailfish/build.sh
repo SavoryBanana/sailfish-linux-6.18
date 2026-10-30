@@ -15,6 +15,28 @@ rm -rf "$OUT_DIR/initramfs_root"
 mkdir -p "$OUT_DIR/initramfs_root"
 clang -target aarch64-linux-gnu -static -O2 "$SCRIPT_DIR/init.c" -o "$OUT_DIR/initramfs_root/init"
 chmod +x "$OUT_DIR/initramfs_root/init"
+
+# Stage early GPU microcode in initramfs for early boot
+mkdir -p "$OUT_DIR/initramfs_root/lib/firmware/qcom"
+for fw in a530_pm4.fw a530_pfp.fw a530v3_gpmu.fw2; do
+    if [ -f "/lib/firmware/qcom/$fw.zst" ]; then
+        zstd -d -c "/lib/firmware/qcom/$fw.zst" > "$OUT_DIR/initramfs_root/lib/firmware/qcom/$fw"
+        cp "$OUT_DIR/initramfs_root/lib/firmware/qcom/$fw" "$OUT_DIR/initramfs_root/lib/firmware/$fw"
+    fi
+done
+
+# Copy any authentic OEM-extracted firmware from tools/sailfish/firmware
+if [ -d "$SCRIPT_DIR/firmware" ] && [ "$(ls -A "$SCRIPT_DIR/firmware")" ]; then
+    echo "[+] Staging device-specific firmware from $SCRIPT_DIR/firmware"
+    cp -r "$SCRIPT_DIR/firmware/"* "$OUT_DIR/initramfs_root/lib/firmware/qcom/"
+    cp -r "$SCRIPT_DIR/firmware/"* "$OUT_DIR/initramfs_root/lib/firmware/"
+elif [ -f "/lib/firmware/qcom/apq8096/a530_zap.mbn.zst" ]; then
+    zstd -d -c "/lib/firmware/qcom/apq8096/a530_zap.mbn.zst" > "$OUT_DIR/initramfs_root/lib/firmware/qcom/a530_zap.mdt"
+    cp "$OUT_DIR/initramfs_root/lib/firmware/qcom/a530_zap.mdt" "$OUT_DIR/initramfs_root/lib/firmware/qcom/a530_zap.mbn"
+    cp "$OUT_DIR/initramfs_root/lib/firmware/qcom/a530_zap.mdt" "$OUT_DIR/initramfs_root/lib/firmware/a530_zap.mdt"
+    cp "$OUT_DIR/initramfs_root/lib/firmware/qcom/a530_zap.mdt" "$OUT_DIR/initramfs_root/lib/firmware/a530_zap.mbn"
+fi
+
 (cd "$OUT_DIR/initramfs_root" && find . | cpio -o -H newc | gzip -9 > "$OUT_DIR/initramfs.cpio.gz")
 
 echo "=== 2. Configuring Kernel (sailfish_defconfig) ==="

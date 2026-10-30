@@ -19,7 +19,7 @@ This repository contains the complete board support package, device tree source,
 | **USB Peripheral** | DWC3 High-Speed (`6a00000.usb`) ConfigFS | **Working** | Interactive high-speed CDC-ACM serial shell (`18d1:d001`) |
 | **Crash Logging** | `pstore` / ramoops (`0x83500000`, 1 MB) | **Working** | `earlyramoops` console & `/sys/fs/pstore` accessible live |
 | **Battery & Charging** | PMI8994 Switch-Mode Charger & Fuel Gauge | **Working** | 1.5A fast charging, USB status, monotonic SoC & voltage reporting |
-| **GPU (3D)** | Freedreno Adreno 530 (`&gpu`, `&adreno_smmu`) | **In Progress (WIP)** | Display subsystem fully native; 3D acceleration WIP |
+| **GPU (3D)** | Freedreno Adreno 530 (`&gpu`, `&adreno_smmu`) | **Working** | Authentic OEM signed zap shader authenticated via TrustZone PAS; non-secure mode cleared; `/dev/dri/card1` & `/dev/dri/renderD128` operational |
 
 ---
 
@@ -96,10 +96,24 @@ This repository contains the complete board support package, device tree source,
    - [`tools/sailfish/init.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/init.c) binds a high-speed USB CDC-ACM serial console (`18d1:d001`) with commands:
      - `battery` / `power`: inspect battery SoC %, voltage, health, and charger state.
      - `display` / `drm`: inspect DRM KMS connectors, CRTCs, and backlight brightness.
+     - `gpu` / `freedreno`: inspect DRI nodes, test DRM ioctls, and trigger GPU hardware initialization.
      - `input` / `touch`: test live multi-touch events and pressure readings.
      - `dmesg [filter]`: search live kernel log.
      - `ramoops`: inspect `/sys/fs/pstore`.
      - `bootloader`: reboot directly to fastboot.
+
+8. **Freedreno Adreno 530 3D GPU Acceleration & Authentic Signed Zap Shader:**
+   - **GPU Power & Clock Sequencing:**
+     - MMCC explicitly un-collapses `GPU_GDSC` (`0x4034`) and `GPU_GX_GDSC` (`0x4024`) and deasserts clamp IO (`0x4300`), allowing `adreno_smmu` (`b40000.iommu`) and Adreno core graphics clocks (`GPU_GX_GFX3D_CLK`) to operate without power-collapse faults.
+     - Device tree supplies `vdd-supply = <&vdd_gfx>` (PM8994 SMPS2) with `regulator-always-on` at 300mV - 1065mV.
+   - **Authentic Retail Signed Zap Shader Extraction:**
+     - Dumped HTC/Google signed zap shader binaries directly from vendor storage (`/dev/sda31`): `a530_zap_signed.mdt`, `a530_zap_signed.b00`, `a530_zap_signed.b01`, `a530_zap_signed.b02`, and `a530_zap_signed.mbn`.
+     - Validated X.509 certificate chain (`OEM attestation CA`, `HW_ID 0x0005F0E1` for MSM8996 Pro) and SHA-256 segment hashes.
+     - Staged firmware files into initramfs under `/lib/firmware/qcom/` and device tree `zap-shader { firmware-name = "qcom/a530_zap_signed.mdt"; };`.
+   - **TrustZone Authentication & Non-Secure Mode Switch:**
+     - TrustZone PAS (Peripheral Authentication Service) authenticates the firmware via SMC `0x72000602` into reserved memory `gpu_mem` (`0x90f00000`).
+     - Adreno command processor (CP) sends `CP_SET_SECURE_MODE (0)` packet to switch the GPU out of secure mode.
+     - Userspace DRI nodes `/dev/dri/card1` and `/dev/dri/renderD128` query cleanly through DRM UAPI (`msm` v1.13.0) without hardware access faults (`NOC_ERROR`).
 
 ---
 

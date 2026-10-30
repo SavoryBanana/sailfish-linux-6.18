@@ -13,6 +13,7 @@
 #include <linux/input.h>
 #include <linux/gpio.h>
 #include <sys/ioctl.h>
+#include <drm/drm.h>
 #include <fcntl.h>
 #include <string.h>
 #include <ctype.h>
@@ -584,15 +585,17 @@ static void parse_and_dump_fdt_touch(const uint8_t *fdt, size_t fdt_size, bool t
     }
 }
 
-static void dump_base64_dtb(const uint8_t *dtb, size_t total, bool to_usb) {
+static void dump_base64_buf(const char *label, const uint8_t *data, size_t total, bool to_usb) {
     static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    print_fdt_dump("\n---START_DTB_B64---\n", to_usb);
+    char hdr[160];
+    snprintf(hdr, sizeof(hdr), "\n---START_%s_B64 (%zu bytes)---\n", label, total);
+    print_fdt_dump(hdr, to_usb);
     char line[128];
     int line_len = 0;
     for (size_t i = 0; i < total; i += 3) {
-        uint32_t octet_a = dtb[i];
-        uint32_t octet_b = (i + 1 < total) ? dtb[i + 1] : 0;
-        uint32_t octet_c = (i + 2 < total) ? dtb[i + 2] : 0;
+        uint32_t octet_a = data[i];
+        uint32_t octet_b = (i + 1 < total) ? data[i + 1] : 0;
+        uint32_t octet_c = (i + 2 < total) ? data[i + 2] : 0;
         uint32_t triple = (octet_a << 16) | (octet_b << 8) | octet_c;
         line[line_len++] = b64[(triple >> 18) & 0x3f];
         line[line_len++] = b64[(triple >> 12) & 0x3f];
@@ -610,7 +613,45 @@ static void dump_base64_dtb(const uint8_t *dtb, size_t total, bool to_usb) {
         line[line_len] = '\0';
         print_fdt_dump(line, to_usb);
     }
-    print_fdt_dump("---END_DTB_B64---\n", to_usb);
+    snprintf(hdr, sizeof(hdr), "---END_%s_B64---\n", label);
+    print_fdt_dump(hdr, to_usb);
+}
+
+static void dump_base64_dtb(const uint8_t *dtb, size_t total, bool to_usb) {
+    dump_base64_buf("DTB", dtb, total, to_usb);
+}
+
+static void dump_firmware_file_b64(const char *name) {
+    char path[160];
+    snprintf(path, sizeof(path), "/mnt/vendor_a/firmware/%s", name);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        char err[160];
+        snprintf(err, sizeof(err), "[-] Cannot open %s: %s\n", path, strerror(errno));
+        usb_write(err);
+        return;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size <= 0) {
+        close(fd);
+        usb_write("[-] Bad file size\n");
+        return;
+    }
+    uint8_t *buf = malloc(st.st_size);
+    if (!buf) {
+        close(fd);
+        usb_write("[-] Out of memory\n");
+        return;
+    }
+    ssize_t rd = read(fd, buf, st.st_size);
+    close(fd);
+    if (rd != st.st_size) {
+        free(buf);
+        usb_write("[-] Read error\n");
+        return;
+    }
+    dump_base64_buf(name, buf, st.st_size, true);
+    free(buf);
 }
 
 static void scan_sda_for_dtb(bool to_usb, bool dump_b64) {
@@ -927,6 +968,56 @@ static void dump_display_info(void) {
     }
 }
 
+static void test_gpu(void) {
+    char out[256];
+    usb_write("[+] DRM DRI nodes (/dev/dri):\n");
+    dump_sysfs_dir("dri", "/dev/dri", true);
+
+    const char *nodes[] = {
+        "/dev/dri/renderD128",
+        "/dev/dri/card1",
+        "/dev/dri/card0",
+        NULL
+    };
+
+    bool opened = false;
+    for (int i = 0; nodes[i]; i++) {
+        int fd = open(nodes[i], O_RDWR);
+        if (fd >= 0) {
+            snprintf(out, sizeof(out), "[+] Successfully opened %s (fd=%d) - triggered load_gpu()\n", nodes[i], fd);
+            usb_write(out);
+
+            char name[64] = {0};
+            char date[64] = {0};
+            char desc[128] = {0};
+            struct drm_version ver;
+            memset(&ver, 0, sizeof(ver));
+            ver.name = name;
+            ver.name_len = sizeof(name) - 1;
+            ver.date = date;
+            ver.date_len = sizeof(date) - 1;
+            ver.desc = desc;
+            ver.desc_len = sizeof(desc) - 1;
+            if (ioctl(fd, DRM_IOCTL_VERSION, &ver) == 0) {
+                snprintf(out, sizeof(out), "    DRM Driver: %s (%s) v%d.%d.%d\n    Desc: %s\n",
+                         name, date, ver.version_major, ver.version_minor, ver.version_patchlevel, desc);
+                usb_write(out);
+            }
+
+            close(fd);
+            opened = true;
+            break;
+        } else {
+            snprintf(out, sizeof(out), "[-] Cannot open %s: %s\n", nodes[i], strerror(errno));
+            usb_write(out);
+        }
+    }
+
+    usb_write("[+] Checking kernel dmesg for Adreno / Freedreno GPU initialization:\n");
+    dump_dmesg_filtered(60, "adreno");
+    dump_dmesg_filtered(60, "msm");
+}
+
 static void handle_usb_cmd(char *cmd) {
     while (*cmd == ' ' || *cmd == '\t')
         cmd++;
@@ -949,12 +1040,15 @@ static void handle_usb_cmd(char *cmd) {
                   "  input / touch     - List input devices & monitor events for 10s\n"
                   "  battery           - Show battery capacity, voltage, and charger state\n"
                   "  display / drm     - Show DRM/KMS connectors, CRTCs, and backlight\n"
+                  "  gpu / freedreno   - Test DRI nodes & trigger GPU firmware load\n"
                   "  touch_test        - Sweep switch & reset GPIOs and test I2C ACK\n"
                   "  i2c / i2c_scan    - Scan /dev/i2c-0 for responsive slave addresses\n"
                   "  usb               - Show UDC status & speed\n"
                   "  parts             - Show /proc/partitions\n"
                   "  dtb / stock_dtb   - Scan stock boot_a for factory DTB & touch node\n"
                   "  dump_dtb          - Dump stock factory DTB as base64\n"
+                  "  dump_zap          - Dump signed Adreno zap shader files as base64\n"
+                  "  b64 <file>        - Dump any file as base64\n"
                   "  mounts            - Show /proc/mounts\n"
                   "  ls [dir]          - List directory entries\n"
                   "  cat <file>        - Print file contents (up to 2000 lines)\n"
@@ -990,6 +1084,8 @@ static void handle_usb_cmd(char *cmd) {
         dump_battery_info();
     } else if (strcmp(cmd, "display") == 0 || strcmp(cmd, "drm") == 0) {
         dump_display_info();
+    } else if (strcmp(cmd, "gpu") == 0 || strcmp(cmd, "freedreno") == 0) {
+        test_gpu();
     } else if (strcmp(cmd, "usb") == 0) {
         char state[64], speed[64];
         get_udc_state(state, sizeof(state));
@@ -1003,6 +1099,39 @@ static void handle_usb_cmd(char *cmd) {
         scan_sda_for_dtb(true, false);
     } else if (strcmp(cmd, "dump_dtb") == 0) {
         scan_sda_for_dtb(true, true);
+    } else if (strcmp(cmd, "dump_zap") == 0) {
+        usb_write("[+] Dumping signed Adreno 530 zap shader firmware files:\n");
+        dump_firmware_file_b64("a530_zap_signed.mdt");
+        dump_firmware_file_b64("a530_zap_signed.b00");
+        dump_firmware_file_b64("a530_zap_signed.b01");
+        dump_firmware_file_b64("a530_zap_signed.b02");
+        dump_firmware_file_b64("a530_zap_signed.mbn");
+    } else if (strncmp(cmd, "b64 ", 4) == 0) {
+        const char *p = cmd + 4;
+        while (*p == ' ') p++;
+        const char *slash = strrchr(p, '/');
+        const char *lbl = slash ? slash + 1 : p;
+        int fd = open(p, O_RDONLY);
+        if (fd < 0) {
+            char err[160];
+            snprintf(err, sizeof(err), "[-] Cannot open %s: %s\n", p, strerror(errno));
+            usb_write(err);
+        } else {
+            struct stat st;
+            if (fstat(fd, &st) < 0 || st.st_size <= 0) {
+                close(fd);
+                usb_write("[-] Bad file size\n");
+            } else {
+                uint8_t *buf = malloc(st.st_size);
+                if (buf && read(fd, buf, st.st_size) == st.st_size) {
+                    dump_base64_buf(lbl, buf, st.st_size, true);
+                } else {
+                    usb_write("[-] Read error\n");
+                }
+                free(buf);
+                close(fd);
+            }
+        }
     } else if (strcmp(cmd, "touch_test") == 0 || strcmp(cmd, "touch_probe") == 0) {
         test_touch_hardware();
     } else if (strcmp(cmd, "i2c") == 0 || strcmp(cmd, "i2c_scan") == 0) {
@@ -1011,6 +1140,11 @@ static void handle_usb_cmd(char *cmd) {
         dump_file_lines("/proc/mounts", 120, NULL, true);
     } else if (strcmp(cmd, "ls") == 0 || strncmp(cmd, "ls ", 3) == 0) {
         const char *dir = (strlen(cmd) > 3) ? cmd + 3 : "/";
+        while (*dir == ' ') dir++;
+        if (strncmp(dir, "-l ", 3) == 0) dir += 3;
+        else if (strncmp(dir, "-la ", 4) == 0) dir += 4;
+        else if (strncmp(dir, "-al ", 4) == 0) dir += 4;
+        else if (strncmp(dir, "-a ", 3) == 0) dir += 3;
         while (*dir == ' ') dir++;
         if (*dir == '\0') dir = "/";
         dump_sysfs_dir("Dir", dir, true);
@@ -1024,6 +1158,15 @@ static void handle_usb_cmd(char *cmd) {
         mkdir("/mnt/vendor_a", 0755);
         int r1 = mount("/dev/sda33", "/mnt/system_a", "ext4", MS_RDONLY, NULL);
         int r2 = mount("/dev/sda31", "/mnt/vendor_a", "ext4", MS_RDONLY, NULL);
+        if (r2 == 0) {
+            mkdir("/vendor", 0755);
+            mount("/mnt/vendor_a", "/vendor", NULL, MS_BIND | MS_RDONLY, NULL);
+            mkdir("/lib", 0755);
+            mkdir("/lib/firmware", 0755);
+            mount("/mnt/vendor_a/firmware", "/lib/firmware", NULL, MS_BIND | MS_RDONLY, NULL);
+            mkdir("/lib/firmware/qcom", 0755);
+            mount("/mnt/vendor_a/firmware", "/lib/firmware/qcom", NULL, MS_BIND | MS_RDONLY, NULL);
+        }
         char out[220];
         snprintf(out, sizeof(out), "mount sda33->/mnt/system_a: %d (%s)\nmount sda31->/mnt/vendor_a: %d (%s)\n",
                  r1, r1 == 0 ? "ok" : strerror(errno),
@@ -1088,6 +1231,16 @@ int main(void) {
     mkdir("/mnt/vendor_a", 0755);
     int sys_rc = mount("/dev/sda33", "/mnt/system_a", "ext4", MS_RDONLY, NULL);
     int ven_rc = mount("/dev/sda31", "/mnt/vendor_a", "ext4", MS_RDONLY, NULL);
+    if (ven_rc == 0) {
+        mkdir("/vendor", 0755);
+        mount("/mnt/vendor_a", "/vendor", NULL, MS_BIND | MS_RDONLY, NULL);
+        mkdir("/lib", 0755);
+        mkdir("/lib/firmware", 0755);
+        mount("/mnt/vendor_a/firmware", "/lib/firmware", NULL, MS_BIND | MS_RDONLY, NULL);
+        mkdir("/lib/firmware/qcom", 0755);
+        mount("/mnt/vendor_a/firmware", "/lib/firmware/qcom", NULL, MS_BIND | MS_RDONLY, NULL);
+        print_msg("[+] Bound /mnt/vendor_a/firmware to /vendor/firmware and /lib/firmware\n");
+    }
     {
         char mmsg[200];
         snprintf(mmsg, sizeof(mmsg),
