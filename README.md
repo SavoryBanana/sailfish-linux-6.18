@@ -14,12 +14,12 @@ This repository contains the complete board support package, device tree source,
 | **RPM Power Rails** | Qualcomm SMD RPM Regulators (`qcom,rpm-pm8994-regulators`) | **Working** | S4, L6, L14, L17, L18, L19 (2.85V), L20, L21, L22, L23, L24, L25, L28, L29 (3.0V), L30, LVS1, LVS2 |
 | **Touchscreen** | Synaptics S3708AR (`synaptics_dsxv26`) via RMI4 I2C | **Working** | Multi-touch digitizer (`/dev/input/event2`); real-time X/Y tracking & pressure |
 | **Watchdog** | Qualcomm APCS Watchdog (`0x09830000`) | **Working** | Early assembly pet in `head.S` + runtime keep-alive |
-| **Display** | Samsung AMOLED 1080x1920 (`simpledrm` / MDP5) | **Working** | Tear-free via `PING_PONG_0_DONE` sync & VIG0 re-anchoring |
+| **Display & KMS** | Native MSM MDP5 v1.7 KMS + DSI Host + Samsung EA8064TG AMOLED | **Working** | Native KMS modesetting (`card1-DSI-1` at 1080x1920@60Hz), fbcon (4 Tux penguins & boot log), DCS backlight |
 | **Storage (UFS)** | 32 GB Toshiba UFS 2.0 (`624000.ufshc`) | **Working** | All 6 LUNs enumerated; mounts `system_a` & `vendor_a` (ext4) |
 | **USB Peripheral** | DWC3 High-Speed (`6a00000.usb`) ConfigFS | **Working** | Interactive high-speed CDC-ACM serial shell (`18d1:d001`) |
 | **Crash Logging** | `pstore` / ramoops (`0x83500000`, 1 MB) | **Working** | `earlyramoops` console & `/sys/fs/pstore` accessible live |
 | **Battery & Charging** | PMI8994 Switch-Mode Charger & Fuel Gauge | **Working** | 1.5A fast charging, USB status, monotonic SoC & voltage reporting |
-| **GPU / KMS** | Adreno 530 + Native MDP5 DSI Host | **In Progress (WIP)** | Display working via `simpledrm`; native DRM/KMS & Adreno GPU WIP |
+| **GPU (3D)** | Freedreno Adreno 530 (`&gpu`, `&adreno_smmu`) | **In Progress (WIP)** | Display subsystem fully native; 3D acceleration WIP |
 
 ---
 
@@ -72,10 +72,25 @@ This repository contains the complete board support package, device tree source,
    - **Fuel Gauge Monotonic State of Charge:** Directly reads real-time battery percentage from PMI8994 `FG_SOC` (register `0x4009`) and battery voltage from `FG_BATT` (registers `0x4150` / `0x4151`), exposing `/sys/class/power_supply/smbb-bif/capacity` and `/sys/class/power_supply/smbb-bif/voltage_now`.
    - **Continuous USB Fast Charging:** Configured `qcom,fast-charge-current-limit = <1500000>` (1.5A) and `qcom,fast-charge-high-threshold-voltage = <4350000>` (4.35V cutoff) in DTS. The driver monitors USB status (`smbb-usbin`) and keeps the battery charged while running Linux workloads.
 
-6. **Native DRM KMS Display Engine & Freedreno Adreno 530 GPU (In Progress / WIP):**
-   - **Current Display Driver:** Display output is active and verified tear-free via `simpledrm` handover from the bootloader continuous splash (`/dev/dri/card0` and `/dev/fb0` at 1080x1920 RGB888).
-   - **Samsung EA8064TG AMOLED Panel Driver:** Authored native panel driver [`drivers/gpu/drm/panel/panel-samsung-ea8064tg.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/gpu/drm/panel/panel-samsung-ea8064tg.c) driving the 5.0" 1080x1920 command-mode DSI display with 4 lanes at 60Hz.
-   - **Native Hardware Subsystem Bring-up:** Native KMS (`&mdss`, `&mdp`, `&mdss_dsi0`), MMCC clock controller (`&mmcc`), and Freedreno 3D GPU (`&gpu`, `&adreno_smmu`) are in active bring-up. They are kept disabled in the default device tree to avoid conflicts with the bootloader's active continuous splash scanout pipeline until native display handover is complete.
+6. **Native DRM KMS Display Engine & Samsung EA8064TG AMOLED Panel Driver:**
+   - **Native Hardware KMS Subsystem:** Fully brought up the native Qualcomm display subsystem in mainline DRM:
+     - `msm_mdss` (`900000.display-subsystem`): Master MDSS platform controller managing power domains and component binding via `pm_runtime_resume_and_get`.
+     - `msm_mdp` (`901000.display-controller`): Mobile Display Processor MDP5 v1.7. Core clock capped at 300MHz (`max_clk = 300000000`) in [`mdp5_cfg.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/gpu/drm/msm/disp/mdp5/mdp5_cfg.c) to match MSM8996 PLL operating ranges.
+     - `msm_dsi` (`994000.dsi`) & `msm_dsi_phy` (`994400.phy`): DSI 6G v1.3 controller with 4 data lanes and non-continuous clock mode.
+   - **Multimedia Clock Controller (MMCC) Bringup:**
+     - Probes and drives the MSM8996 Multimedia Clock Controller at `8c0000.clock-controller`.
+     - Workaround for retail Pixel TrustZone XPU security: TrustZone locks register `0x529c` (`MMAGIC_BIMC_GDSC`). In [`drivers/clk/qcom/mmcc-msm8996.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/clk/qcom/mmcc-msm8996.c), disabled runtime GDSC probing (`gdscs = NULL`) and unflagged unclocked MMAGIC branches from `CLK_IS_CRITICAL` to avoid XPU security fault reboots.
+   - **MDP IOMMU / SMMU Handling:**
+     - The MDP SMMU at `d00000.iommu` probes cleanly using `qcom,skip-init` and `qcom,no-smr-check` properties in [`drivers/iommu/arm/arm-smmu/arm-smmu.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/iommu/arm/arm-smmu/arm-smmu.c) to prevent hardware reset while continuous scanout is live.
+     - Added `qcom,mdp5` to [`drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c) with `IOMMU_DOMAIN_IDENTITY` (bypass) default domain type for uninterrupted linear scanout.
+   - **Command-Mode Atomic KMS Modesetting & IRQ Sequencing:**
+     - Guarded `mdp_irq_update()` in [`drivers/gpu/drm/msm/disp/mdp5/mdp5_crtc.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/gpu/drm/msm/disp/mdp5/mdp5_crtc.c) so MMIO register writes to `REG_MDP5_INTR_EN` only execute while CRTC clocks and power domains are active.
+     - Configured command-mode ping-pong buffer sync write count (`REG_MDP5_PP_SYNC_WRCOUNT`) and disabled tearcheck gating (`REG_MDP5_PP_TEAR_CHECK_EN = 0`) in [`drivers/gpu/drm/msm/disp/mdp5/mdp5_cmd_encoder.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/gpu/drm/msm/disp/mdp5/mdp5_cmd_encoder.c) to allow frames to push immediately upon `CTL_START`.
+   - **Native Samsung EA8064TG AMOLED Panel Driver:**
+     - Fully authored [`drivers/gpu/drm/panel/panel-samsung-ea8064tg.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/gpu/drm/panel/panel-samsung-ea8064tg.c) driving the 5.0" 1080x1920 AMOLED panel with 4 DSI data lanes.
+     - Implements exact Novatek/Samsung manufacturer commands (`0xf0` CMD2 page selects, SPR rainbow RGB mode, SRAM display out, 120ms exit-sleep and display-on delays).
+     - Full backlight brightness control via standard 8-bit DCS command (`0x51`, 0-255 levels) registered in `/sys/class/backlight/994000.dsi.0`.
+     - Framebuffer console (`fb0: msmdrmfb frame buffer device`) renders live boot text and 4 Kryo Tux penguins on physical AMOLED hardware.
 
 7. **Interactive USB CDC-ACM Diagnostic Shell:**
    - [`tools/sailfish/init.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/init.c) binds a high-speed USB CDC-ACM serial console (`18d1:d001`) with commands:

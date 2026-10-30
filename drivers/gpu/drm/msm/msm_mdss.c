@@ -510,6 +510,10 @@ static int mdss_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, mdss);
 
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret)
+		DRM_DEV_ERROR(dev, "failed to resume mdss: %d\n", ret);
+
 	/*
 	 * MDP5/DPU based devices don't have a flat hierarchy. There is a top
 	 * level parent: MDSS, and children: MDP5/DPU, DSI, HDMI, eDP etc.

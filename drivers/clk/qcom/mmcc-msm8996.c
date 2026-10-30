@@ -1360,7 +1360,7 @@ static struct clk_branch mmagic_camss_axi_clk = {
 				&axi_clk_src.clkr.hw
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT | CLK_IS_CRITICAL,
+			.flags = CLK_SET_RATE_PARENT,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -1377,7 +1377,7 @@ static struct clk_branch mmagic_camss_noc_cfg_ahb_clk = {
 				{ .fw_name = "gcc_mmss_noc_cfg_ahb_clk", .name = "gcc_mmss_noc_cfg_ahb_clk" },
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT | CLK_IS_CRITICAL,
+			.flags = CLK_SET_RATE_PARENT,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -1496,7 +1496,7 @@ static struct clk_branch mmagic_mdss_axi_clk = {
 				&axi_clk_src.clkr.hw
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT | CLK_IS_CRITICAL,
+			.flags = CLK_SET_RATE_PARENT,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -1513,7 +1513,7 @@ static struct clk_branch mmagic_mdss_noc_cfg_ahb_clk = {
 				{ .fw_name = "gcc_mmss_noc_cfg_ahb_clk", .name = "gcc_mmss_noc_cfg_ahb_clk" },
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT | CLK_IS_CRITICAL,
+			.flags = CLK_SET_RATE_PARENT,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -1598,7 +1598,7 @@ static struct clk_branch mmagic_video_axi_clk = {
 				&axi_clk_src.clkr.hw
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT | CLK_IS_CRITICAL,
+			.flags = CLK_SET_RATE_PARENT,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -1615,7 +1615,7 @@ static struct clk_branch mmagic_video_noc_cfg_ahb_clk = {
 				{ .fw_name = "gcc_mmss_noc_cfg_ahb_clk", .name = "gcc_mmss_noc_cfg_ahb_clk" },
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT | CLK_IS_CRITICAL,
+			.flags = CLK_SET_RATE_PARENT,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -3155,7 +3155,7 @@ static struct clk_hw *mmcc_msm8996_hws[] = {
 	&gpll0_div.hw,
 };
 
-static struct gdsc mmagic_bimc_gdsc = {
+static struct gdsc mmagic_bimc_gdsc __maybe_unused = {
 	.gdscr = 0x529c,
 	.pd = {
 		.name = "mmagic_bimc",
@@ -3164,7 +3164,7 @@ static struct gdsc mmagic_bimc_gdsc = {
 	.flags = ALWAYS_ON,
 };
 
-static struct gdsc mmagic_video_gdsc = {
+static struct gdsc mmagic_video_gdsc __maybe_unused = {
 	.gdscr = 0x119c,
 	.gds_hw_ctrl = 0x120c,
 	.pd = {
@@ -3174,7 +3174,7 @@ static struct gdsc mmagic_video_gdsc = {
 	.flags = VOTABLE | ALWAYS_ON,
 };
 
-static struct gdsc mmagic_mdss_gdsc = {
+static struct gdsc mmagic_mdss_gdsc __maybe_unused = {
 	.gdscr = 0x247c,
 	.gds_hw_ctrl = 0x2480,
 	.pd = {
@@ -3184,7 +3184,7 @@ static struct gdsc mmagic_mdss_gdsc = {
 	.flags = VOTABLE | ALWAYS_ON,
 };
 
-static struct gdsc mmagic_camss_gdsc = {
+static struct gdsc mmagic_camss_gdsc __maybe_unused = {
 	.gdscr = 0x3c4c,
 	.gds_hw_ctrl = 0x3c50,
 	.pd = {
@@ -3194,7 +3194,7 @@ static struct gdsc mmagic_camss_gdsc = {
 	.flags = VOTABLE | ALWAYS_ON,
 };
 
-static struct gdsc venus_gdsc = {
+static struct gdsc venus_gdsc __maybe_unused = {
 	.gdscr = 0x1024,
 	.cxcs = (unsigned int []){ 0x1028, 0x1034, 0x1038 },
 	.cxc_count = 3,
@@ -3205,7 +3205,7 @@ static struct gdsc venus_gdsc = {
 	.pwrsts = PWRSTS_OFF_ON,
 };
 
-static struct gdsc venus_core0_gdsc = {
+static struct gdsc venus_core0_gdsc __maybe_unused = {
 	.gdscr = 0x1040,
 	.cxcs = (unsigned int []){ 0x1048 },
 	.cxc_count = 1,
@@ -3217,7 +3217,7 @@ static struct gdsc venus_core0_gdsc = {
 	.flags = HW_CTRL,
 };
 
-static struct gdsc venus_core1_gdsc = {
+static struct gdsc venus_core1_gdsc __maybe_unused = {
 	.gdscr = 0x1044,
 	.cxcs = (unsigned int []){ 0x104c },
 	.cxc_count = 1,
@@ -3229,7 +3229,7 @@ static struct gdsc venus_core1_gdsc = {
 	.flags = HW_CTRL,
 };
 
-static struct gdsc camss_gdsc = {
+static struct gdsc camss_gdsc __maybe_unused = {
 	.gdscr = 0x34a0,
 	.cxcs = (unsigned int []){ 0x36bc, 0x36c4 },
 	.cxc_count = 2,
@@ -3240,7 +3240,7 @@ static struct gdsc camss_gdsc = {
 	.pwrsts = PWRSTS_OFF_ON,
 };
 
-static struct gdsc vfe0_gdsc = {
+static struct gdsc vfe0_gdsc __maybe_unused = {
 	.gdscr = 0x3664,
 	.cxcs = (unsigned int []){ 0x36a8 },
 	.cxc_count = 1,
@@ -3251,7 +3251,7 @@ static struct gdsc vfe0_gdsc = {
 	.pwrsts = PWRSTS_OFF_ON,
 };
 
-static struct gdsc vfe1_gdsc = {
+static struct gdsc vfe1_gdsc __maybe_unused = {
 	.gdscr = 0x3674,
 	.cxcs = (unsigned int []){ 0x36ac },
 	.cxc_count = 1,
@@ -3262,7 +3262,7 @@ static struct gdsc vfe1_gdsc = {
 	.pwrsts = PWRSTS_OFF_ON,
 };
 
-static struct gdsc jpeg_gdsc = {
+static struct gdsc jpeg_gdsc __maybe_unused = {
 	.gdscr = 0x35a4,
 	.cxcs = (unsigned int []){ 0x35a8, 0x35b0, 0x35c0, 0x35b8 },
 	.cxc_count = 4,
@@ -3273,7 +3273,7 @@ static struct gdsc jpeg_gdsc = {
 	.pwrsts = PWRSTS_OFF_ON,
 };
 
-static struct gdsc cpp_gdsc = {
+static struct gdsc cpp_gdsc __maybe_unused = {
 	.gdscr = 0x36d4,
 	.cxcs = (unsigned int []){ 0x36b0 },
 	.cxc_count = 1,
@@ -3284,7 +3284,7 @@ static struct gdsc cpp_gdsc = {
 	.pwrsts = PWRSTS_OFF_ON,
 };
 
-static struct gdsc fd_gdsc = {
+static struct gdsc fd_gdsc __maybe_unused = {
 	.gdscr = 0x3b64,
 	.cxcs = (unsigned int []){ 0x3b68, 0x3b6c },
 	.cxc_count = 2,
@@ -3295,7 +3295,7 @@ static struct gdsc fd_gdsc = {
 	.pwrsts = PWRSTS_OFF_ON,
 };
 
-static struct gdsc mdss_gdsc = {
+static struct gdsc mdss_gdsc __maybe_unused = {
 	.gdscr = 0x2304,
 	.cxcs = (unsigned int []){ 0x2310, 0x231c },
 	.cxc_count = 2,
@@ -3306,7 +3306,7 @@ static struct gdsc mdss_gdsc = {
 	.pwrsts = PWRSTS_OFF_ON,
 };
 
-static struct gdsc gpu_gdsc = {
+static struct gdsc gpu_gdsc __maybe_unused = {
 	.gdscr = 0x4034,
 	.gds_hw_ctrl = 0x4038,
 	.pd = {
@@ -3316,7 +3316,7 @@ static struct gdsc gpu_gdsc = {
 	.flags = VOTABLE,
 };
 
-static struct gdsc gpu_gx_gdsc = {
+static struct gdsc gpu_gx_gdsc __maybe_unused = {
 	.gdscr = 0x4024,
 	.clamp_io_ctrl = 0x4300,
 	.cxcs = (unsigned int []){ 0x4028 },
@@ -3504,23 +3504,23 @@ static struct clk_regmap *mmcc_msm8996_clocks[] = {
 	[FD_AHB_CLK] = &fd_ahb_clk.clkr,
 };
 
-static struct gdsc *mmcc_msm8996_gdscs[] = {
-	[MMAGIC_BIMC_GDSC] = &mmagic_bimc_gdsc,
-	[MMAGIC_VIDEO_GDSC] = &mmagic_video_gdsc,
+static struct gdsc *mmcc_msm8996_gdscs[] __maybe_unused = {
+	[MMAGIC_BIMC_GDSC] = NULL, /* 0x529c is locked by TrustZone XPU on retail Pixel */
+	[MMAGIC_VIDEO_GDSC] = NULL,
 	[MMAGIC_MDSS_GDSC] = &mmagic_mdss_gdsc,
-	[MMAGIC_CAMSS_GDSC] = &mmagic_camss_gdsc,
-	[VENUS_GDSC] = &venus_gdsc,
-	[VENUS_CORE0_GDSC] = &venus_core0_gdsc,
-	[VENUS_CORE1_GDSC] = &venus_core1_gdsc,
-	[CAMSS_GDSC] = &camss_gdsc,
-	[VFE0_GDSC] = &vfe0_gdsc,
-	[VFE1_GDSC] = &vfe1_gdsc,
-	[JPEG_GDSC] = &jpeg_gdsc,
-	[CPP_GDSC] = &cpp_gdsc,
-	[FD_GDSC] = &fd_gdsc,
+	[MMAGIC_CAMSS_GDSC] = NULL,
+	[VENUS_GDSC] = NULL,
+	[VENUS_CORE0_GDSC] = NULL,
+	[VENUS_CORE1_GDSC] = NULL,
+	[CAMSS_GDSC] = NULL,
+	[VFE0_GDSC] = NULL,
+	[VFE1_GDSC] = NULL,
+	[JPEG_GDSC] = NULL,
+	[CPP_GDSC] = NULL,
+	[FD_GDSC] = NULL,
 	[MDSS_GDSC] = &mdss_gdsc,
-	[GPU_GDSC] = &gpu_gdsc,
-	[GPU_GX_GDSC] = &gpu_gx_gdsc,
+	[GPU_GDSC] = NULL,
+	[GPU_GX_GDSC] = NULL,
 };
 
 static const struct qcom_reset_map mmcc_msm8996_resets[] = {
@@ -3600,8 +3600,8 @@ static const struct qcom_cc_desc mmcc_msm8996_desc = {
 	.num_clks = ARRAY_SIZE(mmcc_msm8996_clocks),
 	.resets = mmcc_msm8996_resets,
 	.num_resets = ARRAY_SIZE(mmcc_msm8996_resets),
-	.gdscs = mmcc_msm8996_gdscs,
-	.num_gdscs = ARRAY_SIZE(mmcc_msm8996_gdscs),
+	.gdscs = NULL,
+	.num_gdscs = 0,
 	.clk_hws = mmcc_msm8996_hws,
 	.num_clk_hws = ARRAY_SIZE(mmcc_msm8996_hws),
 };

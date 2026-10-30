@@ -733,7 +733,7 @@ static const struct mdp5_cfg_hw msm8x96_config = {
 		.ib_inefficiency = 200,
 		.clk_inefficiency = 105
 	},
-	.max_clk = 412500000,
+	.max_clk = 300000000,
 };
 
 static const struct mdp5_cfg_hw msm8x76_config = {

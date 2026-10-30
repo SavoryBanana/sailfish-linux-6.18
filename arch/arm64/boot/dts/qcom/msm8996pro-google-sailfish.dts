@@ -142,6 +142,18 @@
 		output-high;
 	};
 
+	/*
+	 * Command-mode panel tearing-effect line: route it to the MDP vsync
+	 * input. The exact TE gpio is unconfirmed on Sailfish, so all three
+	 * mdp_vsync-capable pins (10/11/12, unused here) are muxed as inputs.
+	 */
+	mdss_te_default: mdss-te-default-state {
+		pins = "gpio10", "gpio11", "gpio12";
+		function = "mdp_vsync";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
 	touch_int_default: touch-int-default-state {
 		pins = "gpio125";
 		function = "gpio";
@@ -234,9 +246,19 @@
 	clock-names = "xo",
 		      "gpll0",
 		      "gcc_mmss_noc_cfg_ahb_clk";
+	protected-clocks = <MMSS_MMAGIC_AHB_CLK>,
+			   <MMSS_MMAGIC_CFG_AHB_CLK>,
+			   <MMSS_MMAGIC_AXI_CLK>,
+			   <MMSS_MMAGIC_MAXI_CLK>,
+			   <MMAGIC_BIMC_AXI_CLK>,
+			   <MMAGIC_BIMC_NOC_CFG_AHB_CLK>,
+			   <MMAGIC_CAMSS_AXI_CLK>,
+			   <MMAGIC_CAMSS_NOC_CFG_AHB_CLK>,
+			   <MMAGIC_VIDEO_AXI_CLK>,
+			   <MMAGIC_VIDEO_NOC_CFG_AHB_CLK>;
 	/delete-property/ assigned-clocks;
 	/delete-property/ assigned-clock-rates;
-	status = "disabled";
+	status = "okay";
 };
 
 &mnoc {
@@ -269,15 +291,23 @@
 };
 
 &mdp_smmu {
-	status = "disabled";
-};
-
-&mdp {
-	status = "disabled";
+	/delete-property/ power-domains;
+	qcom,skip-init;
+	qcom,no-smr-check;
+	status = "okay";
 };
 
 &mdss {
-	status = "disabled";
+	/delete-property/ power-domains;
+	status = "okay";
+};
+
+&mdp {
+	/delete-property/ assigned-clocks;
+	/delete-property/ assigned-clock-rates;
+	/delete-property/ interconnects;
+	/delete-property/ interconnect-names;
+	status = "okay";
 };
 
 &adreno_smmu {
@@ -289,8 +319,12 @@
 };
 
 &mdss_dsi0 {
+	/delete-property/ assigned-clocks;
+	/delete-property/ assigned-clock-parents;
 	vdda-supply = <&vreg_l2a_1p25>;
 	vcca-supply = <&vreg_l28a_0p925>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&mdss_te_default>;
 	status = "okay";
 
 	panel: panel@0 {

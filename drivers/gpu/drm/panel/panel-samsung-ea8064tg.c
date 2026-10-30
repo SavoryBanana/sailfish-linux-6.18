@@ -33,13 +33,13 @@ static inline struct ea8064tg_panel *to_ea8064tg_panel(struct drm_panel *panel)
 
 static void ea8064tg_reset(struct ea8064tg_panel *ctx)
 {
-	/* Hardware reset sequence: High 2ms, Low 1ms, High 10ms */
-	gpiod_set_value_cansleep(ctx->reset_gpio, 0); /* Active-low raw 1 = asserted */
-	usleep_range(2000, 3000);
-	gpiod_set_value_cansleep(ctx->reset_gpio, 1); /* Active-low raw 0 = reset pulse */
-	usleep_range(1000, 2000);
-	gpiod_set_value_cansleep(ctx->reset_gpio, 0); /* Release reset (raw 1) */
-	usleep_range(10000, 12000);
+	/* Hardware reset sequence: High 20ms, Low 20ms, High 20ms */
+	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+	msleep(20);
+	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+	msleep(20);
+	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+	msleep(20);
 }
 
 static int ea8064tg_on(struct ea8064tg_panel *ctx)
@@ -49,23 +49,51 @@ static int ea8064tg_on(struct ea8064tg_panel *ctx)
 
 	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 
-	/* 0x11: Exit sleep mode, delay 20ms */
-	mipi_dsi_dcs_exit_sleep_mode_multi(&dsi_ctx);
-	mipi_dsi_msleep(&dsi_ctx, 20);
+	/* CMD2 Page 4: VESA DSC setting */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x55, 0xaa, 0x52, 0x08, 0x04);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc0, 0x03);
 
-	/* 0x35: Set tear effect on (VBLANK mode) */
+	/* CMD2 Page 7: SubPixel Rendering (SPR) Mode: YYG Rainbow-RGB */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x55, 0xaa, 0x52, 0x08, 0x07);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xef, 0x01);
+
+	/* CMD2 Page 0: Display Output Control: SRAM Enable */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x55, 0xaa, 0x52, 0x08, 0x00);
+	/* Data Compression Mode: None (0x00) & VESA DSC Off (0x00) */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x90, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x03, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb4, 0x01);
+
+	/* Set Tear Effect ON (mode 0 = VBLANK) */
 	mipi_dsi_dcs_set_tear_on_multi(&dsi_ctx, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
 
-	/* Manufacturer key sequence */
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfc, 0x5a, 0x5a);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf4, 0x00, 0x01);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfc, 0xa5, 0xa5);
+	/* CMD2 Page 1: Novatek manufacturer key sequence */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x55, 0xaa, 0x52, 0x08, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0xaa, 0x55, 0xa5, 0x80);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6f, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf3, 0x10);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0xaa, 0x55, 0xa5, 0x00);
+
+	/* 0x11: Exit sleep mode, delay 120ms */
+	mipi_dsi_dcs_exit_sleep_mode_multi(&dsi_ctx);
+	mipi_dsi_msleep(&dsi_ctx, 120);
+
+	/* 0x29: Display ON, delay 120ms */
+	mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
+	mipi_dsi_msleep(&dsi_ctx, 120);
 
 	/* 0x53: Write control display (0x20 = brightness via DCS) */
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY, 0x20);
 
-	/* 0x29: Set display on */
-	mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
+	/* 0x51: Write initial display brightness (180/255) */
+	mipi_dsi_dcs_set_display_brightness_multi(&dsi_ctx, 180);
+
+	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+
+	if (dsi_ctx.accum_err)
+		pr_err("panel-samsung-ea8064tg: ea8064tg_on failed: %d\n", dsi_ctx.accum_err);
+	else
+		pr_info("panel-samsung-ea8064tg: ea8064tg_on success\n");
 
 	return dsi_ctx.accum_err;
 }
@@ -75,15 +103,17 @@ static int ea8064tg_off(struct ea8064tg_panel *ctx)
 	struct mipi_dsi_device *dsi = ctx->dsi;
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi };
 
-	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 
-	/* 0x28: Display off, delay 35ms */
+	/* 0x28: Display off, delay 120ms */
 	mipi_dsi_dcs_set_display_off_multi(&dsi_ctx);
-	mipi_dsi_msleep(&dsi_ctx, 35);
+	mipi_dsi_msleep(&dsi_ctx, 120);
 
-	/* 0x10: Enter sleep mode, delay 150ms */
+	/* 0x10: Enter sleep mode, delay 120ms */
 	mipi_dsi_dcs_enter_sleep_mode_multi(&dsi_ctx);
-	mipi_dsi_msleep(&dsi_ctx, 150);
+	mipi_dsi_msleep(&dsi_ctx, 120);
+
+	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
 
 	return dsi_ctx.accum_err;
 }
@@ -165,9 +195,9 @@ static const struct drm_panel_funcs ea8064tg_panel_funcs = {
 static int ea8064tg_bl_update_status(struct backlight_device *bl)
 {
 	struct mipi_dsi_device *dsi = bl_get_data(bl);
-	u16 brightness = (u16)backlight_get_brightness(bl);
+	u8 brightness = (u8)backlight_get_brightness(bl);
 
-	return mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
+	return mipi_dsi_dcs_set_display_brightness(dsi, brightness);
 }
 
 static const struct backlight_ops ea8064tg_bl_ops = {
@@ -212,6 +242,9 @@ static int ea8064tg_probe(struct mipi_dsi_device *dsi)
 
 	ctx->dsi = dsi;
 	mipi_dsi_set_drvdata(dsi, ctx);
+
+	/* DCS commands in prepare() need the DSI host powered up first */
+	ctx->panel.prepare_prev_first = true;
 
 	dsi->lanes = 4;
 	dsi->format = MIPI_DSI_FMT_RGB888;

@@ -368,6 +368,7 @@ static const struct of_device_id qcom_smmu_client_of_match[] __maybe_unused = {
 	{ .compatible = "qcom,adreno" },
 	{ .compatible = "qcom,adreno-gmu" },
 	{ .compatible = "qcom,mdp4" },
+	{ .compatible = "qcom,mdp5" },
 	{ .compatible = "qcom,mdss" },
 	{ .compatible = "qcom,qcm2290-mdss" },
 	{ .compatible = "qcom,sar2130p-mdss" },
@@ -667,10 +668,15 @@ static const struct qcom_smmu_config qcom_smmu_impl0_cfg = {
 
 /*
  * It is not yet possible to use MDP SMMU with the bypass quirk on the msm8996,
- * there are not enough context banks.
+ * there are not enough context banks. However, we must provide def_domain_type
+ * so display and GPU clients default to IDENTITY (bypass) domain.
  */
+static const struct arm_smmu_impl msm8996_smmu_impl = {
+	.def_domain_type = qcom_smmu_def_domain_type,
+};
+
 static const struct qcom_smmu_match_data msm8996_smmu_data = {
-	.impl = NULL,
+	.impl = &msm8996_smmu_impl,
 	.adreno_impl = &qcom_adreno_smmu_v2_impl,
 };
 

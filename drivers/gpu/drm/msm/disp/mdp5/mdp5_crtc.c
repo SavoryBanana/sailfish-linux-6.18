@@ -570,6 +570,11 @@ static void mdp5_crtc_atomic_enable(struct drm_crtc *crtc,
 
 	mdp5_crtc_mode_set_nofb(crtc);
 
+	mdp5_crtc->vblank.irqmask = mdp5_cstate->vblank_irqmask;
+	mdp5_crtc->err.irqmask = mdp5_cstate->err_irqmask;
+	mdp5_crtc->pp_done.irqmask = mdp5_cstate->pp_done_irqmask;
+	mdp_irq_update(&mdp5_kms->base);
+
 	mdp_irq_register(&mdp5_kms->base, &mdp5_crtc->err);
 
 	if (mdp5_cstate->cmd_mode)
@@ -820,6 +825,14 @@ static void mdp5_crtc_atomic_flush(struct drm_crtc *crtc,
 
 	blend_setup(crtc);
 
+	/* Ensure IRQ masks are updated BEFORE triggering CTL START only if already powered */
+	if (mdp5_crtc->enabled) {
+		mdp5_crtc->vblank.irqmask = mdp5_cstate->vblank_irqmask;
+		mdp5_crtc->err.irqmask = mdp5_cstate->err_irqmask;
+		mdp5_crtc->pp_done.irqmask = mdp5_cstate->pp_done_irqmask;
+		mdp_irq_update(&get_kms(crtc)->base);
+	}
+
 	/* PP_DONE irq is only used by command mode for now.
 	 * It is better to request pending before FLUSH and START trigger
 	 * to make sure no pp_done irq missed.
@@ -830,11 +843,6 @@ static void mdp5_crtc_atomic_flush(struct drm_crtc *crtc,
 		request_pp_done_pending(crtc);
 
 	mdp5_crtc->flushed_mask = crtc_flush_all(crtc);
-
-	/* XXX are we leaking out state here? */
-	mdp5_crtc->vblank.irqmask = mdp5_cstate->vblank_irqmask;
-	mdp5_crtc->err.irqmask = mdp5_cstate->err_irqmask;
-	mdp5_crtc->pp_done.irqmask = mdp5_cstate->pp_done_irqmask;
 
 	request_pending(crtc, PENDING_FLIP);
 }
@@ -1222,10 +1230,16 @@ static void mdp5_crtc_wait_for_pp_done(struct drm_crtc *crtc)
 	int ret;
 
 	ret = wait_for_completion_timeout(&mdp5_crtc->pp_completion,
-						msecs_to_jiffies(50));
-	if (ret == 0)
-		dev_warn_ratelimited(dev->dev, "pp done time out, lm=%d\n",
-				     mdp5_cstate->pipeline.mixer->lm);
+						msecs_to_jiffies(100));
+	if (ret == 0) {
+		struct mdp5_kms *mdp5_kms = get_kms(crtc);
+		u32 intr_en = mdp5_read(mdp5_kms, REG_MDP5_INTR_EN);
+		u32 intr_status = mdp5_read(mdp5_kms, REG_MDP5_INTR_STATUS);
+		dev_warn_ratelimited(dev->dev, "pp done time out, lm=%d pp=%d intr_en=0x%08x intr_status=0x%08x\n",
+				     mdp5_cstate->pipeline.mixer->lm,
+				     mdp5_cstate->pipeline.mixer->pp,
+				     intr_en, intr_status);
+	}
 }
 
 static void mdp5_crtc_wait_for_flush_done(struct drm_crtc *crtc)

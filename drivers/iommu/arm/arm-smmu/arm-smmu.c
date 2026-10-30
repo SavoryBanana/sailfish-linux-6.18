@@ -2226,8 +2226,18 @@ static int arm_smmu_device_probe(struct platform_device *pdev)
 	/* Check for RMRs and install bypass SMRs if any */
 	arm_smmu_rmr_install_bypass_smr(smmu);
 
-	arm_smmu_device_reset(smmu);
-	arm_smmu_test_smr_masks(smmu);
+	if (!of_property_read_bool(dev->of_node, "qcom,skip-init")) {
+		arm_smmu_device_reset(smmu);
+	} else {
+		dev_info(dev, "Qualcomm skip-init enabled: skipping hardware reset\n");
+	}
+
+	if (!of_property_read_bool(dev->of_node, "qcom,no-smr-check")) {
+		arm_smmu_test_smr_masks(smmu);
+	} else {
+		dev_info(dev, "Qualcomm no-smr-check enabled: skipping SMR mask test\n");
+		smmu->smr_mask_mask = smmu->streamid_mask;
+	}
 
 	err = iommu_device_sysfs_add(&smmu->iommu, smmu->dev, NULL,
 				     "smmu.%pa", &smmu->ioaddr);
@@ -2265,7 +2275,8 @@ static void arm_smmu_device_shutdown(struct platform_device *pdev)
 
 	arm_smmu_rpm_get(smmu);
 	/* Turn the thing off */
-	arm_smmu_gr0_write(smmu, ARM_SMMU_GR0_sCR0, ARM_SMMU_sCR0_CLIENTPD);
+	if (!of_property_read_bool(pdev->dev.of_node, "qcom,skip-init"))
+		arm_smmu_gr0_write(smmu, ARM_SMMU_GR0_sCR0, ARM_SMMU_sCR0_CLIENTPD);
 	arm_smmu_rpm_put(smmu);
 
 	if (pm_runtime_enabled(smmu->dev))
