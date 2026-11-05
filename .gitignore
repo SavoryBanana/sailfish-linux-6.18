@@ -192,3 +192,5 @@ sphinx_*/
 *.code-workspace
 console-ramoops*.txt
 ramoops_latest/
+edge/
+pmbootstrap*

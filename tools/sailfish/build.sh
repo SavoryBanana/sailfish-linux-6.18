@@ -84,7 +84,7 @@ python3 "$SCRIPT_DIR/mkbootimg.py" \
   --ramdisk_offset 0x02800000 \
   --tags_offset 0x02600000 \
   --pagesize 4096 \
-  --cmdline "console=tty0 console=earlyramoops keep_bootcon androidboot.hardware=sailfish root=/dev/ram0 rw rdinit=/init init=/init clk_ignore_unused pd_ignore_unused firmware_class.path=/vendor/firmware initcall_debug iommu.passthrough=1" \
+  --cmdline "console=ramoops0 console=tty0 keep_bootcon androidboot.hardware=sailfish androidboot.debuggable=1 androidboot.selinux=permissive androidboot.veritymode=disabled root=/dev/ram0 rw rdinit=/init init=/init clk_ignore_unused pd_ignore_unused firmware_class.path=/vendor/firmware initcall_debug iommu.passthrough=1 audit=0" \
   -o "$OUT_DIR/boot.img"
 
 echo "=== Build Complete: out/boot.img ($(ls -lh "$OUT_DIR/boot.img" | awk '{print $5}')) ==="

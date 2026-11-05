@@ -22,6 +22,10 @@
 #include <termios.h>
 #include <time.h>
 #include <errno.h>
+#include <sys/wait.h>
+#include <sys/sysmacros.h>
+#include <sys/xattr.h>
+#include <sched.h>
 
 static int g_ttygs_fd = -1;
 
@@ -249,6 +253,49 @@ static void dump_file_raw(const char *path) {
         }
     }
     close(fd);
+}
+
+static void dump_file_tail(const char *path, off_t bytes) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        char err[192];
+        snprintf(err, sizeof(err), "[-] Cannot open %s: %s\n", path, strerror(errno));
+        usb_write(err);
+        return;
+    }
+    char *buf = malloc(bytes);
+    if (!buf) {
+        close(fd);
+        return;
+    }
+    size_t total = 0;
+    char chunk[2048];
+    ssize_t n;
+    while ((n = read(fd, chunk, sizeof(chunk))) > 0) {
+        if (total + (size_t)n <= (size_t)bytes) {
+            memcpy(buf + total, chunk, n);
+            total += n;
+        } else {
+            size_t shift = (total + n) - bytes;
+            memmove(buf, buf + shift, bytes - n);
+            memcpy(buf + bytes - n, chunk, n);
+            total = bytes;
+        }
+    }
+    close(fd);
+
+    size_t off = 0;
+    while (off < total) {
+        ssize_t rc = write(g_ttygs_fd, buf + off, total - off);
+        if (rc > 0) {
+            off += rc;
+        } else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            usleep(2000);
+        } else {
+            break;
+        }
+    }
+    free(buf);
 }
 
 static void dump_file_lines(const char *path, int max_lines, const char *filter, bool usb_only) {
@@ -1008,6 +1055,719 @@ static void test_android_primitives(void) {
     dump_file_lines("/proc/cgroups", 20, NULL, true);
 }
 
+static void set_selinux_label(const char *path, const char *label) {
+    if (path && label) {
+        setxattr(path, "security.selinux", label, strlen(label) + 1, 0);
+    }
+}
+
+static void rm_rf(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0)
+        return;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path);
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                    continue;
+                char child[512];
+                snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
+                rm_rf(child);
+            }
+            closedir(d);
+        }
+        rmdir(path);
+    } else {
+        unlink(path);
+    }
+}
+
+static bool prepare_android_rootfs(bool for_shell) {
+    write_str("/proc/sys/kernel/printk_devkmsg", "on\n");
+    rm_rf("/dev/__properties__");
+    rm_rf("/dev/socket");
+    mkdir("/dev/socket", 0755);
+    mkdir("/dev/pts", 0755);
+    mount("devpts", "/dev/pts", "devpts", 0, NULL);
+    mkdir("/dev/dm-user", 0755);
+    symlink("/dev/mapper/control", "/dev/device-mapper");
+    set_selinux_label("/dev/mapper/control", "u:object_r:dm_device:s0");
+    set_selinux_label("/dev/loop-control", "u:object_r:loop_control_device:s0");
+    unlink("/dev/.coldboot_done");
+
+    mkdir("/mnt", 0755);
+    mkdir("/mnt/system_a", 0755);
+    mkdir("/mnt/vendor_a", 0755);
+
+    /* Mount system_a (sda33, fallback to sda35) rw and vendor_a (sda31) ro */
+    const char *sys_dev = "/dev/sda33";
+    int mrc = -1;
+    if (mount("/dev/sda33", "/mnt/system_a", "ext4", MS_REMOUNT, NULL) == 0 ||
+        mount("/dev/sda33", "/mnt/system_a", "ext4", 0, NULL) == 0 ||
+        mount("/dev/sda33", "/mnt/system_a", "ext4", MS_RDONLY, NULL) == 0) {
+        mrc = 0;
+        sys_dev = "/dev/sda33";
+    } else if (access("/mnt/system_a/system/bin/init", F_OK) == 0) {
+        mrc = 0;
+        sys_dev = "/dev/sda33";
+    } else {
+        if (mount("/dev/sda35", "/mnt/system_a", "ext4", MS_REMOUNT, NULL) == 0 ||
+            mount("/dev/sda35", "/mnt/system_a", "ext4", 0, NULL) == 0) {
+            mrc = 0;
+            sys_dev = "/dev/sda35";
+            usb_write("[+] Mounted system root from /dev/sda35 (userdata)\n");
+        }
+    }
+    mount("/dev/sda31", "/mnt/vendor_a", "ext4", MS_RDONLY, NULL);
+
+    /* Bind vendor into system_a/vendor */
+    mkdir("/mnt/system_a/vendor", 0755);
+    mount("/mnt/vendor_a", "/mnt/system_a/vendor", NULL, MS_BIND | MS_REC, NULL);
+
+    /* Mount tmpfs on system_a/apex, bootstrap-apex, and linkerconfig */
+    mkdir("/mnt/system_a/apex", 0755);
+    umount2("/mnt/system_a/apex", MNT_DETACH);
+    mount("tmpfs", "/mnt/system_a/apex", "tmpfs", 0, "mode=0755,uid=0,gid=0");
+
+    mkdir("/mnt/system_a/bootstrap-apex", 0755);
+    umount2("/mnt/system_a/bootstrap-apex", MNT_DETACH);
+    mount("tmpfs", "/mnt/system_a/bootstrap-apex", "tmpfs", 0, "mode=0755,uid=0,gid=0");
+
+    mkdir("/mnt/system_a/linkerconfig", 0755);
+    umount2("/mnt/system_a/linkerconfig", MNT_DETACH);
+    mount("tmpfs", "/mnt/system_a/linkerconfig", "tmpfs", 0, "mode=0755,uid=0,gid=0");
+
+    /* Bootstrap fallback inside com.android.runtime when launching interactive sh */
+    if (for_shell) {
+        const char *apex_roots[] = { "/mnt/system_a/apex", "/mnt/system_a/bootstrap-apex", NULL };
+        for (int a = 0; apex_roots[a]; a++) {
+            char ap[256];
+            snprintf(ap, sizeof(ap), "%s/com.android.runtime", apex_roots[a]);
+            mkdir(ap, 0755);
+            snprintf(ap, sizeof(ap), "%s/com.android.runtime/bin", apex_roots[a]);
+            mkdir(ap, 0755);
+            snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib64", apex_roots[a]);
+            mkdir(ap, 0755);
+            snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib64/bionic", apex_roots[a]);
+            mkdir(ap, 0755);
+            snprintf(ap, sizeof(ap), "%s/com.android.runtime/bin/linker64", apex_roots[a]);
+            symlink("/system/bin/bootstrap/linker64", ap);
+            snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib64/bionic/libc.so", apex_roots[a]);
+            symlink("/system/lib64/bootstrap/libc.so", ap);
+            snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib64/bionic/libm.so", apex_roots[a]);
+            symlink("/system/lib64/bootstrap/libm.so", ap);
+            snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib64/bionic/libdl.so", apex_roots[a]);
+            symlink("/system/lib64/bootstrap/libdl.so", ap);
+        }
+    }
+
+    /* Bind /dev, /proc, /sys into system_a */
+    mkdir("/mnt/system_a/dev", 0755);
+    mount("/dev", "/mnt/system_a/dev", NULL, MS_BIND | MS_REC, NULL);
+
+    mkdir("/mnt/system_a/proc", 0755);
+    mount("/proc", "/mnt/system_a/proc", NULL, MS_BIND | MS_REC, NULL);
+
+    mkdir("/mnt/system_a/sys", 0755);
+    mount("/sys", "/mnt/system_a/sys", NULL, MS_BIND | MS_REC, NULL);
+
+    mkdir("/mnt/system_a/sys/fs/selinux", 0755);
+    mount("none", "/mnt/system_a/sys/fs/selinux", "selinuxfs", 0, NULL);
+
+    /* Mount configfs for Android USB gadget at /config */
+    mkdir("/mnt/system_a/config", 0755);
+    mount("none", "/mnt/system_a/config", "configfs", 0, NULL);
+
+    /* Label critical /dev nodes with Android SELinux contexts */
+    const char *dev_dirs[] = { "/dev", "/mnt/system_a/dev", NULL };
+    for (int i = 0; dev_dirs[i]; i++) {
+        char p[256];
+        snprintf(p, sizeof(p), "%s/kmsg", dev_dirs[i]);
+        set_selinux_label(p, "u:object_r:kmsg_device:s0");
+        snprintf(p, sizeof(p), "%s/null", dev_dirs[i]);
+        set_selinux_label(p, "u:object_r:null_device:s0");
+        snprintf(p, sizeof(p), "%s/zero", dev_dirs[i]);
+        set_selinux_label(p, "u:object_r:zero_device:s0");
+        snprintf(p, sizeof(p), "%s/console", dev_dirs[i]);
+        set_selinux_label(p, "u:object_r:console_device:s0");
+        snprintf(p, sizeof(p), "%s/ptmx", dev_dirs[i]);
+        set_selinux_label(p, "u:object_r:ptmx_device:s0");
+        snprintf(p, sizeof(p), "%s/tty", dev_dirs[i]);
+        set_selinux_label(p, "u:object_r:tty_device:s0");
+        snprintf(p, sizeof(p), "%s/random", dev_dirs[i]);
+        set_selinux_label(p, "u:object_r:random_device:s0");
+        snprintf(p, sizeof(p), "%s/urandom", dev_dirs[i]);
+        set_selinux_label(p, "u:object_r:urandom_device:s0");
+        snprintf(p, sizeof(p), "%s/binder", dev_dirs[i]);
+        set_selinux_label(p, "u:object_r:binder_device:s0");
+        snprintf(p, sizeof(p), "%s/hwbinder", dev_dirs[i]);
+        set_selinux_label(p, "u:object_r:hwbinder_device:s0");
+        snprintf(p, sizeof(p), "%s/vndbinder", dev_dirs[i]);
+        set_selinux_label(p, "u:object_r:vndbinder_device:s0");
+        snprintf(p, sizeof(p), "%s/binderfs/binder", dev_dirs[i]);
+        set_selinux_label(p, "u:object_r:binder_device:s0");
+        snprintf(p, sizeof(p), "%s/binderfs/hwbinder", dev_dirs[i]);
+        set_selinux_label(p, "u:object_r:hwbinder_device:s0");
+        snprintf(p, sizeof(p), "%s/binderfs/vndbinder", dev_dirs[i]);
+        set_selinux_label(p, "u:object_r:vndbinder_device:s0");
+    }
+    set_selinux_label("/mnt/system_a/system/bin/init", "u:object_r:init_exec:s0");
+    set_selinux_label("/mnt/system_a/init", "u:object_r:init_exec:s0");
+
+    /* Mount in-memory tmpfs for /data (bypasses Qualcomm ICE encryption dependency) */
+    mkdir("/mnt/system_a/data", 0771);
+    mount("tmpfs", "/mnt/system_a/data", "tmpfs", 0, "mode=0771,uid=1000,gid=1000");
+    set_selinux_label("/mnt/system_a/data", "u:object_r:system_data_root_file:s0");
+
+    /* Mount in-memory tmpfs for cache and metadata */
+    mkdir("/mnt/system_a/cache", 0770);
+    mount("tmpfs", "/mnt/system_a/cache", "tmpfs", 0, "mode=0770,uid=1000,gid=2001");
+    set_selinux_label("/mnt/system_a/cache", "u:object_r:cache_file:s0");
+
+    mkdir("/mnt/system_a/metadata", 0700);
+    mount("tmpfs", "/mnt/system_a/metadata", "tmpfs", 0, "mode=0700");
+    set_selinux_label("/mnt/system_a/metadata", "u:object_r:metadata_file:s0");
+
+    /* Mount persist (sda3) and modem firmware (sda2) */
+    mkdir("/mnt/system_a/mnt", 0755);
+    umount2("/mnt/system_a/mnt", MNT_DETACH);
+    mount("tmpfs", "/mnt/system_a/mnt", "tmpfs", 0, "mode=0755,uid=0,gid=1000");
+    mkdir("/mnt/system_a/mnt/vendor", 0755);
+    mkdir("/mnt/system_a/mnt/vendor/persist", 0771);
+    mount("/dev/sda3", "/mnt/system_a/mnt/vendor/persist", "ext4", 0, NULL);
+    set_selinux_label("/mnt/system_a/mnt/vendor/persist", "u:object_r:persist_file:s0");
+
+    mkdir("/mnt/system_a/vendor/firmware_mnt", 0755);
+    mount("/dev/sda2", "/mnt/system_a/vendor/firmware_mnt", "vfat", MS_RDONLY, NULL);
+    set_selinux_label("/mnt/system_a/vendor/firmware_mnt", "u:object_r:firmware_file:s0");
+
+    /* Ensure block device symlinks and loop devices exist for Android fstab & apexd */
+    mkdir("/dev/block", 0755);
+    mkdir("/mnt/system_a/dev/block", 0755);
+    mkdir("/mnt/system_a/dev/block/mapper", 0755);
+    mkdir("/mnt/system_a/dev/block/by-name", 0755);
+    mkdir("/mnt/system_a/dev/block/bootdevice", 0755);
+    mkdir("/mnt/system_a/dev/block/bootdevice/by-name", 0755);
+    mkdir("/mnt/system_a/dev/block/platform", 0755);
+    mkdir("/mnt/system_a/dev/block/platform/soc", 0755);
+    mkdir("/mnt/system_a/dev/block/platform/soc/624000.ufshc", 0755);
+    mkdir("/mnt/system_a/dev/block/platform/soc/624000.ufshc/by-name", 0755);
+
+    int lcfd = open("/dev/loop-control", O_RDWR);
+    for (int l = 0; l < 96; l++) {
+        if (lcfd >= 0)
+            ioctl(lcfd, 0x4C80, l); /* LOOP_CTL_ADD */
+        char lpath[128], blpath[128];
+        snprintf(lpath, sizeof(lpath), "/dev/loop%d", l);
+        snprintf(blpath, sizeof(blpath), "/dev/block/loop%d", l);
+        mknod(lpath, S_IFBLK | 0660, makedev(7, l));
+        mknod(blpath, S_IFBLK | 0660, makedev(7, l));
+        set_selinux_label(lpath, "u:object_r:loop_device:s0");
+        set_selinux_label(blpath, "u:object_r:loop_device:s0");
+    }
+    if (lcfd >= 0)
+        close(lcfd);
+
+    const char *prefixes[] = {
+        "/mnt/system_a/dev/block/by-name",
+        "/mnt/system_a/dev/block/bootdevice/by-name",
+        "/mnt/system_a/dev/block/platform/soc/624000.ufshc/by-name",
+    };
+
+    /* Dynamically populate all sda partition symlinks from /sys/block/sda uevent files */
+    DIR *sd = opendir("/sys/block/sda");
+    if (sd) {
+        struct dirent *sde;
+        while ((sde = readdir(sd)) != NULL) {
+            if (strncmp(sde->d_name, "sda", 3) == 0 && isdigit(sde->d_name[3])) {
+                char devnode[64], blknode[128], uev_path[128], uev[256];
+                snprintf(devnode, sizeof(devnode), "/dev/%s", sde->d_name);
+                snprintf(blknode, sizeof(blknode), "/dev/block/%s", sde->d_name);
+                symlink(devnode, blknode);
+
+                snprintf(uev_path, sizeof(uev_path), "/sys/block/sda/%s/uevent", sde->d_name);
+                FILE *uf = fopen(uev_path, "r");
+                if (uf) {
+                    while (fgets(uev, sizeof(uev), uf)) {
+                        if (strncmp(uev, "PARTNAME=", 9) == 0) {
+                            char *nl = strchr(uev, '\n');
+                            if (nl) *nl = '\0';
+                            const char *pname = uev + 9;
+                            for (int p = 0; p < 3; p++) {
+                                char lpath[256];
+                                snprintf(lpath, sizeof(lpath), "%s/%s", prefixes[p], pname);
+                                symlink(devnode, lpath);
+                            }
+                        }
+                    }
+                    fclose(uf);
+                }
+            }
+        }
+        closedir(sd);
+    }
+
+    for (int p = 0; p < 3; p++) {
+        char linkpath[256];
+        snprintf(linkpath, sizeof(linkpath), "%s/system", prefixes[p]);
+        symlink(sys_dev, linkpath);
+        snprintf(linkpath, sizeof(linkpath), "%s/system_a", prefixes[p]);
+        symlink(sys_dev, linkpath);
+        snprintf(linkpath, sizeof(linkpath), "%s/system_b", prefixes[p]);
+        symlink(strcmp(sys_dev, "/dev/sda35") == 0 ? "/dev/sda35" : "/dev/sda34", linkpath);
+
+        snprintf(linkpath, sizeof(linkpath), "%s/vendor", prefixes[p]);
+        symlink("/dev/sda31", linkpath);
+        snprintf(linkpath, sizeof(linkpath), "%s/vendor_a", prefixes[p]);
+        symlink("/dev/sda31", linkpath);
+        snprintf(linkpath, sizeof(linkpath), "%s/vendor_b", prefixes[p]);
+        symlink("/dev/sda32", linkpath);
+
+        snprintf(linkpath, sizeof(linkpath), "%s/boot", prefixes[p]);
+        symlink("/dev/sda27", linkpath);
+        snprintf(linkpath, sizeof(linkpath), "%s/boot_a", prefixes[p]);
+        symlink("/dev/sda27", linkpath);
+        snprintf(linkpath, sizeof(linkpath), "%s/boot_b", prefixes[p]);
+        symlink("/dev/sda28", linkpath);
+
+        snprintf(linkpath, sizeof(linkpath), "%s/userdata", prefixes[p]);
+        symlink(strcmp(sys_dev, "/dev/sda35") == 0 ? "/dev/sda33" : "/dev/sda35", linkpath);
+
+        snprintf(linkpath, sizeof(linkpath), "%s/persist", prefixes[p]);
+        symlink("/dev/sda3", linkpath);
+
+        snprintf(linkpath, sizeof(linkpath), "%s/modem", prefixes[p]);
+        symlink("/dev/sda2", linkpath);
+        snprintf(linkpath, sizeof(linkpath), "%s/modem_a", prefixes[p]);
+        symlink("/dev/sda2", linkpath);
+    }
+
+    return true;
+}
+
+static pid_t find_android_init_pid(void) {
+    DIR *d = opendir("/proc");
+    if (!d)
+        return -1;
+    struct dirent *de;
+    pid_t found = -1;
+    while ((de = readdir(d)) != NULL) {
+        if (!isdigit(de->d_name[0]))
+            continue;
+        pid_t p = atoi(de->d_name);
+        if (p <= 1)
+            continue;
+        char comm_path[128], comm[64];
+        snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", (int)p);
+        if (read_first_line(comm_path, comm, sizeof(comm)) && strcmp(comm, "init") == 0) {
+            /* Prefer the PID that is PID 1 inside its own PID namespace */
+            char status_path[128], line[256];
+            snprintf(status_path, sizeof(status_path), "/proc/%d/status", (int)p);
+            FILE *sf = fopen(status_path, "r");
+            bool is_ns_pid1 = false;
+            if (sf) {
+                while (fgets(line, sizeof(line), sf)) {
+                    if (strncmp(line, "NSpid:", 6) == 0) {
+                        size_t len = strlen(line);
+                        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == ' ' || line[len - 1] == '\t'))
+                            line[--len] = '\0';
+                        if (len >= 2 && line[len - 1] == '1' && (line[len - 2] == '\t' || line[len - 2] == ' '))
+                            is_ns_pid1 = true;
+                        break;
+                    }
+                }
+                fclose(sf);
+            }
+            found = p;
+            if (is_ns_pid1)
+                break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+static void dump_logcat_filtered(const char *filter) {
+    FILE *f = fopen("/dev/logcat.txt", "r");
+    if (!f) {
+        usb_write("[-] /dev/logcat.txt not found (run boot_android first)\n");
+        return;
+    }
+    #define LOGCAT_RING 120
+    char *ring[LOGCAT_RING];
+    memset(ring, 0, sizeof(ring));
+    int idx = 0, count = 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "Waited one second for SurfaceFlingerAIDL"))
+            continue;
+        if (filter && *filter && !strstr(line, filter))
+            continue;
+        if (ring[idx])
+            free(ring[idx]);
+        ring[idx] = strdup(line);
+        idx = (idx + 1) % LOGCAT_RING;
+        count++;
+    }
+    fclose(f);
+
+    int start = (count > LOGCAT_RING) ? idx : 0;
+    int total = (count > LOGCAT_RING) ? LOGCAT_RING : count;
+    for (int i = 0; i < total; i++) {
+        int pos = (start + i) % LOGCAT_RING;
+        if (ring[pos]) {
+            usb_write(ring[pos]);
+            free(ring[pos]);
+        }
+    }
+}
+
+static void launch_android_shell(void) {
+    pid_t init_pid = find_android_init_pid();
+    if (init_pid > 1) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "[+] Joining live Android init (PID %d) PID + mount namespaces (non-destructive)...\n",
+                 (int)init_pid);
+        usb_write(msg);
+    } else {
+        usb_write("[+] Preparing Android rootfs & APEX runtime...\n");
+        prepare_android_rootfs(true);
+    }
+
+    usb_write("[+] Forking interactive Android Bionic root shell (/system/bin/sh)...\n");
+    usb_write("[+] Type 'exit' to return to sailfish# bringup shell.\n\n");
+
+    /* Switch ttyGS0 to blocking mode for interactive child shell */
+    if (g_ttygs_fd >= 0) {
+        int flags = fcntl(g_ttygs_fd, F_GETFL, 0);
+        fcntl(g_ttygs_fd, F_SETFL, flags & ~O_NONBLOCK);
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        char err[128];
+        snprintf(err, sizeof(err), "[-] fork failed: %s\n", strerror(errno));
+        usb_write(err);
+        return;
+    }
+
+    if (pid == 0) {
+        /* Child process: attach stdio to ttyGS0 */
+        if (g_ttygs_fd >= 0) {
+            dup2(g_ttygs_fd, 0);
+            dup2(g_ttygs_fd, 1);
+            dup2(g_ttygs_fd, 2);
+        }
+
+        bool joined_ns = false;
+        if (init_pid > 1) {
+            char pid_path[128], mnt_path[128], root_path[128];
+            snprintf(pid_path, sizeof(pid_path), "/proc/%d/ns/pid", (int)init_pid);
+            snprintf(mnt_path, sizeof(mnt_path), "/proc/%d/ns/mnt", (int)init_pid);
+            snprintf(root_path, sizeof(root_path), "/proc/%d/root", (int)init_pid);
+            int pid_fd = open(pid_path, O_RDONLY);
+            int mnt_fd = open(mnt_path, O_RDONLY);
+            int root_fd = open(root_path, O_RDONLY | O_DIRECTORY);
+            if (pid_fd >= 0) {
+                setns(pid_fd, CLONE_NEWPID);
+                close(pid_fd);
+            }
+            if (mnt_fd >= 0 && root_fd >= 0) {
+                if (setns(mnt_fd, CLONE_NEWNS) == 0 &&
+                    fchdir(root_fd) == 0 &&
+                    chroot(".") == 0 &&
+                    chdir("/") == 0) {
+                    joined_ns = true;
+                }
+            }
+            if (mnt_fd >= 0) close(mnt_fd);
+            if (root_fd >= 0) close(root_fd);
+
+            if (joined_ns) {
+                /* Fork inner child so it actually enters the target CLONE_NEWPID namespace! */
+                pid_t inner_sh = fork();
+                if (inner_sh > 0) {
+                    int ist = 0;
+                    waitpid(inner_sh, &ist, 0);
+                    _exit(WIFEXITED(ist) ? WEXITSTATUS(ist) : 0);
+                }
+            }
+        }
+
+        if (!joined_ns) {
+            if (chroot("/mnt/system_a") != 0) {
+                perror("[-] chroot(/mnt/system_a) failed");
+                _exit(1);
+            }
+            if (chdir("/") != 0) {
+                perror("[-] chdir(/) failed");
+                _exit(1);
+            }
+        }
+
+        char *envp[] = {
+            "PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/apex/com.android.runtime/bin:/apex/com.android.art/bin",
+            "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64",
+            "ANDROID_ROOT=/system",
+            "ANDROID_DATA=/data",
+            "ANDROID_STORAGE=/storage",
+            "ANDROID_ART_ROOT=/apex/com.android.art",
+            "ANDROID_I18N_ROOT=/apex/com.android.i18n",
+            "ANDROID_TZDATA_ROOT=/apex/com.android.tzdata",
+            "TERM=xterm-256color",
+            "HOSTNAME=sailfish",
+            "HOME=/",
+            NULL
+        };
+
+        char *argv[] = { (char *)"/system/bin/sh", NULL };
+        execve("/system/bin/sh", argv, envp);
+        execve("/system/bin/toybox", argv, envp);
+
+        perror("[-] execve /system/bin/sh failed");
+        _exit(127);
+    }
+
+    /* Parent waits for child shell */
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    /* Restore non-blocking on ttyGS0 */
+    if (g_ttygs_fd >= 0) {
+        int flags = fcntl(g_ttygs_fd, F_GETFL, 0);
+        fcntl(g_ttygs_fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    char res[128];
+    snprintf(res, sizeof(res), "\n[+] Android shell exited (status=%d)\n", WEXITSTATUS(status));
+    usb_write(res);
+}
+
+static void drain_kmsg_to_usb(int kfd) {
+    if (kfd < 0)
+        return;
+    char buf[4096];
+    char out[4160];
+    while (1) {
+        ssize_t n = read(kfd, buf, sizeof(buf) - 1);
+        if (n < 0) {
+            if (errno == EPIPE || errno == EINVAL)
+                continue;
+            break;
+        }
+        if (n == 0)
+            break;
+        buf[n] = '\0';
+        char *semi = strchr(buf, ';');
+        const char *msg = semi ? semi + 1 : buf;
+        snprintf(out, sizeof(out), "[kmsg] %s", msg);
+        usb_write(out);
+    }
+}
+
+static void boot_android_init(const char *stage) {
+    if (!stage || !*stage)
+        stage = "selinux_setup";
+
+    usb_write("[+] Preparing Android rootfs & filesystems...\n");
+    prepare_android_rootfs(false);
+
+    int kfd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+    if (kfd >= 0)
+        lseek(kfd, 0, SEEK_END);
+
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "[+] Launching Android /system/bin/init (%s) in isolated PID 1 namespace...\n"
+             "[+] Streaming live /dev/kmsg to serial! (Press Ctrl+C to abort & return to sailfish#)\n\n",
+             stage);
+    usb_write(msg);
+
+    pid_t outer = fork();
+    if (outer < 0) {
+        if (kfd >= 0) close(kfd);
+        usb_write("[-] fork failed\n");
+        return;
+    }
+
+    if (outer == 0) {
+        if (kfd >= 0) close(kfd);
+
+        if (chdir("/mnt/system_a") != 0) {
+            perror("[-] chdir(/mnt/system_a) failed");
+            _exit(1);
+        }
+        if (chroot(".") != 0) {
+            perror("[-] chroot(/mnt/system_a) failed");
+            _exit(1);
+        }
+        chdir("/");
+
+        /* unshare(CLONE_NEWNS) clones fs->root (/mnt/system_a) as the true mnt_ns->root! */
+        if (unshare(CLONE_NEWPID | CLONE_NEWNS) != 0) {
+            perror("[-] unshare(CLONE_NEWPID|CLONE_NEWNS) failed");
+        }
+
+        pid_t inner = fork();
+        if (inner < 0) {
+            perror("[-] inner fork failed");
+            _exit(1);
+        }
+
+        if (inner == 0) {
+            /* Child is now PID 1 inside its own pid_namespace and mnt_namespace rooted at /mnt/system_a */
+            mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL);
+
+            /* Mount fresh /proc for this PID namespace so /proc/1 is Android init */
+            umount2("/proc", MNT_DETACH);
+            mkdir("/proc", 0555);
+            mount("proc", "/proc", "proc", 0, NULL);
+
+            /* Attach stdout/stderr to ttyGS0 so any early linker/init stderr is visible */
+            if (g_ttygs_fd >= 0) {
+                dup2(g_ttygs_fd, 1);
+                dup2(g_ttygs_fd, 2);
+            }
+
+            char *argv_stage[] = { (char *)"/system/bin/init", (char *)stage, NULL };
+            char *argv_plain[] = { (char *)"/system/bin/init", NULL };
+            char *envp[] = {
+                "PATH=/sbin:/system/sbin:/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/apex/com.android.runtime/bin",
+                "ANDROID_ROOT=/system",
+                "ANDROID_DATA=/data",
+                "ANDROID_STORAGE=/storage",
+                "ANDROID_ART_ROOT=/apex/com.android.runtime",
+                "ANDROID_I18N_ROOT=/apex/com.android.tzdata",
+                "ANDROID_TZDATA_ROOT=/apex/com.android.tzdata",
+                "TERM=linux",
+                NULL
+            };
+
+            if (strcmp(stage, "first_stage") == 0 || strcmp(stage, "none") == 0) {
+                execve("/system/bin/init", argv_plain, envp);
+            } else {
+                execve("/system/bin/init", argv_stage, envp);
+            }
+            execve("/system/bin/init", argv_plain, envp);
+            perror("[-] execve /system/bin/init failed");
+            _exit(127);
+        }
+
+        int st = 0;
+        waitpid(inner, &st, 0);
+        if (WIFEXITED(st))
+            _exit(WEXITSTATUS(st));
+        _exit(128 + WTERMSIG(st));
+    }
+
+    int status = 0;
+    while (1) {
+        drain_kmsg_to_usb(kfd);
+
+        pid_t w = waitpid(outer, &status, WNOHANG);
+        if (w > 0 || w < 0)
+            break;
+
+        if (g_ttygs_fd >= 0) {
+            struct pollfd pfd;
+            pfd.fd = g_ttygs_fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            if (poll(&pfd, 1, 50) > 0 && (pfd.revents & POLLIN)) {
+                char rx[16];
+                ssize_t n = read(g_ttygs_fd, rx, sizeof(rx));
+                for (ssize_t i = 0; i < n; i++) {
+                    if (rx[i] == 0x03) { /* Ctrl+C */
+                        usb_write("\n[!] Ctrl+C received; terminating Android init namespace...\n");
+                        kill(outer, SIGKILL);
+                        waitpid(outer, &status, 0);
+                        goto done;
+                    }
+                }
+            }
+        } else {
+            usleep(50000);
+        }
+    }
+
+done:
+    usleep(200000);
+    drain_kmsg_to_usb(kfd);
+    if (kfd >= 0)
+        close(kfd);
+
+    char exit_msg[160];
+    snprintf(exit_msg, sizeof(exit_msg),
+             "\n[+] Android /init exited (status=%d) — phone kept alive in sailfish# shell!\n",
+             WIFEXITED(status) ? WEXITSTATUS(status) : status);
+    usb_write(exit_msg);
+}
+
+static void boot_linux_init(void) {
+    usb_write("[+] Preparing Linux rootfs & mount points...\n");
+    mkdir("/mnt", 0755);
+    mkdir("/mnt/system_a", 0755);
+
+    if (mount("/dev/sda33", "/mnt/system_a", "ext4", MS_REMOUNT, NULL) != 0 &&
+        mount("/dev/sda33", "/mnt/system_a", "ext4", 0, NULL) != 0) {
+        mount("/dev/sda35", "/mnt/system_a", "ext4", 0, NULL);
+    }
+
+    mkdir("/mnt/system_a/dev", 0755);
+    mount("/dev", "/mnt/system_a/dev", NULL, MS_BIND | MS_REC, NULL);
+
+    mkdir("/mnt/system_a/proc", 0755);
+    mount("/proc", "/mnt/system_a/proc", NULL, MS_BIND | MS_REC, NULL);
+
+    mkdir("/mnt/system_a/sys", 0755);
+    mount("/sys", "/mnt/system_a/sys", NULL, MS_BIND | MS_REC, NULL);
+
+    usb_write("[+] Moving root mount to /mnt/system_a (switch_root)...\n");
+    mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL);
+
+    if (chdir("/mnt/system_a") != 0) {
+        usb_write("[-] chdir(/mnt/system_a) failed\n");
+        return;
+    }
+
+    if (mount(".", "/", NULL, MS_MOVE, NULL) != 0) {
+        char err[128];
+        snprintf(err, sizeof(err), "[-] mount MS_MOVE failed: %s (falling back to chroot)\n", strerror(errno));
+        usb_write(err);
+    }
+
+    if (chroot(".") != 0) {
+        usb_write("[-] chroot failed\n");
+        return;
+    }
+    chdir("/");
+
+    usb_write("[+] Executing Linux init (/sbin/init / OpenRC / systemd) as PID 1...\n\n");
+    sync();
+    usleep(100000);
+
+    char *argv[] = { (char *)"/sbin/init", NULL };
+    char *envp[] = {
+        "PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/bin",
+        "TERM=linux",
+        "HOME=/root",
+        "USER=root",
+        NULL
+    };
+
+    execve("/sbin/init", argv, envp);
+    execve("/usr/lib/systemd/systemd", argv, envp);
+    execve("/lib/systemd/systemd", argv, envp);
+    execve("/bin/sh", argv, envp);
+
+    char err2[128];
+    snprintf(err2, sizeof(err2), "[-] execve failed: %s\n", strerror(errno));
+    usb_write(err2);
+}
+
 static void test_gpu(void) {
     char out[256];
     usb_write("[+] DRM DRI nodes (/dev/dri):\n");
@@ -1076,7 +1836,10 @@ static void handle_usb_cmd(char *cmd) {
                   "  uname             - Kernel version & machine info\n"
                   "  uptime            - System uptime (/proc/uptime)\n"
                   "  dmesg [filter]    - Dump kernel log (optional substring filter)\n"
-                  "  ramoops [filter]  - Dump /sys/fs/pstore/console-ramoops-0\n"
+                  "  ramoops [filter]  - Dump ramoops log (default: last 16KB; 'all' for full)\n"
+                  "  sh / android_sh   - Launch interactive Android Bionic root shell\n"
+                  "  boot_android      - Pivot root and hand off control to Android /init\n"
+                  "  boot_linux / pmos - Pivot root and hand off control to Linux /sbin/init\n"
                   "  input / touch     - List input devices & monitor events for 10s\n"
                   "  battery           - Show battery capacity, voltage, and charger state\n"
                   "  display / drm     - Show DRM/KMS connectors, CRTCs, and backlight\n"
@@ -1111,14 +1874,22 @@ static void handle_usb_cmd(char *cmd) {
         const char *flt = (strlen(cmd) > 6) ? cmd + 6 : NULL;
         while (flt && *flt == ' ') flt++;
         dump_dmesg_filtered(4000, flt);
+    } else if (strcmp(cmd, "logcat") == 0 || strncmp(cmd, "logcat ", 7) == 0) {
+        const char *flt = (strlen(cmd) > 7) ? cmd + 7 : NULL;
+        while (flt && *flt == ' ') flt++;
+        dump_logcat_filtered(flt);
     } else if (strcmp(cmd, "ramoops") == 0 || strncmp(cmd, "ramoops ", 8) == 0) {
         const char *flt = (strlen(cmd) > 8) ? cmd + 8 : NULL;
         while (flt && *flt == ' ') flt++;
         dump_sysfs_dir("pstore", "/sys/fs/pstore", true);
-        if (flt && *flt)
-            dump_file_lines("/sys/fs/pstore/console-ramoops-0", 4000, flt, true);
-        else
+        if (flt && strcmp(flt, "all") == 0) {
             dump_file_raw("/sys/fs/pstore/console-ramoops-0");
+        } else if (flt && *flt && strcmp(flt, "tail") != 0) {
+            dump_file_lines("/sys/fs/pstore/console-ramoops-0", 500, flt, true);
+        } else {
+            usb_write("[+] Showing last 16KB of /sys/fs/pstore/console-ramoops-0:\n");
+            dump_file_tail("/sys/fs/pstore/console-ramoops-0", 16384);
+        }
     } else if (strcmp(cmd, "input") == 0 || strcmp(cmd, "touch") == 0) {
         test_input_events(10);
     } else if (strcmp(cmd, "battery") == 0 || strcmp(cmd, "power") == 0) {
@@ -1129,6 +1900,16 @@ static void handle_usb_cmd(char *cmd) {
         test_gpu();
     } else if (strcmp(cmd, "android") == 0 || strcmp(cmd, "aosp") == 0) {
         test_android_primitives();
+    } else if (strcmp(cmd, "android_sh") == 0 || strcmp(cmd, "sh") == 0) {
+        launch_android_shell();
+    } else if (strcmp(cmd, "boot_android") == 0 || strcmp(cmd, "boot") == 0) {
+        boot_android_init("selinux_setup");
+    } else if (strncmp(cmd, "boot_android ", 13) == 0) {
+        const char *st = cmd + 13;
+        while (*st == ' ') st++;
+        boot_android_init(st);
+    } else if (strcmp(cmd, "boot_linux") == 0 || strcmp(cmd, "boot_pmos") == 0 || strcmp(cmd, "pmos") == 0) {
+        boot_linux_init();
     } else if (strcmp(cmd, "usb") == 0) {
         char state[64], speed[64];
         get_udc_state(state, sizeof(state));
@@ -1199,7 +1980,16 @@ static void handle_usb_cmd(char *cmd) {
         mkdir("/mnt", 0755);
         mkdir("/mnt/system_a", 0755);
         mkdir("/mnt/vendor_a", 0755);
-        int r1 = mount("/dev/sda33", "/mnt/system_a", "ext4", MS_RDONLY, NULL);
+        const char *sys_dev = "sda33";
+        int r1 = mount("/dev/sda33", "/mnt/system_a", "ext4", MS_REMOUNT, NULL);
+        if (r1 != 0) r1 = mount("/dev/sda33", "/mnt/system_a", "ext4", 0, NULL);
+        if (r1 != 0) r1 = mount("/dev/sda33", "/mnt/system_a", "ext4", MS_RDONLY, NULL);
+        if (r1 != 0 && access("/mnt/system_a/system/bin/init", F_OK) == 0) r1 = 0;
+        if (r1 != 0) {
+            r1 = mount("/dev/sda35", "/mnt/system_a", "ext4", MS_REMOUNT, NULL);
+            if (r1 != 0) r1 = mount("/dev/sda35", "/mnt/system_a", "ext4", 0, NULL);
+            if (r1 == 0) sys_dev = "sda35(userdata)";
+        }
         int r2 = mount("/dev/sda31", "/mnt/vendor_a", "ext4", MS_RDONLY, NULL);
         if (r2 == 0) {
             mkdir("/vendor", 0755);
@@ -1211,8 +2001,8 @@ static void handle_usb_cmd(char *cmd) {
             mount("/mnt/vendor_a/firmware", "/lib/firmware/qcom", NULL, MS_BIND | MS_RDONLY, NULL);
         }
         char out[220];
-        snprintf(out, sizeof(out), "mount sda33->/mnt/system_a: %d (%s)\nmount sda31->/mnt/vendor_a: %d (%s)\n",
-                 r1, r1 == 0 ? "ok" : strerror(errno),
+        snprintf(out, sizeof(out), "mount system (%s)->/mnt/system_a: %d (%s)\nmount sda31->/mnt/vendor_a: %d (%s)\n",
+                 sys_dev, r1, r1 == 0 ? "ok" : strerror(errno),
                  r2, r2 == 0 ? "ok" : strerror(errno));
         print_msg(out);
     } else if (strcmp(cmd, "bootloader") == 0) {
@@ -1249,6 +2039,8 @@ int main(void) {
     mount("none", "/sys", "sysfs", 0, NULL);
     mkdir("/sys/fs/pstore", 0755);
     mount("pstore", "/sys/fs/pstore", "pstore", 0, NULL);
+    mkdir("/sys/fs/selinux", 0755);
+    mount("none", "/sys/fs/selinux", "selinuxfs", 0, NULL);
     mkdir("/dev/binderfs", 0755);
     mount("binder", "/dev/binderfs", "binder", 0, "stats=global");
     symlink("/dev/binderfs/binder", "/dev/binder");
@@ -1273,11 +2065,18 @@ int main(void) {
     if (!usb_bound)
         print_msg("[-] UDC not ready yet; will retry in loop\n");
 
-    /* Try mounting stock/installed system_a & vendor_a read-only as a sanity test */
+    /* Mount installed system_a (sda33) read-write and vendor_a read-only */
     mkdir("/mnt", 0755);
     mkdir("/mnt/system_a", 0755);
     mkdir("/mnt/vendor_a", 0755);
-    int sys_rc = mount("/dev/sda33", "/mnt/system_a", "ext4", MS_RDONLY, NULL);
+    int sys_rc = mount("/dev/sda33", "/mnt/system_a", "ext4", 0, NULL);
+    if (sys_rc != 0)
+        sys_rc = mount("/dev/sda33", "/mnt/system_a", "ext4", MS_RDONLY, NULL);
+    if (sys_rc != 0) {
+        sys_rc = mount("/dev/sda35", "/mnt/system_a", "ext4", 0, NULL);
+        if (sys_rc == 0)
+            print_msg("[+] Mounted system root from /dev/sda35 (userdata)\n");
+    }
     int ven_rc = mount("/dev/sda31", "/mnt/vendor_a", "ext4", MS_RDONLY, NULL);
     if (ven_rc == 0) {
         mkdir("/vendor", 0755);

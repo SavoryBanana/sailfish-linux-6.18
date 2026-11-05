@@ -4127,6 +4127,10 @@ struct mnt_namespace *copy_mnt_ns(u64 flags, struct mnt_namespace *ns,
 	}
 
 	old = ns->root;
+	if (new_fs && new_fs->root.mnt &&
+	    new_fs->root.dentry == new_fs->root.mnt->mnt_root &&
+	    real_mount(new_fs->root.mnt)->mnt_ns == ns)
+		old = real_mount(new_fs->root.mnt);
 
 	new_ns = alloc_mnt_ns(user_ns, false);
 	if (IS_ERR(new_ns))

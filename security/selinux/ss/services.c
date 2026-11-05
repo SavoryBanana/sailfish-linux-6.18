@@ -1531,6 +1531,17 @@ static int string_to_context_struct(struct policydb *pol,
 	*p++ = 0;
 
 	typdatum = symtab_search(&pol->p_types, scontextp);
+	if (!typdatum || typdatum->attribute) {
+		if (role->value == OBJECT_R_VAL) {
+			typdatum = symtab_search(&pol->p_types, "vendor_file");
+			if (!typdatum || typdatum->attribute)
+				typdatum = symtab_search(&pol->p_types, "system_file");
+		} else {
+			typdatum = symtab_search(&pol->p_types, "vendor_init");
+			if (!typdatum || typdatum->attribute)
+				typdatum = symtab_search(&pol->p_types, "init");
+		}
+	}
 	if (!typdatum || typdatum->attribute)
 		goto out;
 

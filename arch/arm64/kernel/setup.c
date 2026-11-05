@@ -212,31 +212,10 @@ static void __init early_fb_bar(int start_line, int num_lines, u32 color)
 
 static void __init early_ramoops_log(const char *msg)
 {
-	u32 *hdr = early_memremap_prot(0x83540000, 0x1000,
-				       pgprot_val(pgprot_writecombine(PAGE_KERNEL)));
-
-	if (hdr) {
-		char *buf = (char *)&hdr[3];
-		u32 pos;
-
-		if (hdr[0] != 0x43474244) {
-			hdr[0] = 0x43474244; /* 'DBGC' */
-			hdr[1] = 0;
-			hdr[2] = 0;
-		}
-		pos = hdr[1];
-		if (pos > 3900)
-			pos = 0;
-		while (*msg && pos < 4000)
-			buf[pos++] = *msg++;
-		hdr[1] = pos;
-		hdr[2] = pos;
-		dsb(sy);
-		early_memunmap(hdr, 0x1000);
-	}
+	(void)msg;
 }
 
-bool sailfish_early_ramoops_disabled;
+bool sailfish_early_ramoops_disabled = true;
 EXPORT_SYMBOL_GPL(sailfish_early_ramoops_disabled);
 
 static void sailfish_early_ramoops_write(struct console *con, const char *s,

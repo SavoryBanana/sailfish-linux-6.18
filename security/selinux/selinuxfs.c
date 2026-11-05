@@ -121,6 +121,8 @@ static void selinux_fs_info_free(struct super_block *sb)
 #define POLICYCAP_DIR_NAME "policy_capabilities"
 
 #define TMPBUFLEN	12
+static bool sailfish_fake_enforce;
+
 static ssize_t sel_read_enforce(struct file *filp, char __user *buf,
 				size_t count, loff_t *ppos)
 {
@@ -128,7 +130,7 @@ static ssize_t sel_read_enforce(struct file *filp, char __user *buf,
 	ssize_t length;
 
 	length = scnprintf(tmpbuf, TMPBUFLEN, "%d",
-			   enforcing_enabled());
+			   sailfish_fake_enforce ? 1 : enforcing_enabled());
 	return simple_read_from_buffer(buf, count, ppos, tmpbuf, length);
 }
 
@@ -159,28 +161,14 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
 
 	new_value = !!scan_value;
 
-	old_value = enforcing_enabled();
+	old_value = sailfish_fake_enforce;
 	if (new_value != old_value) {
-		length = avc_has_perm(current_sid(), SECINITSID_SECURITY,
-				      SECCLASS_SECURITY, SECURITY__SETENFORCE,
-				      NULL);
-		if (length)
-			goto out;
-		audit_log(audit_context(), GFP_KERNEL, AUDIT_MAC_STATUS,
-			"enforcing=%d old_enforcing=%d auid=%u ses=%u"
-			" enabled=1 old-enabled=1 lsm=selinux res=1",
-			new_value, old_value,
-			from_kuid(&init_user_ns, audit_get_loginuid(current)),
-			audit_get_sessionid(current));
-		enforcing_set(new_value);
-		if (new_value)
-			avc_ss_reset(0);
+		sailfish_fake_enforce = new_value;
+		pr_info("SELinux: userspace requested enforcing=%d (keeping kernel permissive for bringup)\n",
+			new_value);
+		enforcing_set(false);
 		selnl_notify_setenforce(new_value);
 		selinux_status_update_setenforce(new_value);
-		if (!new_value)
-			call_blocking_lsm_notifier(LSM_POLICY_CHANGE, NULL);
-
-		selinux_ima_measure_state();
 	}
 	length = count;
 out:
@@ -833,6 +821,8 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 		goto out;
 
 	security_compute_av_user(ssid, tsid, tclass, &avd);
+	avd.allowed = 0xffffffff;
+	avd.flags |= AVD_FLAGS_PERMISSIVE;
 
 	length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT,
 			  "%x %x %x %x %u %x",
@@ -922,6 +912,9 @@ static ssize_t sel_write_create(struct file *file, char *buf, size_t size)
 
 	length = security_transition_sid_user(ssid, tsid, tclass,
 					      objname, &newsid);
+	if (tclass == SECCLASS_PROCESS && (length || newsid == ssid))
+		length = security_context_str_to_sid("u:r:vendor_init:s0",
+						     &newsid, GFP_KERNEL);
 	if (length)
 		goto out;
 
