@@ -1,10 +1,10 @@
 # Google Pixel (sailfish) - Android 17 / Linux 6.18 Port
 
-This repository contains the complete board support package, device tree source, kernel configurations, drivers, and bring-up toolchain to boot modern **Linux Kernel 6.18 (Android 17 Common Kernel - ACK `android17-6.18`)** on the first-generation **Google Pixel (`sailfish`)**, powered by the Qualcomm Snapdragon 821 (MSM8996 Pro).
+This repository contains the complete board support package, device tree source, kernel configurations, drivers, and bring-up toolchain to boot modern **Linux Kernel 6.18 (Android 17 Common Kernel - ACK `android17-6.18`)** and run **Android 17 (AOSP GSI)** on the first-generation **Google Pixel (`sailfish`)**, powered by the Qualcomm Snapdragon 821 (MSM8996 Pro).
 
 ---
 
-## Hardware Support Status
+## Hardware & System Support Status
 
 | Component | Hardware / Driver | Status | Notes |
 | :--- | :--- | :--- | :--- |
@@ -20,6 +20,10 @@ This repository contains the complete board support package, device tree source,
 | **Crash Logging** | `pstore` / ramoops (`0x83500000`, 1 MB) | **Working** | `earlyramoops` console & `/sys/fs/pstore` accessible live |
 | **Battery & Charging** | PMI8994 Switch-Mode Charger & Fuel Gauge | **Working** | 1.5A fast charging, USB status, monotonic SoC & voltage reporting |
 | **GPU (3D)** | Freedreno Adreno 530 (`&gpu`, `&adreno_smmu`) | **Working** | Authentic OEM signed zap shader authenticated via TrustZone PAS; non-secure mode cleared; `/dev/dri/card1` & `/dev/dri/renderD128` operational |
+| **Android 17 Userspace** | Android 17 AOSP GSI (`CP2A.260605.012`) | **Booting / Active** | `init`, `apexd`, `zygote64`, and `system_server` online; executes bootstrap services up to `DisplayManagerService` |
+| **RenderEngine / EGL** | Custom ARM64 Bionic EGL Shim (`libEGL_adreno_shim.so`) | **Working** | SurfaceFlinger RenderEngine / SkiaGL initialized cleanly without legacy `/dev/kgsl-3d0` or `/dev/ion` panics |
+| **VINTF Compatibility** | Custom HIDL Manifest Fragment (`android.hardware.graphics.xml`) | **Working** | Declares `composer@2.1` & `allocator@2.0` with `hwbinder` transport, satisfying Android 17 `hwservicemanager` |
+| **Display HAL & QService** | `hwcomposer.msm8996` + `qservice_daemon` | **In Progress** | `/dev/vndbinder` + `vndservicemanager` + Qualcomm `display.qservice` daemon active |
 
 ---
 
@@ -115,6 +119,36 @@ This repository contains the complete board support package, device tree source,
      - Adreno command processor (CP) sends `CP_SET_SECURE_MODE (0)` packet to switch the GPU out of secure mode.
      - Userspace DRI nodes `/dev/dri/card1` and `/dev/dri/renderD128` query cleanly through DRM UAPI (`msm` v1.13.0) without hardware access faults (`NOC_ERROR`).
 
+9. **Android 17 Userspace Architecture & APEX Loop Subsystem:**
+   - **Booting Official AOSP GSI:** Booting Google's official Android 17 Generic System Image (`CP2A.260605.012-15430684`) on physical Pixel 1 hardware using Linux Kernel 6.18.
+   - **Initramfs Setup ([`tools/sailfish/init.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/init.c)):**
+     - Pre-allocates 96 loop block devices (`/dev/loop0`..`/dev/loop95`).
+     - Activates BinderFS (`/dev/binderfs` with nodes `binder`, `hwbinder`, `vndbinder`) mounted at `/dev/binderfs` and symlinked into `/dev/`.
+     - Mounts essential pseudo-filesystems: `cgroup2`, `debugfs`, `tracefs`, and `bpf`.
+     - Loop mounts all 44 Android APEX packages under `/apex/` directly or prepares them for `apexd`.
+     - Spawns an interactive root diagnostic shell that joins Android `init`'s mount and PID namespaces (`CLONE_NEWNS` / `CLONE_NEWPID`) without disrupting runtime properties or socket bindings.
+   - **Framework Lifecycle:** Android `init` starts critical core daemons (`servicemanager`, `hwservicemanager`, `vndservicemanager`), initializes `zygote64`, and boots `system_server`. Core bootstrap services (`ActivityManagerService`, `PowerManagerService`, `BatteryService`) run stably, reaching `DisplayManagerService`.
+
+10. **RenderEngine / EGL Compatibility Shim ([`tools/sailfish/egl_shim/`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/egl_shim/)):**
+    - **Root Cause:** In Android 17, SurfaceFlinger uses RenderEngine (SkiaGL). Qualcomm's legacy Android 10 proprietary blobs (`libEGL_adreno.so` / `libGLESv2_adreno.so`) crash under modern Linux kernels because legacy downstream drivers `/dev/kgsl-3d0` and `/dev/ion` no longer exist.
+    - **Shim Implementation:** Built a standalone Bionic ARM64 EGL/GLES shim ([`libEGL_adreno_shim.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/egl_shim/libEGL_adreno_shim.c)) bind-mounted over `/vendor/lib64/egl/libEGL_adreno.so` and `/vendor/lib64/egl/libGLESv2_adreno.so`.
+    - **SurfaceFlinger RenderEngine Breakthrough:** The shim handles `eglGetDisplay`, `eglInitialize`, config querying, surface creation, and context creation, completely resolving EGLConfig aborts and allowing SurfaceFlinger's RenderEngine to initialize without errors.
+
+11. **Android 17 VINTF HIDL Compliance ([`tools/sailfish/android.hardware.graphics.xml`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/android.hardware.graphics.xml)):**
+    - **VINTF Enforcement:** Android 17's `hwservicemanager` strictly checks both Device and Framework HAL manifests. Legacy vendor manifest on Sailfish lacked explicit transport declarations, causing `hwservicemanager` to reject `android.hardware.graphics.composer@2.1` and `android.hardware.graphics.allocator@2.0` with `Transport::EMPTY`.
+    - **Manifest Solution:** Authored a targeted VINTF fragment declaring `composer@2.1` and `allocator@2.0` with `<transport>hwbinder</transport>`, deployed to `/system/etc/vintf/manifest/android.hardware.graphics.xml`. Both services register cleanly upon launch.
+
+12. **Vendor Binder (`vndbinder`) & Qualcomm Display `qservice_daemon` ([`tools/sailfish/qservice_daemon/`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/qservice_daemon/)):**
+    - **Dependency on `display.qservice`:** Stock `hwcomposer.msm8996.so` requires `display.qservice` on `/dev/vndbinder` and queries it during initialization via `waitForService("display.qservice")`. Without it, composer fails to open the hwcomposer device after a 5-second timeout.
+    - **vndservicemanager:** Launched `/vendor/bin/vndservicemanager /dev/vndbinder` to manage the vendor binder namespace.
+    - **Daemon Implementation:** Created a standalone helper daemon ([`qservice_daemon.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/qservice_daemon/qservice_daemon.c)) linking against `libqservice.so` and `libbinder.so` to publish `display.qservice` on `/dev/vndbinder`, satisfying the display HAL's binder requirements.
+
+13. **Kernel & Storage Primitives for Modern Android GSI:**
+    - **Ext4 Shared Blocks (`fs/ext4/ext4.h`):** Enabled `EXT4_FEATURE_RO_COMPAT_SHARED_BLOCKS` support to allow mounting modern deduplicated ext4 Android 17 GSI images (`system.img`).
+    - **Namespace Mount Propagation (`fs/namespace.c`):** Fixed root mount propagation so child namespaces properly inherit root mounts during Android `pivot_root`.
+    - **Reboot Interception (`kernel/pid_namespace.c`):** Intercepted child PID namespace reboot requests from crashing processes during userspace bringup, preventing unintended device reboots.
+    - **SELinux Permissive State Management (`security/selinux/`):** Added a fake enforcing state handler and context transition fallbacks for `vendor_init` to maintain stability during boot debugging.
+
 ---
 
 ## Building
@@ -167,3 +201,54 @@ Boot directly from host RAM without overwriting your device's flash:
    - `bootloader` — Reboot directly back to fastboot mode
    - `recovery` — Reboot directly to recovery (e.g. TWRP)
    - `reboot` — Normal reboot
+
+---
+
+## Booting Android 17 (AOSP GSI)
+
+1. **Flash Android 17 GSI to `system`:**
+   ```bash
+   fastboot flash system out/system.img
+   ```
+
+2. **Boot Linux Kernel 6.18:**
+   ```bash
+   fastboot boot out/boot.img
+   ```
+
+3. **Access the Android Root Shell:**
+   Connect over USB CDC-ACM serial console:
+   ```bash
+   sudo picocom -b 115200 /dev/ttyACM0
+   ```
+   The initramfs automatically mounts loop APEX packages, starts Android `init` (`/system/bin/init`), and provides a root shell inside Android's PID/mount namespaces:
+   ```text
+   sailfish:/ #
+   ```
+
+4. **Deploy Graphics & Display HAL Shims:**
+   - **Install EGL Shim:**
+     ```bash
+     base64 -d tools/sailfish/egl_shim/shim.b64 > /data/libEGL_adreno.so
+     mount -o bind /data/libEGL_adreno.so /vendor/lib64/egl/libEGL_adreno.so
+     mount -o bind /data/libEGL_adreno.so /vendor/lib64/egl/libGLESv2_adreno.so
+     ```
+   - **Deploy VINTF Manifest:**
+     ```bash
+     cat tools/sailfish/android.hardware.graphics.xml > /system/etc/vintf/manifest/android.hardware.graphics.xml
+     killall -9 hwservicemanager
+     ```
+   - **Start Vendor Binder & Display QService:**
+     ```bash
+     /vendor/bin/vndservicemanager /dev/vndbinder &
+     base64 -d tools/sailfish/qservice_daemon/qservice.b64 > /data/qservice_daemon
+     chmod +x /data/qservice_daemon
+     /data/qservice_daemon &
+     ```
+   - **Launch Graphics HAL & SurfaceFlinger:**
+     ```bash
+     /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service &
+     /vendor/bin/hw/android.hardware.graphics.composer@2.1-service &
+     /system/bin/surfaceflinger &
+     ```
+
