@@ -1121,6 +1121,7 @@ static void setup_mdss_sysfs_mock(void) {
 
     const char *panel_content =
         "panel_name=s6e3fa5_cmd\n"
+        "primary_panel=1\n"
         "xres=1080\n"
         "yres=1920\n"
         "bpp=24\n"
@@ -1130,7 +1131,9 @@ static void setup_mdss_sysfs_mock(void) {
 
     write_file_str("/sys/devices/virtual/graphics/fb0/msm_fb_type", "mipi dsi cmd panel\n");
     write_file_str("/sys/devices/virtual/graphics/fb0/connected", "1\n");
-    write_file_str("/sys/devices/virtual/graphics/fb0/msm_fb_split", "0\n");
+    write_file_str("/sys/devices/virtual/graphics/fb0/msm_fb_split", "0 0\n");
+    write_file_str("/sys/devices/virtual/graphics/fb0/vsync_event", "VSYNC=0\n");
+    chmod("/sys/devices/virtual/graphics/fb0/vsync_event", 0666);
 
     /* Also provide /sys/class/graphics/fb0 mapping */
     mkdir("/sys/class/graphics", 0755);
@@ -1142,6 +1145,7 @@ static void setup_mdss_sysfs_mock(void) {
     chmod("/dev/dri/card0", 0666);
     chmod("/dev/dri/card1", 0666);
     chmod("/dev/dri/renderD128", 0666);
+    chmod("/dev/ion", 0666);
 
     usb_write("[+] Automated: MDSS sysfs mock initialized (10 pipes, SDE 5.0, panel s6e3fa5_cmd)\n");
 }
@@ -1268,6 +1272,18 @@ static bool prepare_android_rootfs(bool for_shell) {
         if (access(link29, F_OK) != 0 && access(target31, F_OK) == 0) {
             symlink("31.0.compat.cil", link29);
         }
+    }
+
+    /* Automated: Ensure ICU libraries are accessible in /system/lib64 for SurfaceFlinger */
+    const char *icu_libs[] = {
+        "libicu.so", "libicui18n.so", "libicuuc.so", "libandroidicu.so", "libicu_jni.so", NULL
+    };
+    for (int i = 0; icu_libs[i]; i++) {
+        char target[256], linkpath[256];
+        snprintf(target, sizeof(target), "/apex/com.android.i18n/lib64/%s", icu_libs[i]);
+        snprintf(linkpath, sizeof(linkpath), "/mnt/system_a/system/lib64/%s", icu_libs[i]);
+        unlink(linkpath);
+        symlink(target, linkpath);
     }
 
     /* Automated: Create graphics and DRM compatibility device symlinks */
@@ -1425,30 +1441,71 @@ static bool prepare_android_rootfs(bool for_shell) {
         usb_write("[+] Automated: Installed /data/setup_composer_sysfs.sh\n");
     }
 
+    /* Automated: Install libsdm_shim.so and libEGL_adreno_shim.so into /data */
+    if (access("/tools/libsdm_shim.so", F_OK) == 0) {
+        copy_file("/tools/libsdm_shim.so", "/mnt/system_a/data/libsdm_shim.so");
+        chmod("/mnt/system_a/data/libsdm_shim.so", 0755);
+        set_selinux_label("/mnt/system_a/data/libsdm_shim.so", "u:object_r:system_file:s0");
+        usb_write("[+] Automated: Installed /data/libsdm_shim.so\n");
+    }
+    if (access("/tools/libEGL_adreno_shim.so", F_OK) == 0) {
+        copy_file("/tools/libEGL_adreno_shim.so", "/mnt/system_a/data/libEGL_adreno_shim.so");
+        chmod("/mnt/system_a/data/libEGL_adreno_shim.so", 0755);
+        set_selinux_label("/mnt/system_a/data/libEGL_adreno_shim.so", "u:object_r:system_file:s0");
+        usb_write("[+] Automated: Installed /data/libEGL_adreno_shim.so\n");
+    }
+
     /* Automated: Generate /data/start_graphics.sh helper script */
     FILE *gf = fopen("/mnt/system_a/data/start_graphics.sh", "w");
     if (gf) {
         fprintf(gf, "#!/system/bin/sh\n"
                     "setenforce 0 2>/dev/null\n"
                     "export LD_LIBRARY_PATH=/apex/com.android.i18n/lib64:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/system/lib64:/vendor/lib64\n"
+                    "chmod 666 /dev/ion 2>/dev/null\n"
+                    "chmod 666 /dev/dma_heap/* 2>/dev/null\n"
                     "mkdir -p /dev/graphics 2>/dev/null\n"
                     "[ ! -e /dev/graphics/fb0 ] && [ -e /dev/fb0 ] && ln -sf /dev/fb0 /dev/graphics/fb0\n"
                     "mkdir -p /dev/dri 2>/dev/null\n"
                     "[ ! -e /dev/dri/card0 ] && [ -e /dev/dri/card1 ] && ln -sf /dev/dri/card1 /dev/dri/card0\n"
+                    "if [ -f /data/libEGL_adreno_shim.so ]; then\n"
+                    "    mount -o bind /data/libEGL_adreno_shim.so /vendor/lib64/egl/libEGL_adreno.so 2>/dev/null || true\n"
+                    "    mount -o bind /data/libEGL_adreno_shim.so /vendor/lib64/egl/libGLESv2_adreno.so 2>/dev/null || true\n"
+                    "fi\n"
                     "killall -9 qservice_daemon 2>/dev/null\n"
                     "if ! ps -A | grep -q vndservicemanager; then\n"
-                    "    /vendor/bin/vndservicemanager /dev/vndbinder &\n"
+                    "    /vendor/bin/vndservicemanager /dev/vndbinder >/dev/null 2>&1 &\n"
                     "    sleep 0.5\n"
                     "fi\n"
-                    "/data/qservice_daemon &\n"
+                    "/data/qservice_daemon >/dev/null 2>&1 &\n"
                     "sleep 0.5\n"
-                    "start vendor.hwcomposer-2-1 2>/dev/null\n"
-                    "/vendor/bin/hw/android.hardware.graphics.allocator@2.0-service &\n"
-                    "/vendor/bin/hw/android.hardware.graphics.composer@2.1-service &\n"
+                    "stop vendor.hwcomposer-2-1 2>/dev/null\n"
+                    "killall -9 android.hardware.graphics.composer@2.1-service 2>/dev/null\n"
+                    "/vendor/bin/hw/android.hardware.graphics.allocator@2.0-service >/dev/null 2>&1 &\n"
+                    "touch /sys/devices/virtual/graphics/fb0/vsync_event 2>/dev/null\n"
+                    "chmod 666 /sys/devices/virtual/graphics/fb0/vsync_event 2>/dev/null\n"
+                    "echo 200 > /sys/class/backlight/994000.dsi.0/brightness 2>/dev/null || true\n"
+                    "if [ -f /data/libsdm_shim.so ]; then\n"
+                    "    LD_PRELOAD=/data/libsdm_shim.so /vendor/bin/hw/android.hardware.graphics.composer@2.1-service >/dev/null 2>&1 &\n"
+                    "else\n"
+                    "    /vendor/bin/hw/android.hardware.graphics.composer@2.1-service >/dev/null 2>&1 &\n"
+                    "fi\n"
                     "sleep 0.5\n"
+                    "setprop service.sf.prime_shader_cache 0\n"
                     "killall -9 surfaceflinger 2>/dev/null\n"
-                    "/system/bin/surfaceflinger &\n"
-                    "echo '[+] Graphics stack launched in background!'\n");
+                    "if [ -f /data/libsdm_shim.so ]; then\n"
+                    "    LD_PRELOAD=/data/libsdm_shim.so /system/bin/surfaceflinger >/data/sf.log 2>&1 &\n"
+                    "else\n"
+                    "    /system/bin/surfaceflinger >/data/sf.log 2>&1 &\n"
+                    "fi\n"
+                    "sleep 1\n"
+                    "setprop ctl.stop bootanim 2>/dev/null\n"
+                    "killall -9 bootanimation 2>/dev/null\n"
+                    "if [ -f /data/libsdm_shim.so ]; then\n"
+                    "    LD_PRELOAD=/data/libsdm_shim.so /system/bin/bootanimation >/dev/null 2>&1 &\n"
+                    "else\n"
+                    "    /system/bin/bootanimation >/dev/null 2>&1 &\n"
+                    "fi\n"
+                    "echo '[+] Graphics stack & BootAnimation launched in background!'\n");
         fclose(gf);
         chmod("/mnt/system_a/data/start_graphics.sh", 0755);
         set_selinux_label("/mnt/system_a/data/start_graphics.sh", "u:object_r:system_file:s0");
@@ -1503,6 +1560,10 @@ static bool prepare_android_rootfs(bool for_shell) {
     }
     if (lcfd >= 0)
         close(lcfd);
+
+    /* Ensure /dev/ion device permissions and SELinux label */
+    chmod("/mnt/system_a/dev/ion", 0666);
+    set_selinux_label("/mnt/system_a/dev/ion", "u:object_r:ion_device:s0");
 
     const char *prefixes[] = {
         "/mnt/system_a/dev/block/by-name",
@@ -1689,8 +1750,10 @@ static void launch_android_shell(void) {
     }
 
     if (pid == 0) {
-        /* Child process: attach stdio to ttyGS0 */
+        /* Set new session and acquire ttyGS0 as controlling terminal */
+        setsid();
         if (g_ttygs_fd >= 0) {
+            ioctl(g_ttygs_fd, TIOCSCTTY, 1);
             dup2(g_ttygs_fd, 0);
             dup2(g_ttygs_fd, 1);
             dup2(g_ttygs_fd, 2);
@@ -1724,10 +1787,23 @@ static void launch_android_shell(void) {
                 /* Fork inner child so it actually enters the target CLONE_NEWPID namespace! */
                 pid_t inner_sh = fork();
                 if (inner_sh > 0) {
+                    /* Parent ignores terminal signals so Ctrl+C goes directly to the foreground shell job */
+                    signal(SIGINT, SIG_IGN);
+                    signal(SIGQUIT, SIG_IGN);
+                    signal(SIGTSTP, SIG_IGN);
                     int ist = 0;
                     waitpid(inner_sh, &ist, 0);
                     _exit(WIFEXITED(ist) ? WEXITSTATUS(ist) : 0);
                 }
+
+                /* Child: assign own process group and make it foreground on controlling tty */
+                setpgid(0, 0);
+                if (g_ttygs_fd >= 0) {
+                    tcsetpgrp(0, getpgrp());
+                }
+                signal(SIGINT, SIG_DFL);
+                signal(SIGQUIT, SIG_DFL);
+                signal(SIGTSTP, SIG_DFL);
             }
         }
 
@@ -2298,6 +2374,9 @@ int main(void) {
     mkdir("/dev", 0755);
 
     mount("none", "/dev", "devtmpfs", 0, NULL);
+    if (access("/dev/tty", F_OK) != 0) {
+        mknod("/dev/tty", S_IFCHR | 0666, makedev(5, 0));
+    }
     mount("none", "/proc", "proc", 0, NULL);
     mount("none", "/sys", "sysfs", 0, NULL);
     mkdir("/sys/fs/pstore", 0755);

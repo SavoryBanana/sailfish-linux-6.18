@@ -56,10 +56,43 @@ static void msm_fbdev_fb_destroy(struct fb_info *info)
 	kfree(helper);
 }
 
+static int msm_fbdev_ioctl(struct fb_info *info, unsigned int cmd, unsigned long arg)
+{
+	if (_IOC_TYPE(cmd) == 'm') {
+		unsigned int nr = _IOC_NR(cmd);
+		if (nr == 166) { /* MSMFB_METADATA_GET */
+			uint32_t op = 0;
+			if (copy_from_user(&op, (void __user *)arg, sizeof(op)))
+				return -EFAULT;
+			if (op == 2) { /* metadata_op_frame_rate */
+				uint32_t fps = 60;
+				if (copy_to_user((void __user *)(arg + 8), &fps, sizeof(fps)))
+					return -EFAULT;
+			}
+			return 0;
+		} else if (nr == 165) { /* MSMFB_METADATA_SET */
+			return 0;
+		} else if (nr == 160) { /* MSMFB_OVERLAY_VSYNC_CTRL */
+			return 0;
+		} else if (nr == 164) { /* MSMFB_DISPLAY_COMMIT */
+			return 0;
+		}
+		return 0; /* Succeed on all other MSMFB ioctls */
+	}
+	return drm_fb_helper_ioctl(info, cmd, arg);
+}
+
 static const struct fb_ops msm_fb_ops = {
 	.owner = THIS_MODULE,
 	__FB_DEFAULT_DEFERRED_OPS_RDWR(msm_fbdev),
-	DRM_FB_HELPER_DEFAULT_OPS,
+	.fb_check_var	= drm_fb_helper_check_var,
+	.fb_set_par	= drm_fb_helper_set_par,
+	.fb_setcmap	= drm_fb_helper_setcmap,
+	.fb_blank	= drm_fb_helper_blank,
+	.fb_pan_display	= drm_fb_helper_pan_display,
+	.fb_debug_enter = drm_fb_helper_debug_enter,
+	.fb_debug_leave = drm_fb_helper_debug_leave,
+	.fb_ioctl	= msm_fbdev_ioctl,
 	__FB_DEFAULT_DEFERRED_OPS_DRAW(msm_fbdev),
 	.fb_mmap = msm_fbdev_mmap,
 	.fb_destroy = msm_fbdev_fb_destroy,
