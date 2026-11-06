@@ -37,6 +37,18 @@ elif [ -f "/lib/firmware/qcom/apq8096/a530_zap.mbn.zst" ]; then
     cp "$OUT_DIR/initramfs_root/lib/firmware/qcom/a530_zap.mdt" "$OUT_DIR/initramfs_root/lib/firmware/a530_zap.mbn"
 fi
 
+# Stage Android 17 graphics compatibility shims and manifests
+echo "[+] Staging Android 17 graphics compatibility shims into initramfs"
+mkdir -p "$OUT_DIR/initramfs_root/tools"
+cp "$SCRIPT_DIR/egl_shim/libEGL_adreno_shim.so" "$OUT_DIR/initramfs_root/tools/libEGL_adreno_shim.so"
+cp "$SCRIPT_DIR/qservice_daemon/qservice_daemon" "$OUT_DIR/initramfs_root/tools/qservice_daemon"
+chmod +x "$OUT_DIR/initramfs_root/tools/qservice_daemon"
+cp "$SCRIPT_DIR/android.hardware.graphics.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.graphics.xml"
+if [ -f "$SCRIPT_DIR/setup_composer_sysfs.sh" ]; then
+    cp "$SCRIPT_DIR/setup_composer_sysfs.sh" "$OUT_DIR/initramfs_root/tools/setup_composer_sysfs.sh"
+    chmod +x "$OUT_DIR/initramfs_root/tools/setup_composer_sysfs.sh"
+fi
+
 (cd "$OUT_DIR/initramfs_root" && find . | cpio -o -H newc | gzip -9 > "$OUT_DIR/initramfs.cpio.gz")
 
 echo "=== 2. Configuring Kernel (sailfish_defconfig) ==="

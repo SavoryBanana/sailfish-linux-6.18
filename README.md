@@ -23,7 +23,7 @@ This repository contains the complete board support package, device tree source,
 | **Android 17 Userspace** | Android 17 AOSP GSI (`CP2A.260605.012`) | **Booting / Active** | `init`, `apexd`, `zygote64`, and `system_server` online; executes bootstrap services up to `DisplayManagerService` |
 | **RenderEngine / EGL** | Custom ARM64 Bionic EGL Shim (`libEGL_adreno_shim.so`) | **Working** | SurfaceFlinger RenderEngine / SkiaGL initialized cleanly without legacy `/dev/kgsl-3d0` or `/dev/ion` panics |
 | **VINTF Compatibility** | Custom HIDL Manifest Fragment (`android.hardware.graphics.xml`) | **Working** | Declares `composer@2.1` & `allocator@2.0` with `hwbinder` transport, satisfying Android 17 `hwservicemanager` |
-| **Display HAL & QService** | `hwcomposer.msm8996` + `qservice_daemon` | **In Progress** | `/dev/vndbinder` + `vndservicemanager` + Qualcomm `display.qservice` daemon active |
+| **Display HAL & QService** | `hwcomposer.msm8996` + `libsdmcore` + `qservice_daemon` | **Core Created / HWDevice In Progress** | `qservice_daemon` active on `/dev/vndbinder` via AIDL servicemanager shim; `caps` reverse-engineered with 10 pipes (4 VIG, 4 DMA, 2 Cursor), `hw_rev=268894210`, `clk_fudge_factor=105 100`; `CoreInterface::CreateCore` succeeds; currently solving `HWDevice::Init: Primary Display Device should be present` (`GetFBNodeIndex`) |
 
 ---
 
@@ -140,10 +140,36 @@ This repository contains the complete board support package, device tree source,
 
 12. **Vendor Binder (`vndbinder`) & Qualcomm Display `qservice_daemon` ([`tools/sailfish/qservice_daemon/`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/qservice_daemon/)):**
     - **Dependency on `display.qservice`:** Stock `hwcomposer.msm8996.so` requires `display.qservice` on `/dev/vndbinder` and queries it during initialization via `waitForService("display.qservice")`. Without it, composer fails to open the hwcomposer device after a 5-second timeout.
-    - **vndservicemanager:** Launched `/vendor/bin/vndservicemanager /dev/vndbinder` to manage the vendor binder namespace.
-    - **Daemon Implementation:** Created a standalone helper daemon ([`qservice_daemon.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/qservice_daemon/qservice_daemon.c)) linking against `libqservice.so` and `libbinder.so` to publish `display.qservice` on `/dev/vndbinder`, satisfying the display HAL's binder requirements.
+    - **vndservicemanager Modernization:** Android 17 deprecates legacy HIDL servicemanager. Bind-mounted Android 17 AIDL `servicemanager` over `/vendor/bin/vndservicemanager`, providing modern AIDL binder context on `/dev/vndbinder`.
+    - **Daemon Implementation & ARM64 ABI Bridge:** Authored a standalone helper daemon ([`qservice_daemon.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/qservice_daemon/qservice_daemon.c)) compiled with dynamic stubs. Utilizes register-level ARM64 `BLR` calling conventions (`x8` indirect return buffer) to bridge Bionic `sp<ProcessState>` and `sp<IServiceManager>` ABI across modern Android 17 and legacy vendor binder:
+      - `ProcessState::initWithDriver("/dev/vndbinder")`
+      - `ProcessState::getContextObject()`
+      - `IServiceManager::asInterface()`
+      - `getServiceManagerShimFromAidlServiceManagerForTests()`
+      - `setDefaultServiceManager()`
+      - `android::Init()` from `libqservice.so`
+      - Successfully publishes `display.qservice` into the vendor binder tree.
 
-13. **Kernel & Storage Primitives for Modern Android GSI:**
+13. **Qualcomm SDM Core & MDP Caps Reverse-Engineering (`libsdmcore.so`):**
+    - **Clock Fudge Factor Crash (SIGSEGV in `strtol_l` / `atoi`):**
+      - `libsdmcore.so` crashed at `0x288b0` when reading `/sys/devices/virtual/graphics/fb0/mdp/caps`.
+      - Disassembly revealed the parser expects `clk_fudge_factor` to supply **two space-separated integer values** (`<numerator> <denominator>`), e.g. `clk_fudge_factor=105 100`.
+    - **SDE Hardware Revision:**
+      - Set `hw_rev=268894210` (`0x10070002` in hex), identifying the MDSS hardware as Snapdragon 821 (MSM8996 Pro) SDE v5.0.
+    - **MDP Pipe Parser Reverse-Engineering (`0x28e5c`–`0x29330`):**
+      - Discovered the exact syntax required by `HWInfo::GetHWResourceInfo` for MDSS hardware pipes:
+        - Header: `pipe_count=10`
+        - Pipe definition: `pipe_type=<type> pipe_ndx=<id> rects=1`
+        - Pipe types parsed: `vig` (increments `num_vig_pipe`), `dma` (increments `num_dma_pipe`), `rgb` (increments `num_rgb_pipe`), `cursor` (increments `num_cursor_pipe`).
+      - Populated complete 10-pipe architecture (4 VIG, 4 DMA, 2 Cursor).
+      - **Result:** `HWInfo::GetHWResourceInfo: SDE Version = 500, SDE Revision = 10070002, RGB = 0, VIG = 4, DMA = 4, Cursor = 2`.
+      - **Milestone:** `CoreInterface::CreateCore` succeeded! `ResourceImpl::Init: Number of H/W pipes is Zero!` completely eliminated.
+    - **Current Milestone & Blocker (`HWDevice::Init`):**
+      - `HWCDisplay::Init: Display create failed. Error = 11 (kErrorResources)`.
+      - Root cause: `HWDevice::Init` calls `GetFBNodeIndex(kDevicePrimary)`. While node 0 opened (`/sys/devices/virtual/graphics/fb0/msm_fb_panel_info`), `GetFBNodeIndex` returned `-1` and logged `HWDevice::Init: Primary Display Device should be present`.
+      - In progress: Reverse-engineering `_ZN3sdm8HWDevice14GetFBNodeIndexENS_12HWDeviceTypeE` and `GetHWPanelInfoByNode` / `GetHWDisplayPortAndMode` to determine the exact sysfs attribute or mode string expected to accept `fb0` as the primary panel.
+
+14. **Kernel & Storage Primitives for Modern Android GSI:**
     - **Ext4 Shared Blocks (`fs/ext4/ext4.h`):** Enabled `EXT4_FEATURE_RO_COMPAT_SHARED_BLOCKS` support to allow mounting modern deduplicated ext4 Android 17 GSI images (`system.img`).
     - **Namespace Mount Propagation (`fs/namespace.c`):** Fixed root mount propagation so child namespaces properly inherit root mounts during Android `pivot_root`.
     - **Reboot Interception (`kernel/pid_namespace.c`):** Intercepted child PID namespace reboot requests from crashing processes during userspace bringup, preventing unintended device reboots.
@@ -245,10 +271,39 @@ Boot directly from host RAM without overwriting your device's flash:
      chmod +x /data/qservice_daemon
      /data/qservice_daemon &
      ```
+   - **Setup Qualcomm MDP Sysfs Simulation (Caps & Panel Info):**
+     ```bash
+     mkdir -p /sys/devices/virtual/graphics/fb0/mdp
+     printf "hw_rev=268894210\nmax_upscale_ratio=20\nmax_downscale_ratio=4\nmax_bandwidth_low=9600000000\nmax_bandwidth_high=9600000000\nmax_pipe_bandwidth=2500000000\nmax_sde_clk=412500000\nclk_fudge_factor=105 100\nscale_factor=1\nxtra_ff_factor=1\nblending_stages=4\nfeatures=qseed3,ubwc,src_split\npipe_count=10\npipe_type=vig pipe_ndx=1 rects=1\npipe_type=vig pipe_ndx=2 rects=1\npipe_type=vig pipe_ndx=3 rects=1\npipe_type=vig pipe_ndx=4 rects=1\npipe_type=dma pipe_ndx=5 rects=1\npipe_type=dma pipe_ndx=6 rects=1\npipe_type=dma pipe_ndx=7 rects=1\npipe_type=dma pipe_ndx=8 rects=1\npipe_type=cursor pipe_ndx=9 rects=1\npipe_type=cursor pipe_ndx=10 rects=1\n" > /sys/devices/virtual/graphics/fb0/mdp/caps
+     printf "panel_name=s6e3fa5_cmd\nxres=1080\nyres=1920\nbpp=24\ntype=mipi dsi cmd panel\nfps=60\n" > /sys/devices/virtual/graphics/fb0/msm_fb_panel_info
+     printf "mipi dsi cmd panel\n" > /sys/devices/virtual/graphics/fb0/msm_fb_type
+     printf "1\n" > /sys/devices/virtual/graphics/fb0/connected
+     printf "0\n" > /sys/devices/virtual/graphics/fb0/msm_fb_split
+     chmod 666 /dev/fb* /dev/graphics/* /dev/dri/* 2>/dev/null
+     ```
    - **Launch Graphics HAL & SurfaceFlinger:**
      ```bash
      /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service &
      /vendor/bin/hw/android.hardware.graphics.composer@2.1-service &
      /system/bin/surfaceflinger &
      ```
+
+---
+
+## Restoring & Resuming Workflow
+
+When restoring the phone back to stock Android 10 and returning later to resume kernel bringup:
+1. **Stock Android 10:** Flash stock factory image if needed.
+2. **Resuming Android 17 / Kernel 6.18:**
+   - Boot modern Kernel 6.18:
+     ```bash
+     fastboot boot out/boot.img
+     ```
+   - Connect via serial console:
+     ```bash
+     sudo picocom -b 115200 /dev/ttyACM0
+     ```
+   - Compatibility shims in `tools/sailfish/init.c` automatically bind modern `servicemanager` over `vndservicemanager`, sync SELinux sha256 checksums, mount APEXes, and populate the MDSS sysfs mock architecture (`/sys/devices/virtual/graphics/fb0/mdp/caps`, `msm_fb_panel_info`, etc.) on early boot.
+   - Run `/data/start_graphics.sh` to launch vendor binder, `qservice_daemon`, allocator, and composer.
+   - Pick up directly from reverse-engineering `libsdmcore.so`'s `GetFBNodeIndex` / `GetHWPanelInfoByNode`.
 

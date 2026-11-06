@@ -1061,6 +1061,91 @@ static void set_selinux_label(const char *path, const char *label) {
     }
 }
 
+static bool copy_file(const char *src, const char *dst) {
+    int sfd = open(src, O_RDONLY);
+    if (sfd < 0) return false;
+    int dfd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (dfd < 0) { close(sfd); return false; }
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(sfd, buf, sizeof(buf))) > 0) {
+        if (write(dfd, buf, n) != n) {
+            close(sfd); close(dfd); return false;
+        }
+    }
+    close(sfd);
+    close(dfd);
+    return true;
+}
+
+static void write_file_str(const char *path, const char *val) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        write(fd, val, strlen(val));
+        close(fd);
+    }
+}
+
+static void setup_mdss_sysfs_mock(void) {
+    /* Create tmpfs overlay for MDSS graphics sysfs */
+    mkdir("/sys/devices/virtual/graphics", 0755);
+    mount("tmpfs", "/sys/devices/virtual/graphics", "tmpfs", 0, "mode=0755,uid=0,gid=0");
+    mkdir("/sys/devices/virtual/graphics/fb0", 0755);
+    mkdir("/sys/devices/virtual/graphics/fb0/mdp", 0755);
+
+    const char *caps_content =
+        "hw_rev=268894210\n"
+        "max_upscale_ratio=20\n"
+        "max_downscale_ratio=4\n"
+        "max_bandwidth_low=9600000000\n"
+        "max_bandwidth_high=9600000000\n"
+        "max_pipe_bandwidth=2500000000\n"
+        "max_sde_clk=412500000\n"
+        "clk_fudge_factor=105 100\n"
+        "scale_factor=1\n"
+        "xtra_ff_factor=1\n"
+        "blending_stages=4\n"
+        "features=qseed3,ubwc,src_split\n"
+        "pipe_count=10\n"
+        "pipe_type=vig pipe_ndx=1 rects=1\n"
+        "pipe_type=vig pipe_ndx=2 rects=1\n"
+        "pipe_type=vig pipe_ndx=3 rects=1\n"
+        "pipe_type=vig pipe_ndx=4 rects=1\n"
+        "pipe_type=dma pipe_ndx=5 rects=1\n"
+        "pipe_type=dma pipe_ndx=6 rects=1\n"
+        "pipe_type=dma pipe_ndx=7 rects=1\n"
+        "pipe_type=dma pipe_ndx=8 rects=1\n"
+        "pipe_type=cursor pipe_ndx=9 rects=1\n"
+        "pipe_type=cursor pipe_ndx=10 rects=1\n";
+    write_file_str("/sys/devices/virtual/graphics/fb0/mdp/caps", caps_content);
+
+    const char *panel_content =
+        "panel_name=s6e3fa5_cmd\n"
+        "xres=1080\n"
+        "yres=1920\n"
+        "bpp=24\n"
+        "type=mipi dsi cmd panel\n"
+        "fps=60\n";
+    write_file_str("/sys/devices/virtual/graphics/fb0/msm_fb_panel_info", panel_content);
+
+    write_file_str("/sys/devices/virtual/graphics/fb0/msm_fb_type", "mipi dsi cmd panel\n");
+    write_file_str("/sys/devices/virtual/graphics/fb0/connected", "1\n");
+    write_file_str("/sys/devices/virtual/graphics/fb0/msm_fb_split", "0\n");
+
+    /* Also provide /sys/class/graphics/fb0 mapping */
+    mkdir("/sys/class/graphics", 0755);
+    mount("tmpfs", "/sys/class/graphics", "tmpfs", 0, "mode=0755,uid=0,gid=0");
+    symlink("/sys/devices/virtual/graphics/fb0", "/sys/class/graphics/fb0");
+
+    /* Ensure device node permissions */
+    chmod("/dev/fb0", 0666);
+    chmod("/dev/dri/card0", 0666);
+    chmod("/dev/dri/card1", 0666);
+    chmod("/dev/dri/renderD128", 0666);
+
+    usb_write("[+] Automated: MDSS sysfs mock initialized (10 pipes, SDE 5.0, panel s6e3fa5_cmd)\n");
+}
+
 static void rm_rf(const char *path) {
     struct stat st;
     if (lstat(path, &st) != 0)
@@ -1126,6 +1211,106 @@ static bool prepare_android_rootfs(bool for_shell) {
     mkdir("/mnt/system_a/vendor", 0755);
     mount("/mnt/vendor_a", "/mnt/system_a/vendor", NULL, MS_BIND | MS_REC, NULL);
 
+    /* Automated: Bind-mount modern Bionic EGL/GLES shim over legacy vendor Adreno blobs */
+    if (access("/tools/libEGL_adreno_shim.so", F_OK) == 0) {
+        if (access("/mnt/system_a/vendor/lib64/egl/libEGL_adreno.so", F_OK) == 0) {
+            if (mount("/tools/libEGL_adreno_shim.so", "/mnt/system_a/vendor/lib64/egl/libEGL_adreno.so", NULL, MS_BIND, NULL) == 0) {
+                usb_write("[+] Automated: Bound libEGL_adreno_shim.so -> /vendor/lib64/egl/libEGL_adreno.so\n");
+            }
+        }
+        if (access("/mnt/system_a/vendor/lib64/egl/libGLESv2_adreno.so", F_OK) == 0) {
+            if (mount("/tools/libEGL_adreno_shim.so", "/mnt/system_a/vendor/lib64/egl/libGLESv2_adreno.so", NULL, MS_BIND, NULL) == 0) {
+                usb_write("[+] Automated: Bound libEGL_adreno_shim.so -> /vendor/lib64/egl/libGLESv2_adreno.so\n");
+            }
+        }
+    }
+
+    /* Automated: Modernize vendor vndservicemanager with Android 17 AIDL servicemanager */
+    if (access("/mnt/system_a/system/bin/servicemanager", F_OK) == 0 &&
+        access("/mnt/system_a/vendor/bin/vndservicemanager", F_OK) == 0) {
+        if (mount("/mnt/system_a/system/bin/servicemanager", "/mnt/system_a/vendor/bin/vndservicemanager", NULL, MS_BIND, NULL) == 0) {
+            usb_write("[+] Automated: Bound Android 17 servicemanager -> /vendor/bin/vndservicemanager\n");
+        }
+    }
+
+    /* Automated: Sync SELinux sha256 checksums to vendor so precompiled_sepolicy loads */
+    const char *sha_pairs[][2] = {
+        { "/mnt/system_a/system/etc/selinux/plat_sepolicy_and_mapping.sha256",
+          "/mnt/system_a/vendor/etc/selinux/precompiled_sepolicy.plat_sepolicy_and_mapping.sha256" },
+        { "/mnt/system_a/system_ext/etc/selinux/system_ext_sepolicy_and_mapping.sha256",
+          "/mnt/system_a/vendor/etc/selinux/precompiled_sepolicy.system_ext_sepolicy_and_mapping.sha256" },
+        { "/mnt/system_a/product/etc/selinux/product_sepolicy_and_mapping.sha256",
+          "/mnt/system_a/vendor/etc/selinux/precompiled_sepolicy.product_sepolicy_and_mapping.sha256" },
+        { NULL, NULL }
+    };
+    for (int i = 0; sha_pairs[i][0]; i++) {
+        if (access(sha_pairs[i][0], F_OK) == 0 && access(sha_pairs[i][1], F_OK) == 0) {
+            mount(sha_pairs[i][0], sha_pairs[i][1], NULL, MS_BIND, NULL);
+        }
+    }
+
+    /* Automated: Ensure 29.0.cil compatibility symlinks exist across mapping dirs */
+    const char *map_dirs[] = {
+        "/mnt/system_a/system/etc/selinux/mapping",
+        "/mnt/system_a/system_ext/etc/selinux/mapping",
+        "/mnt/system_a/product/etc/selinux/mapping",
+        NULL
+    };
+    for (int i = 0; map_dirs[i]; i++) {
+        char link29[256], target31[256];
+        snprintf(link29, sizeof(link29), "%s/29.0.cil", map_dirs[i]);
+        snprintf(target31, sizeof(target31), "%s/31.0.cil", map_dirs[i]);
+        if (access(link29, F_OK) != 0 && access(target31, F_OK) == 0) {
+            symlink("31.0.cil", link29);
+        }
+        snprintf(link29, sizeof(link29), "%s/29.0.compat.cil", map_dirs[i]);
+        snprintf(target31, sizeof(target31), "%s/31.0.compat.cil", map_dirs[i]);
+        if (access(link29, F_OK) != 0 && access(target31, F_OK) == 0) {
+            symlink("31.0.compat.cil", link29);
+        }
+    }
+
+    /* Automated: Create graphics and DRM compatibility device symlinks */
+    mkdir("/dev/graphics", 0755);
+    mkdir("/mnt/system_a/dev/graphics", 0755);
+    if (access("/dev/fb0", F_OK) == 0) {
+        symlink("/dev/fb0", "/dev/graphics/fb0");
+        symlink("/dev/fb0", "/mnt/system_a/dev/graphics/fb0");
+    }
+    mkdir("/dev/dri", 0755);
+    mkdir("/mnt/system_a/dev/dri", 0755);
+    if (access("/dev/dri/card1", F_OK) == 0) {
+        if (access("/dev/dri/card0", F_OK) != 0) symlink("/dev/dri/card1", "/dev/dri/card0");
+        if (access("/mnt/system_a/dev/dri/card0", F_OK) != 0) symlink("/dev/dri/card1", "/mnt/system_a/dev/dri/card0");
+    }
+
+    /* Automated: Inject graphics VINTF manifest fragment (composer@2.1 & allocator@2.0) */
+    if (access("/tools/android.hardware.graphics.xml", F_OK) == 0) {
+        const char *vintf_dir = "/mnt/system_a/system/etc/vintf/manifest";
+        mkdir("/tmp/vintf_manifest", 0755);
+        umount2("/tmp/vintf_manifest", MNT_DETACH);
+        if (mount("tmpfs", "/tmp/vintf_manifest", "tmpfs", 0, "mode=0755,uid=0,gid=0") == 0) {
+            DIR *vd = opendir(vintf_dir);
+            if (vd) {
+                struct dirent *de;
+                while ((de = readdir(vd)) != NULL) {
+                    if (de->d_name[0] == '.') continue;
+                    char src_path[256], dst_path[256];
+                    snprintf(src_path, sizeof(src_path), "%s/%s", vintf_dir, de->d_name);
+                    snprintf(dst_path, sizeof(dst_path), "/tmp/vintf_manifest/%s", de->d_name);
+                    copy_file(src_path, dst_path);
+                    set_selinux_label(dst_path, "u:object_r:system_file:s0");
+                }
+                closedir(vd);
+            }
+            copy_file("/tools/android.hardware.graphics.xml", "/tmp/vintf_manifest/android.hardware.graphics.xml");
+            set_selinux_label("/tmp/vintf_manifest/android.hardware.graphics.xml", "u:object_r:system_file:s0");
+            if (mount("/tmp/vintf_manifest", vintf_dir, NULL, MS_BIND, NULL) == 0) {
+                usb_write("[+] Automated: Overlaid /system/etc/vintf/manifest with android.hardware.graphics.xml\n");
+            }
+        }
+    }
+
     /* Mount tmpfs on system_a/apex, bootstrap-apex, and linkerconfig */
     mkdir("/mnt/system_a/apex", 0755);
     umount2("/mnt/system_a/apex", MNT_DETACH);
@@ -1162,6 +1347,9 @@ static bool prepare_android_rootfs(bool for_shell) {
             symlink("/system/lib64/bootstrap/libdl.so", ap);
         }
     }
+
+    /* Automated: Populate Qualcomm MDSS sysfs mock before binding /sys */
+    setup_mdss_sysfs_mock();
 
     /* Bind /dev, /proc, /sys into system_a */
     mkdir("/mnt/system_a/dev", 0755);
@@ -1220,6 +1408,52 @@ static bool prepare_android_rootfs(bool for_shell) {
     mkdir("/mnt/system_a/data", 0771);
     mount("tmpfs", "/mnt/system_a/data", "tmpfs", 0, "mode=0771,uid=1000,gid=1000");
     set_selinux_label("/mnt/system_a/data", "u:object_r:system_data_root_file:s0");
+
+    /* Automated: Install qservice_daemon into /data */
+    if (access("/tools/qservice_daemon", F_OK) == 0) {
+        copy_file("/tools/qservice_daemon", "/mnt/system_a/data/qservice_daemon");
+        chmod("/mnt/system_a/data/qservice_daemon", 0755);
+        set_selinux_label("/mnt/system_a/data/qservice_daemon", "u:object_r:system_file:s0");
+        usb_write("[+] Automated: Installed /data/qservice_daemon\n");
+    }
+
+    /* Automated: Install setup_composer_sysfs.sh into /data */
+    if (access("/tools/setup_composer_sysfs.sh", F_OK) == 0) {
+        copy_file("/tools/setup_composer_sysfs.sh", "/mnt/system_a/data/setup_composer_sysfs.sh");
+        chmod("/mnt/system_a/data/setup_composer_sysfs.sh", 0755);
+        set_selinux_label("/mnt/system_a/data/setup_composer_sysfs.sh", "u:object_r:system_file:s0");
+        usb_write("[+] Automated: Installed /data/setup_composer_sysfs.sh\n");
+    }
+
+    /* Automated: Generate /data/start_graphics.sh helper script */
+    FILE *gf = fopen("/mnt/system_a/data/start_graphics.sh", "w");
+    if (gf) {
+        fprintf(gf, "#!/system/bin/sh\n"
+                    "setenforce 0 2>/dev/null\n"
+                    "export LD_LIBRARY_PATH=/apex/com.android.i18n/lib64:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/system/lib64:/vendor/lib64\n"
+                    "mkdir -p /dev/graphics 2>/dev/null\n"
+                    "[ ! -e /dev/graphics/fb0 ] && [ -e /dev/fb0 ] && ln -sf /dev/fb0 /dev/graphics/fb0\n"
+                    "mkdir -p /dev/dri 2>/dev/null\n"
+                    "[ ! -e /dev/dri/card0 ] && [ -e /dev/dri/card1 ] && ln -sf /dev/dri/card1 /dev/dri/card0\n"
+                    "killall -9 qservice_daemon 2>/dev/null\n"
+                    "if ! ps -A | grep -q vndservicemanager; then\n"
+                    "    /vendor/bin/vndservicemanager /dev/vndbinder &\n"
+                    "    sleep 0.5\n"
+                    "fi\n"
+                    "/data/qservice_daemon &\n"
+                    "sleep 0.5\n"
+                    "start vendor.hwcomposer-2-1 2>/dev/null\n"
+                    "/vendor/bin/hw/android.hardware.graphics.allocator@2.0-service &\n"
+                    "/vendor/bin/hw/android.hardware.graphics.composer@2.1-service &\n"
+                    "sleep 0.5\n"
+                    "killall -9 surfaceflinger 2>/dev/null\n"
+                    "/system/bin/surfaceflinger &\n"
+                    "echo '[+] Graphics stack launched in background!'\n");
+        fclose(gf);
+        chmod("/mnt/system_a/data/start_graphics.sh", 0755);
+        set_selinux_label("/mnt/system_a/data/start_graphics.sh", "u:object_r:system_file:s0");
+        usb_write("[+] Automated: Created /data/start_graphics.sh\n");
+    }
 
     /* Mount in-memory tmpfs for cache and metadata */
     mkdir("/mnt/system_a/cache", 0770);
@@ -1510,7 +1744,7 @@ static void launch_android_shell(void) {
 
         char *envp[] = {
             "PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/apex/com.android.runtime/bin:/apex/com.android.art/bin",
-            "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64",
+            "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/apex/com.android.i18n/lib64",
             "ANDROID_ROOT=/system",
             "ANDROID_DATA=/data",
             "ANDROID_STORAGE=/storage",
@@ -1522,6 +1756,35 @@ static void launch_android_shell(void) {
             "HOME=/",
             NULL
         };
+
+        /* Auto-start vndservicemanager and qservice_daemon if /dev/vndbinder is ready */
+        if (access("/dev/vndbinder", F_OK) == 0 && access("/vendor/bin/vndservicemanager", F_OK) == 0) {
+            pid_t bg = fork();
+            if (bg == 0) {
+                int nfd = open("/dev/null", O_RDWR);
+                if (nfd >= 0) {
+                    dup2(nfd, 0); dup2(nfd, 1); dup2(nfd, 2);
+                    close(nfd);
+                }
+                setsid();
+                char *vargs[] = { (char *)"/vendor/bin/vndservicemanager", (char *)"/dev/vndbinder", NULL };
+                pid_t vp = fork();
+                if (vp == 0) {
+                    execve(vargs[0], vargs, envp);
+                    _exit(1);
+                }
+                usleep(500000);
+                if (access("/data/qservice_daemon", F_OK) == 0) {
+                    char *qargs[] = { (char *)"/data/qservice_daemon", NULL };
+                    pid_t qp = fork();
+                    if (qp == 0) {
+                        execve(qargs[0], qargs, envp);
+                        _exit(1);
+                    }
+                }
+                _exit(0);
+            }
+        }
 
         char *argv[] = { (char *)"/system/bin/sh", NULL };
         execve("/system/bin/sh", argv, envp);
