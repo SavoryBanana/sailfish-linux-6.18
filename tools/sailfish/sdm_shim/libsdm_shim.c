@@ -399,8 +399,123 @@ int ppoll(struct pollfd *fds, unsigned long nfds, const struct timespec *timeout
 }
 
 void _ZN3sdm18HWCBufferAllocator24GetAlignedWidthAndHeightEiiijPiS1_(void *this, int width, int height, int format, unsigned int usage, int *aligned_w, int *aligned_h) {
-    if (aligned_w) *aligned_w = (width + 31) & ~31;
+    (void)this;
+    (void)format;
+    (void)usage;
+    if (aligned_w) *aligned_w = (width + 63) & ~63;
     if (aligned_h) *aligned_h = (height + 31) & ~31;
+}
+
+void compute_aligned_width_and_height(int width, int height, int bpp, int tile_mode, int raster_mode, int padding_threshold, int *aligned_w, int *aligned_h) {
+    (void)bpp;
+    (void)tile_mode;
+    (void)raster_mode;
+    (void)padding_threshold;
+    if (aligned_w) *aligned_w = (width + 63) & ~63;
+    if (aligned_h) *aligned_h = (height + 31) & ~31;
+}
+
+int isUBWCSupportedByGpu(unsigned int format) {
+    (void)format;
+    return 0;
+}
+
+void _ZN8gralloc113AdrenoMemInfo20AlignUnCompressedRGBEiiiiPjS1_(void *this, int width, int height, int format, int tile_enabled, unsigned int *aligned_w, unsigned int *aligned_h) {
+    (void)this;
+    (void)format;
+    (void)tile_enabled;
+    if (aligned_w) *aligned_w = (unsigned int)((width + 63) & ~63);
+    if (aligned_h) *aligned_h = (unsigned int)((height + 31) & ~31);
+}
+
+int _ZN8gralloc113AdrenoMemInfo20IsUBWCSupportedByGPUEi(void *this, int format) {
+    (void)this;
+    (void)format;
+    return 0;
+}
+
+int _ZN8gralloc19Allocator13IsUBwcEnabledEi25gralloc1_producer_usage_t25gralloc1_consumer_usage_t(void *this, int format, uint64_t prod, uint64_t cons) {
+    (void)this;
+    (void)format;
+    (void)prod;
+    (void)cons;
+    return 0;
+}
+
+int _ZN8gralloc19Allocator15IsUBwcSupportedEi(void *this, int format) {
+    (void)this;
+    (void)format;
+    return 0;
+}
+
+int _ZN8gralloc19BufferMgr18ValidateBufferSizeEPK16private_handle_tNS_10BufferInfoE(void *this, const void *hnd, void *info) {
+    (void)this;
+    (void)hnd;
+    (void)info;
+    return 0;
+}
+
+int _ZN8gralloc113BufferManager18ValidateBufferSizeEPK16private_handle_tNS_16BufferDescriptorE(void *this, const void *hnd, void *desc) {
+    (void)this;
+    (void)hnd;
+    (void)desc;
+    return 0;
+}
+
+int _ZN8gralloc111GrallocImpl18validateBufferSizeEP15gralloc1_devicePK13native_handlePK31gralloc1_buffer_descriptor_infoj(void *dev, const void *hnd, const void *info, uint32_t stride) {
+    (void)dev;
+    (void)hnd;
+    (void)info;
+    (void)stride;
+    return 0;
+}
+
+int _ZNK7android14Gralloc2Mapper18validateBufferSizeEPK13native_handlejjijmj(void *this, const void *hnd, uint32_t w, uint32_t h, int fmt, uint32_t lc, uint64_t usage, uint32_t stride) {
+    (void)this;
+    (void)hnd;
+    (void)w;
+    (void)h;
+    (void)fmt;
+    (void)lc;
+    (void)usage;
+    (void)stride;
+    return 0;
+}
+
+int _ZNK7android14Gralloc2Mapper18validateBufferSizeEPK13native_handlejjijyj(void *this, const void *hnd, uint32_t w, uint32_t h, int fmt, uint32_t lc, uint64_t usage, uint32_t stride) {
+    (void)this;
+    (void)hnd;
+    (void)w;
+    (void)h;
+    (void)fmt;
+    (void)lc;
+    (void)usage;
+    (void)stride;
+    return 0;
+}
+
+int _ZNK7android14Gralloc2Mapper18validateBufferSizeEPK13native_handlejjjimj(void *this, const void *hnd, uint32_t w, uint32_t h, uint32_t lc, int fmt, uint64_t usage, uint32_t stride) {
+    (void)this;
+    (void)hnd;
+    (void)w;
+    (void)h;
+    (void)lc;
+    (void)fmt;
+    (void)usage;
+    (void)stride;
+    return 0;
+}
+
+int _ZNK7android14Gralloc2Mapper18validateBufferSizeEPK13native_handlejjjiyj(void *this, const void *hnd, uint32_t w, uint32_t h, uint32_t lc, int fmt, uint64_t usage, uint32_t stride) {
+    (void)this;
+    (void)hnd;
+    (void)w;
+    (void)h;
+    (void)lc;
+    (void)fmt;
+    (void)usage;
+    (void)stride;
+    return 0;
 }
 
 int android_get_device_api_level(void) {
@@ -408,13 +523,14 @@ int android_get_device_api_level(void) {
 }
 
 int _ZNK7android14Gralloc2Mapper28validateBufferDescriptorInfoEPNS_8hardware8graphics6mapper4V2_17IMapper20BufferDescriptorInfoE(void *this, void *info) {
+    (void)this;
     if (info) {
         uint64_t *usage = (uint64_t *)((char *)info + 0x10);
         *usage &= 0x0fffffffULL;
-        /* Set HW_RENDER (0x200) + SW_READ_OFTEN | SW_WRITE_OFTEN (0x33) so stock
-         * msm8996 gralloc allocates linear (non-UBWC, non-macrotiled) buffers
-         * compatible with Mesa Freedreno a5xx and mainline MDP5 scanout. */
-        *usage |= 0x233ULL;
+        /* Keep HW_RENDER (0x200) without adding SW_READ/SW_WRITE (0x33) so both
+         * createDescriptor and validateBufferSize take the AdrenoMemInfo path in
+         * gralloc.msm8996.so, while libadreno_utils.so disables UBWC/tiling. */
+        *usage |= 0x200ULL;
     }
     return 0;
 }

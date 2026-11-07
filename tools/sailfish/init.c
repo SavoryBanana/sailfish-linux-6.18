@@ -1249,6 +1249,16 @@ static bool prepare_android_rootfs(bool for_shell) {
             } else {
                 usb_write("[-] Mesa egl bind failed, falling back to EGL shim\n");
             }
+            if (access("/tools/libadreno_utils.so", F_OK) == 0 &&
+                access("/mnt/system_a/vendor/lib64/libadreno_utils.so", F_OK) == 0) {
+                if (copy_file("/tools/libadreno_utils.so", "/mesa_egl/libadreno_utils.so")) {
+                    chmod("/mesa_egl/libadreno_utils.so", 0644);
+                    set_selinux_label("/mesa_egl/libadreno_utils.so", "u:object_r:same_process_hal_file:s0");
+                    if (mount("/mesa_egl/libadreno_utils.so", "/mnt/system_a/vendor/lib64/libadreno_utils.so", NULL, MS_BIND, NULL) == 0) {
+                        usb_write("[+] Automated: Bound open-source Adreno 530 libadreno_utils.so -> /vendor/lib64/libadreno_utils.so\n");
+                    }
+                }
+            }
         }
     }
 
@@ -1491,6 +1501,12 @@ static bool prepare_android_rootfs(bool for_shell) {
         set_selinux_label("/mnt/system_a/data/libEGL_adreno_shim.so", "u:object_r:system_file:s0");
         usb_write("[+] Automated: Installed /data/libEGL_adreno_shim.so\n");
     }
+    if (access("/tools/libadreno_utils.so", F_OK) == 0) {
+        copy_file("/tools/libadreno_utils.so", "/mnt/system_a/data/libadreno_utils.so");
+        chmod("/mnt/system_a/data/libadreno_utils.so", 0644);
+        set_selinux_label("/mnt/system_a/data/libadreno_utils.so", "u:object_r:same_process_hal_file:s0");
+        usb_write("[+] Automated: Installed /data/libadreno_utils.so\n");
+    }
 
     /* Automated: Generate /data/start_graphics.sh helper script */
     FILE *gf = fopen("/mnt/system_a/data/start_graphics.sh", "w");
@@ -1498,6 +1514,10 @@ static bool prepare_android_rootfs(bool for_shell) {
         fprintf(gf, "#!/system/bin/sh\n"
                     "setenforce 0 2>/dev/null\n"
                     "export LD_LIBRARY_PATH=/apex/com.android.i18n/lib64:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/system/lib64:/vendor/lib64\n"
+                    "setprop sys.use_memfd true 2>/dev/null\n"
+                    "setprop debug.gralloc.gfx_ubwc_disable 1 2>/dev/null\n"
+                    "setprop debug.gralloc.enable_fb_ubwc 0 2>/dev/null\n"
+                    "setprop service.sf.prime_shader_cache 0 2>/dev/null\n"
                     "chmod 666 /dev/ion 2>/dev/null\n"
                     "chmod 666 /dev/dma_heap/* 2>/dev/null\n"
                     "mkdir -p /dev/graphics 2>/dev/null\n"
@@ -1505,6 +1525,9 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "mkdir -p /dev/dri 2>/dev/null\n"
                     "[ ! -e /dev/dri/card0 ] && [ -e /dev/dri/card1 ] && ln -sf /dev/dri/card1 /dev/dri/card0\n"
                     "chmod 666 /dev/dri/* 2>/dev/null\n"
+                    "if [ -f /data/libadreno_utils.so ]; then\n"
+                    "    mount -o bind /data/libadreno_utils.so /vendor/lib64/libadreno_utils.so 2>/dev/null || true\n"
+                    "fi\n"
                     "if [ -f /vendor/lib64/egl/libgallium_dri.so ]; then\n"
                     "    echo '[+] Using Mesa Freedreno GLES driver'\n"
                     "elif [ -f /data/libEGL_adreno_shim.so ]; then\n"
@@ -1518,13 +1541,18 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "fi\n"
                     "/data/qservice_daemon >/dev/null 2>&1 &\n"
                     "sleep 0.5\n"
+                    "stop vendor.gralloc-2-0 2>/dev/null\n"
+                    "killall -9 android.hardware.graphics.allocator@2.0-service 2>/dev/null\n"
                     "stop vendor.hwcomposer-2-1 2>/dev/null\n"
                     "killall -9 android.hardware.graphics.composer@2.1-service 2>/dev/null\n"
-                    "setprop debug.gralloc.gfx_ubwc_disable 1 2>/dev/null\n"
-                    "setprop debug.gralloc.enable_fb_ubwc 0 2>/dev/null\n"
-                    "/vendor/bin/hw/android.hardware.graphics.allocator@2.0-service >/dev/null 2>&1 &\n"
+                    "if [ -f /data/libsdm_shim.so ]; then\n"
+                    "    LD_PRELOAD=/data/libsdm_shim.so /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service >/dev/null 2>&1 &\n"
+                    "else\n"
+                    "    /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service >/dev/null 2>&1 &\n"
+                    "fi\n"
                     "touch /sys/devices/virtual/graphics/fb0/vsync_event 2>/dev/null\n"
                     "chmod 666 /sys/devices/virtual/graphics/fb0/vsync_event 2>/dev/null\n"
+                    "echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/null || true\n"
                     "echo 200 > /sys/class/backlight/994000.dsi.0/brightness 2>/dev/null || true\n"
                     "if [ -f /data/libsdm_shim.so ]; then\n"
                     "    LD_PRELOAD=/data/libsdm_shim.so /vendor/bin/hw/android.hardware.graphics.composer@2.1-service >/dev/null 2>&1 &\n"
@@ -1532,16 +1560,22 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "    /vendor/bin/hw/android.hardware.graphics.composer@2.1-service >/dev/null 2>&1 &\n"
                     "fi\n"
                     "sleep 0.5\n"
-                    "setprop service.sf.prime_shader_cache 0\n"
                     "killall -9 surfaceflinger 2>/dev/null\n"
+                    "rm -f /data/sf.log 2>/dev/null\n"
                     "if [ -f /data/libsdm_shim.so ]; then\n"
                     "    LD_PRELOAD=/data/libsdm_shim.so /system/bin/surfaceflinger >/data/sf.log 2>&1 &\n"
                     "else\n"
                     "    /system/bin/surfaceflinger >/data/sf.log 2>&1 &\n"
                     "fi\n"
-                    "sleep 1\n"
+                    "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do\n"
+                    "    if [ \"$(getprop init.svc.bootanim)\" = \"running\" ]; then\n"
+                    "        break\n"
+                    "    fi\n"
+                    "    sleep 0.5\n"
+                    "done\n"
                     "setprop ctl.stop bootanim 2>/dev/null\n"
                     "killall -9 bootanimation 2>/dev/null\n"
+                    "setprop service.bootanim.exit 0 2>/dev/null\n"
                     "if [ -f /data/libsdm_shim.so ]; then\n"
                     "    LD_PRELOAD=/data/libsdm_shim.so /system/bin/bootanimation >/dev/null 2>&1 &\n"
                     "else\n"

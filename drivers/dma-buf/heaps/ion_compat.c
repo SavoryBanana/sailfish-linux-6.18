@@ -14,6 +14,7 @@
 #include <linux/idr.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
@@ -106,7 +107,7 @@ static long ion_compat_ioctl(struct file *file, unsigned int cmd, unsigned long 
 		if (!heap)
 			return -ENODEV;
 
-		dmabuf = dma_heap_buffer_alloc(heap, PAGE_ALIGN(data.len), O_RDWR | O_CLOEXEC, 0);
+		dmabuf = dma_heap_buffer_alloc(heap, PAGE_ALIGN(data.len) + SZ_256K, O_RDWR | O_CLOEXEC, 0);
 		if (IS_ERR(dmabuf))
 			return PTR_ERR(dmabuf);
 

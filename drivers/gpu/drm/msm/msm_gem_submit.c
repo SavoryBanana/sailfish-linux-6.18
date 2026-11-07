@@ -548,7 +548,7 @@ void msm_submit_retire(struct msm_gem_submit *submit)
 		if (drm_gem_is_imported(obj) &&
 		    (submit->bos[i].flags & MSM_SUBMIT_BO_WRITE) &&
 		    obj->size >= 1080 * 1920 * 4 &&
-		    obj->size <= 8454144 &&
+		    obj->size <= 9000000 &&
 		    submit->dev && submit->dev->fb_helper) {
 			struct drm_fb_helper *fbh = submit->dev->fb_helper;
 			if (fbh->info && fbh->info->screen_buffer) {
@@ -556,14 +556,23 @@ void msm_submit_retire(struct msm_gem_submit *submit)
 				if (!IS_ERR_OR_NULL(src)) {
 					u32 *s = (u32 *)src;
 					u32 *d = (u32 *)fbh->info->screen_buffer;
-					size_t n = min_t(size_t, obj->size,
-							 fbh->info->screen_size) / 4;
-					size_t j;
-					for (j = 0; j < n; j++) {
-						u32 p = s[j];
-						d[j] = (p & 0xff00ff00U) |
-						       ((p & 0x00ff0000U) >> 16) |
-						       ((p & 0x000000ffU) << 16);
+					u32 dst_stride = fbh->info->fix.line_length ?
+							 (fbh->info->fix.line_length / 4) : 1080;
+					u32 src_stride = 1088;
+					uintptr_t cl, cl_end = (uintptr_t)src + (1088 * 1920 * 4);
+					u32 y, x;
+					for (cl = (uintptr_t)src & ~63UL; cl < cl_end; cl += 64)
+						asm volatile("dc civac, %0" :: "r"(cl) : "memory");
+					asm volatile("dsb ish" ::: "memory");
+					for (y = 0; y < 1920; y++) {
+						u64 *srow64 = (u64 *)(s + y * src_stride);
+						u64 *drow64 = (u64 *)(d + y * dst_stride);
+						for (x = 0; x < 1080 / 2; x++) {
+							u64 p = srow64[x];
+							drow64[x] = (p & 0xff00ff00ff00ff00ULL) |
+								    ((p & 0x00ff000000ff0000ULL) >> 16) |
+								    ((p & 0x000000ff000000ffULL) << 16);
+						}
 					}
 					msm_gem_put_vaddr(obj);
 					{

@@ -51,6 +51,9 @@ fi
 if [ -f "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" ]; then
     cp "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" "$OUT_DIR/initramfs_root/tools/libsdm_shim.so"
 fi
+if [ -f "$SCRIPT_DIR/adreno_utils/libadreno_utils.so" ]; then
+    cp "$SCRIPT_DIR/adreno_utils/libadreno_utils.so" "$OUT_DIR/initramfs_root/tools/libadreno_utils.so"
+fi
 cp "$SCRIPT_DIR/qservice_daemon/qservice_daemon" "$OUT_DIR/initramfs_root/tools/qservice_daemon"
 chmod +x "$OUT_DIR/initramfs_root/tools/qservice_daemon"
 cp "$SCRIPT_DIR/android.hardware.graphics.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.graphics.xml"

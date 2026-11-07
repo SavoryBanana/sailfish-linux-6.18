@@ -754,8 +754,10 @@ static void *get_vaddr(struct drm_gem_object *obj, unsigned madv)
 	msm_obj->vmap_count++;
 
 	if (!msm_obj->vaddr) {
+		pgprot_t prot = drm_gem_is_imported(obj) ?
+				PAGE_KERNEL : msm_gem_pgprot(msm_obj, PAGE_KERNEL);
 		msm_obj->vaddr = vmap(pages, obj->size >> PAGE_SHIFT,
-				VM_MAP, msm_gem_pgprot(msm_obj, PAGE_KERNEL));
+				VM_MAP, prot);
 		if (msm_obj->vaddr == NULL) {
 			ret = -ENOMEM;
 			goto fail;
@@ -1110,7 +1112,7 @@ static void msm_gem_free_object(struct drm_gem_object *obj)
 	}
 
 	if (drm_gem_is_imported(obj)) {
-		GEM_WARN_ON(msm_obj->vaddr);
+		msm_gem_vunmap(obj);
 
 		/* Don't drop the pages for imported dmabuf, as they are not
 		 * ours, just free the array we allocated:

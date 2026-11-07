@@ -139,33 +139,35 @@ static void a5xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 		return;
 	}
 
-	OUT_PKT7(ring, CP_PREEMPT_ENABLE_GLOBAL, 1);
-	OUT_RING(ring, 0x02);
+	if (gpu->nr_rings > 1) {
+		OUT_PKT7(ring, CP_PREEMPT_ENABLE_GLOBAL, 1);
+		OUT_RING(ring, 0x02);
 
-	/* Turn off protected mode to write to special registers */
-	OUT_PKT7(ring, CP_SET_PROTECTED_MODE, 1);
-	OUT_RING(ring, 0);
+		/* Turn off protected mode to write to special registers */
+		OUT_PKT7(ring, CP_SET_PROTECTED_MODE, 1);
+		OUT_RING(ring, 0);
 
-	/* Set the save preemption record for the ring/command */
-	OUT_PKT4(ring, REG_A5XX_CP_CONTEXT_SWITCH_SAVE_ADDR_LO, 2);
-	OUT_RING(ring, lower_32_bits(a5xx_gpu->preempt_iova[submit->ring->id]));
-	OUT_RING(ring, upper_32_bits(a5xx_gpu->preempt_iova[submit->ring->id]));
+		/* Set the save preemption record for the ring/command */
+		OUT_PKT4(ring, REG_A5XX_CP_CONTEXT_SWITCH_SAVE_ADDR_LO, 2);
+		OUT_RING(ring, lower_32_bits(a5xx_gpu->preempt_iova[submit->ring->id]));
+		OUT_RING(ring, upper_32_bits(a5xx_gpu->preempt_iova[submit->ring->id]));
 
-	/* Turn back on protected mode */
-	OUT_PKT7(ring, CP_SET_PROTECTED_MODE, 1);
-	OUT_RING(ring, 1);
+		/* Turn back on protected mode */
+		OUT_PKT7(ring, CP_SET_PROTECTED_MODE, 1);
+		OUT_RING(ring, 1);
 
-	/*
-	 * Disable local preemption by default because it requires
-	 * user-space to be aware of it and provide additional handling
-	 * to restore rendering state or do various flushes on switch.
-	 */
-	OUT_PKT7(ring, CP_PREEMPT_ENABLE_LOCAL, 1);
-	OUT_RING(ring, 0x0);
+		/*
+		 * Disable local preemption by default because it requires
+		 * user-space to be aware of it and provide additional handling
+		 * to restore rendering state or do various flushes on switch.
+		 */
+		OUT_PKT7(ring, CP_PREEMPT_ENABLE_LOCAL, 1);
+		OUT_RING(ring, 0x0);
 
-	/* Allow CP_CONTEXT_SWITCH_YIELD packets in the IB2 */
-	OUT_PKT7(ring, CP_YIELD_ENABLE, 1);
-	OUT_RING(ring, 0x02);
+		/* Allow CP_CONTEXT_SWITCH_YIELD packets in the IB2 */
+		OUT_PKT7(ring, CP_YIELD_ENABLE, 1);
+		OUT_RING(ring, 0x02);
+	}
 
 	/* Submit the commands */
 	for (i = 0; i < submit->nr_cmds; i++) {
@@ -208,9 +210,11 @@ static void a5xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 	OUT_RING(ring, 0);
 	OUT_RING(ring, 0);
 
-	/* Turn off IB level preemptions */
-	OUT_PKT7(ring, CP_YIELD_ENABLE, 1);
-	OUT_RING(ring, 0x01);
+	if (gpu->nr_rings > 1) {
+		/* Turn off IB level preemptions */
+		OUT_PKT7(ring, CP_YIELD_ENABLE, 1);
+		OUT_RING(ring, 0x01);
+	}
 
 	/* Write the fence to the scratch register */
 	OUT_PKT4(ring, REG_A5XX_CP_SCRATCH_REG(2), 1);
@@ -228,19 +232,21 @@ static void a5xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 	OUT_RING(ring, upper_32_bits(rbmemptr(ring, fence)));
 	OUT_RING(ring, submit->seqno);
 
-	/* Yield the floor on command completion */
-	OUT_PKT7(ring, CP_CONTEXT_SWITCH_YIELD, 4);
-	/*
-	 * If dword[2:1] are non zero, they specify an address for the CP to
-	 * write the value of dword[3] to on preemption complete. Write 0 to
-	 * skip the write
-	 */
-	OUT_RING(ring, 0x00);
-	OUT_RING(ring, 0x00);
-	/* Data value - not used if the address above is 0 */
-	OUT_RING(ring, 0x01);
-	/* Set bit 0 to trigger an interrupt on preempt complete */
-	OUT_RING(ring, 0x01);
+	if (gpu->nr_rings > 1) {
+		/* Yield the floor on command completion */
+		OUT_PKT7(ring, CP_CONTEXT_SWITCH_YIELD, 4);
+		/*
+		 * If dword[2:1] are non zero, they specify an address for the CP to
+		 * write the value of dword[3] to on preemption complete. Write 0 to
+		 * skip the write
+		 */
+		OUT_RING(ring, 0x00);
+		OUT_RING(ring, 0x00);
+		/* Data value - not used if the address above is 0 */
+		OUT_RING(ring, 0x01);
+		/* Set bit 0 to trigger an interrupt on preempt complete */
+		OUT_RING(ring, 0x01);
+	}
 
 	/* A WHERE_AM_I packet is not needed after a YIELD */
 	a5xx_flush(gpu, ring, false);
@@ -250,7 +256,7 @@ static void a5xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 
 	{
 		static int submit_log_cnt;
-		if (submit_log_cnt < 5) {
+		if (submit_log_cnt < 25) {
 			pr_info("a5xx_submit: seqno=%u ring=%d nr_cmds=%u ibs=%u\n",
 				submit->seqno, ring->id, submit->nr_cmds, ibs);
 			submit_log_cnt++;
@@ -578,12 +584,11 @@ static void a5xx_ucode_check_version(struct a5xx_gpu *a5xx_gpu,
 		return;
 
 	/*
-	 * If the lowest nibble is 0xa that is an indication that this microcode
-	 * has been patched. The actual version is in dword [3] but we only care
-	 * about the patchlevel which is the lowest nibble of dword [3]
+	 * Use single-ring mode (nr_rings = 1) on Sailfish so RPTR is read
+	 * directly from REG_A5XX_CP_RB_RPTR without WHERE_AM_I / preemption.
 	 */
-	if (((buf[0] & 0xf) == 0xa) && (buf[2] & 0xf) >= 1)
-		a5xx_gpu->has_whereami = true;
+	(void)buf;
+	a5xx_gpu->has_whereami = false;
 
 	msm_gem_put_vaddr(obj);
 }
@@ -1304,6 +1309,13 @@ static irqreturn_t a5xx_irq(struct msm_gpu *gpu)
 		a5xx_gpmu_err_irq(gpu);
 
 	if (status & A5XX_RBBM_INT_0_MASK_CP_CACHE_FLUSH_TS) {
+		static int irq_log_cnt;
+		if (irq_log_cnt < 15) {
+			pr_info("a5xx_irq: CACHE_FLUSH_TS fence=%u scratch2=%u\n",
+				gpu->rb[0]->memptrs->fence,
+				gpu_read(gpu, REG_A5XX_CP_SCRATCH_REG(2)));
+			irq_log_cnt++;
+		}
 		a5xx_preempt_trigger(gpu);
 		msm_gpu_retire(gpu);
 	}
@@ -1778,10 +1790,12 @@ struct msm_gpu *a5xx_gpu_init(struct drm_device *dev)
 
 	check_speed_bin(&pdev->dev);
 
-	nr_rings = 4;
-
-	if (config->info->revn == 510)
-		nr_rings = 1;
+	/*
+	 * Force nr_rings = 1 on Adreno A530 to avoid ring-switch preemption
+	 * timeouts (ring 0 <-> ring 2) and subsequent RBBM_SW_RESET_CMD hangs.
+	 */
+	(void)config;
+	nr_rings = 1;
 
 	ret = adreno_gpu_init(dev, pdev, adreno_gpu, &funcs, nr_rings);
 	if (ret) {
