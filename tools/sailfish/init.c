@@ -1348,7 +1348,86 @@ static bool prepare_android_rootfs(bool for_shell) {
         }
     }
 
-    /* Automated: Create /init.sailfish.rc so Android init sets essential properties on boot */
+    /* Automated: Strip 'onrestart restart surfaceflinger' from composer service definition so
+     * any HAL hiccup never kills SurfaceFlinger */
+    const char *comp_rc = "/mnt/system_a/vendor/etc/init/android.hardware.graphics.composer@2.1-service.rc";
+    if (access(comp_rc, F_OK) == 0) {
+        mkdir("/tmp", 0755);
+        FILE *cin = fopen(comp_rc, "r");
+        FILE *cout = fopen("/tmp/composer.rc", "w");
+        if (cin && cout) {
+            char line[512];
+            while (fgets(line, sizeof(line), cin)) {
+                if (strstr(line, "onrestart restart surfaceflinger"))
+                    continue;
+                fputs(line, cout);
+            }
+        }
+        if (cin) fclose(cin);
+        if (cout) {
+            fclose(cout);
+            chmod("/tmp/composer.rc", 0644);
+            set_selinux_label("/tmp/composer.rc", "u:object_r:vendor_configs_file:s0");
+            if (mount("/tmp/composer.rc", comp_rc, NULL, MS_BIND, NULL) == 0) {
+                usb_write("[+] Automated: Overlaid composer@2.1-service.rc (removed onrestart restart surfaceflinger)\n");
+            }
+        }
+    }
+
+    /* Automated: Bind wrap_preload over graphics HALs & surfaceflinger so they ALWAYS load libsdm_shim.so
+     * natively on startup, preventing SIGSEGV in libsdmcore and unlocking hwcomposer + surfaceflinger */
+    if (access("/tools/wrap_preload", F_OK) == 0) {
+        chmod("/tools/wrap_preload", 0755);
+        struct {
+            const char *service_path;
+            const char *real_path;
+            const char *label;
+        } wrap_targets[] = {
+            { "/mnt/system_a/vendor/bin/hw/android.hardware.graphics.composer@2.1-service",
+              "/mnt/system_a/system/bin/android.hardware.graphics.composer@2.1-service.real",
+              "u:object_r:hal_graphics_composer_default_exec:s0" },
+            { "/mnt/system_a/vendor/bin/hw/android.hardware.graphics.allocator@2.0-service",
+              "/mnt/system_a/system/bin/android.hardware.graphics.allocator@2.0-service.real",
+              "u:object_r:hal_graphics_allocator_default_exec:s0" },
+            { "/mnt/system_a/system/bin/surfaceflinger",
+              "/mnt/system_a/system/bin/surfaceflinger.real",
+              "u:object_r:surfaceflinger_exec:s0" },
+            { "/mnt/system_a/system/bin/bootanimation",
+              "/mnt/system_a/system/bin/bootanimation.real",
+              "u:object_r:bootanim_exec:s0" },
+            { NULL, NULL, NULL }
+        };
+
+        for (int i = 0; wrap_targets[i].service_path; i++) {
+            const char *svc = wrap_targets[i].service_path;
+            const char *real = wrap_targets[i].real_path;
+            const char *lbl = wrap_targets[i].label;
+
+            if (access(svc, F_OK) == 0) {
+                FILE *rf = fopen(real, "w");
+                if (rf) fclose(rf);
+                chmod(real, 0755);
+                set_selinux_label(real, lbl);
+
+                if (mount(svc, real, NULL, MS_BIND, NULL) == 0) {
+                    char wrap_copy[128];
+                    snprintf(wrap_copy, sizeof(wrap_copy), "/tmp/wrap_%d", i);
+                    copy_file("/tools/wrap_preload", wrap_copy);
+                    chmod(wrap_copy, 0755);
+                    set_selinux_label(wrap_copy, lbl);
+
+                    if (mount(wrap_copy, svc, NULL, MS_BIND, NULL) == 0) {
+                        char msg[192];
+                        snprintf(msg, sizeof(msg), "[+] Automated: Bound LD_PRELOAD wrapper -> %s\n", svc);
+                        usb_write(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    /* Automated: Create native .rc files in /system/etc/init and /vendor/etc/init so Android init
+     * automatically executes essential properties and service stops on boot */
     const char *rc_content =
         "on early-init\n"
         "    setprop ro.crypto.state unencrypted\n"
@@ -1358,20 +1437,34 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    setprop service.sf.prime_shader_cache 0\n"
         "\n"
         "on post-fs\n"
+        "    stop vendor.qseecomd\n"
+        "    stop vendor.time_daemon\n"
+        "    stop vendor.keymaster-3-0\n"
+        "    stop vendor.configstore-hal\n"
         "    setprop sys.listeners.registered true\n"
         "\n"
         "on post-fs-data\n"
-        "    setprop sys.time.set true\n"
-        "    exec_background - root root -- /system/bin/sh /data/start_graphics.sh\n";
+        "    setprop sys.time.set true\n";
 
-    write_file_str("/mnt/system_a/init.sailfish.rc", rc_content);
-    chmod("/mnt/system_a/init.sailfish.rc", 0644);
-    set_selinux_label("/mnt/system_a/init.sailfish.rc", "u:object_r:rootfs:s0");
+    mkdir("/mnt/system_a/system/etc/init", 0755);
+    write_file_str("/mnt/system_a/system/etc/init/sailfish_boot.rc", rc_content);
+    chmod("/mnt/system_a/system/etc/init/sailfish_boot.rc", 0644);
+    set_selinux_label("/mnt/system_a/system/etc/init/sailfish_boot.rc", "u:object_r:system_file:s0");
+
+    mkdir("/mnt/system_a/vendor/etc/init", 0755);
+    write_file_str("/mnt/system_a/vendor/etc/init/sailfish_boot.rc", rc_content);
+    chmod("/mnt/system_a/vendor/etc/init/sailfish_boot.rc", 0644);
+    set_selinux_label("/mnt/system_a/vendor/etc/init/sailfish_boot.rc", "u:object_r:vendor_configs_file:s0");
 
     mkdir("/mnt/system_a/vendor/etc/init/hw", 0755);
     write_file_str("/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", rc_content);
     chmod("/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", 0644);
     set_selinux_label("/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", "u:object_r:vendor_configs_file:s0");
+
+    write_file_str("/mnt/system_a/init.sailfish.rc", rc_content);
+    chmod("/mnt/system_a/init.sailfish.rc", 0644);
+    set_selinux_label("/mnt/system_a/init.sailfish.rc", "u:object_r:rootfs:s0");
+
 
     /* Automated: Sync SELinux sha256 checksums to vendor so precompiled_sepolicy loads */
     const char *sha_pairs[][2] = {
@@ -1577,8 +1670,14 @@ static bool prepare_android_rootfs(bool for_shell) {
         usb_write("[+] Automated: Installed /data/setup_composer_sysfs.sh\n");
     }
 
-    /* Automated: Install libsdm_shim.so and libEGL_adreno_shim.so into /data */
+    /* Automated: Install libsdm_shim.so into /system/lib64 and /data */
     if (access("/tools/libsdm_shim.so", F_OK) == 0) {
+        mkdir("/mnt/system_a/system/lib64", 0755);
+        copy_file("/tools/libsdm_shim.so", "/mnt/system_a/system/lib64/libsdm_shim.so");
+        chmod("/mnt/system_a/system/lib64/libsdm_shim.so", 0755);
+        set_selinux_label("/mnt/system_a/system/lib64/libsdm_shim.so", "u:object_r:system_file:s0");
+        usb_write("[+] Automated: Installed /system/lib64/libsdm_shim.so\n");
+
         copy_file("/tools/libsdm_shim.so", "/mnt/system_a/data/libsdm_shim.so");
         chmod("/mnt/system_a/data/libsdm_shim.so", 0755);
         set_selinux_label("/mnt/system_a/data/libsdm_shim.so", "u:object_r:system_file:s0");
@@ -1735,8 +1834,33 @@ static bool prepare_android_rootfs(bool for_shell) {
         close(lcfd);
 
     /* Ensure /dev/ion device permissions and SELinux label */
+    chmod("/dev/ion", 0666);
     chmod("/mnt/system_a/dev/ion", 0666);
     set_selinux_label("/mnt/system_a/dev/ion", "u:object_r:ion_device:s0");
+
+    /* Ensure graphics display nodes and permissions */
+    mkdir("/mnt/system_a/dev/graphics", 0755);
+    symlink("/dev/fb0", "/mnt/system_a/dev/graphics/fb0");
+    mkdir("/dev/graphics", 0755);
+    symlink("/dev/fb0", "/dev/graphics/fb0");
+
+    mkdir("/mnt/system_a/dev/dri", 0755);
+    mkdir("/dev/dri", 0755);
+    if (access("/dev/dri/card1", F_OK) == 0 && access("/dev/dri/card0", F_OK) != 0) {
+        symlink("/dev/dri/card1", "/dev/dri/card0");
+        symlink("/dev/dri/card1", "/mnt/system_a/dev/dri/card0");
+    }
+    chmod("/dev/dri/card0", 0666);
+    chmod("/dev/dri/card1", 0666);
+    chmod("/dev/dri/renderD128", 0666);
+    chmod("/mnt/system_a/dev/dri/card0", 0666);
+    chmod("/mnt/system_a/dev/dri/card1", 0666);
+    chmod("/mnt/system_a/dev/dri/renderD128", 0666);
+
+    write_file_str("/sys/class/backlight/994000.dsi.0/brightness", "200\n");
+    int vfd = open("/sys/devices/virtual/graphics/fb0/vsync_event", O_WRONLY | O_CREAT, 0666);
+    if (vfd >= 0) close(vfd);
+    chmod("/sys/devices/virtual/graphics/fb0/vsync_event", 0666);
 
     const char *prefixes[] = {
         "/mnt/system_a/dev/block/by-name",
@@ -2090,6 +2214,209 @@ static void drain_kmsg_to_usb(int kfd) {
     }
 }
 
+static pid_t find_process_by_name(const char *name) {
+    DIR *d = opendir("/proc");
+    if (!d) return -1;
+    struct dirent *de;
+    pid_t found = -1;
+    while ((de = readdir(d)) != NULL) {
+        if (!isdigit(de->d_name[0])) continue;
+        pid_t p = atoi(de->d_name);
+        if (p <= 1) continue;
+        char comm_path[128], comm[64];
+        snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", (int)p);
+        if (read_first_line(comm_path, comm, sizeof(comm)) && strstr(comm, name)) {
+            found = p;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+static void supervisor_setprop(pid_t init_pid, const char *key, const char *val) {
+    pid_t sp = fork();
+    if (sp == 0) {
+        int nfd = open("/dev/null", O_RDWR);
+        if (nfd >= 0) {
+            dup2(nfd, 0); dup2(nfd, 1); dup2(nfd, 2);
+            close(nfd);
+        }
+        char pid_ns[128], mnt_ns[128], root_path[128];
+        snprintf(pid_ns, sizeof(pid_ns), "/proc/%d/ns/pid", (int)init_pid);
+        snprintf(mnt_ns, sizeof(mnt_ns), "/proc/%d/ns/mnt", (int)init_pid);
+        snprintf(root_path, sizeof(root_path), "/proc/%d/root", (int)init_pid);
+
+        int pfd = open(pid_ns, O_RDONLY);
+        int mfd = open(mnt_ns, O_RDONLY);
+        int rfd = open(root_path, O_RDONLY | O_DIRECTORY);
+
+        if (pfd >= 0) { setns(pfd, CLONE_NEWPID); close(pfd); }
+        if (mfd >= 0 && rfd >= 0) {
+            setns(mfd, CLONE_NEWNS);
+            fchdir(rfd);
+            chroot(".");
+            chdir("/");
+            close(mfd);
+            close(rfd);
+        }
+        char *envp[] = {
+            "PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/apex/com.android.runtime/bin",
+            "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/apex/com.android.runtime/lib64",
+            "ANDROID_ROOT=/system",
+            "ANDROID_DATA=/data",
+            NULL
+        };
+        char *argv[] = { (char *)"/system/bin/setprop", (char *)key, (char *)val, NULL };
+        execve("/system/bin/setprop", argv, envp);
+        _exit(1);
+    }
+    if (sp > 0) {
+        int st = 0;
+        waitpid(sp, &st, 0);
+    }
+}
+
+static void spawn_android_supervisor(void) {
+    pid_t sup = fork();
+    if (sup != 0) return; /* Parent returns immediately */
+
+    setsid();
+    usb_write("[+] Android boot supervisor started in background\n");
+
+    /* Wait for Android init to start and property_service socket to appear */
+    pid_t init_pid = -1;
+    for (int w = 0; w < 120; w++) {
+        init_pid = find_android_init_pid();
+        if (init_pid > 1) {
+            char prop_sock[128];
+            snprintf(prop_sock, sizeof(prop_sock), "/proc/%d/root/dev/socket/property_service", (int)init_pid);
+            if (access(prop_sock, F_OK) == 0) {
+                break;
+            }
+        }
+        usleep(500000);
+    }
+
+    if (init_pid <= 1) {
+        usb_write("[-] Supervisor: Android property_service timed out\n");
+        _exit(1);
+    }
+
+    /* Wait a moment for property_service to finish bind & listen */
+    usleep(1500000);
+    usb_write("[+] Supervisor: Android property_service is online!\n");
+
+    /* Apply critical boot properties */
+    const char *props[][2] = {
+        { "ctl.stop", "vendor.qseecomd" },
+        { "ctl.stop", "vendor.time_daemon" },
+        { "ctl.stop", "vendor.keymaster-3-0" },
+        { "ctl.stop", "vendor.configstore-hal" },
+        { "ro.crypto.state", "unencrypted" },
+        { "sys.use_memfd", "true" },
+        { "debug.gralloc.gfx_ubwc_disable", "1" },
+        { "debug.gralloc.enable_fb_ubwc", "0" },
+        { "service.sf.prime_shader_cache", "0" },
+        { "sys.listeners.registered", "true" },
+        { "sys.time.set", "true" },
+        { NULL, NULL }
+    };
+
+    for (int p = 0; props[p][0]; p++) {
+        supervisor_setprop(init_pid, props[p][0], props[p][1]);
+        usleep(50000);
+    }
+    usb_write("[+] Supervisor: Boot properties applied (listeners=true, time=true, qseecomd=stopped)\n");
+
+    /* Execute /data/start_graphics.sh inside the namespace as guaranteed fallback */
+    char test_script[128];
+    snprintf(test_script, sizeof(test_script), "/proc/%d/root/data/start_graphics.sh", (int)init_pid);
+    if (access(test_script, F_OK) == 0) {
+        pid_t gfork = fork();
+        if (gfork == 0) {
+            char pid_ns[128], mnt_ns[128], root_path[128];
+            snprintf(pid_ns, sizeof(pid_ns), "/proc/%d/ns/pid", (int)init_pid);
+            snprintf(mnt_ns, sizeof(mnt_ns), "/proc/%d/ns/mnt", (int)init_pid);
+            snprintf(root_path, sizeof(root_path), "/proc/%d/root", (int)init_pid);
+
+            int pfd = open(pid_ns, O_RDONLY);
+            int mfd = open(mnt_ns, O_RDONLY);
+            int rfd = open(root_path, O_RDONLY | O_DIRECTORY);
+
+            if (pfd >= 0) { setns(pfd, CLONE_NEWPID); close(pfd); }
+            if (mfd >= 0 && rfd >= 0) {
+                setns(mfd, CLONE_NEWNS);
+                fchdir(rfd);
+                chroot(".");
+                chdir("/");
+                close(mfd);
+                close(rfd);
+            }
+            char *gargv[] = { (char *)"/system/bin/sh", (char *)"/data/start_graphics.sh", NULL };
+            char *genvp[] = {
+                "PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/apex/com.android.runtime/bin",
+                "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/apex/com.android.i18n/lib64",
+                "ANDROID_ROOT=/system",
+                "ANDROID_DATA=/data",
+                NULL
+            };
+            execve("/system/bin/sh", gargv, genvp);
+            _exit(1);
+        }
+        if (gfork > 0) {
+            int gst = 0;
+            waitpid(gfork, &gst, 0);
+            usb_write("[+] Supervisor: /data/start_graphics.sh executed!\n");
+        }
+    }
+
+    /* Monitor boot milestones */
+    bool sf_seen = false, ba_seen = false, zy_seen = false, sys_seen = false;
+    for (int m = 0; m < 90; m++) {
+        if (!sf_seen) {
+            pid_t p = find_process_by_name("surfaceflinger");
+            if (p > 0) {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "[+] Milestone: surfaceflinger running (PID %d)\n", (int)p);
+                usb_write(msg);
+                sf_seen = true;
+            }
+        }
+        if (!ba_seen) {
+            pid_t p = find_process_by_name("bootanimation");
+            if (p > 0) {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "[+] Milestone: bootanimation running (PID %d)\n", (int)p);
+                usb_write(msg);
+                ba_seen = true;
+            }
+        }
+        if (!zy_seen) {
+            pid_t p = find_process_by_name("zygote64");
+            if (p <= 0) p = find_process_by_name("app_process64");
+            if (p > 0) {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "[+] Milestone: zygote64 running (PID %d)\n", (int)p);
+                usb_write(msg);
+                zy_seen = true;
+            }
+        }
+        if (!sys_seen) {
+            pid_t p = find_process_by_name("system_server");
+            if (p > 0) {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "[+] Milestone: system_server running (PID %d)\n", (int)p);
+                usb_write(msg);
+                sys_seen = true;
+            }
+        }
+        sleep(2);
+    }
+
+    _exit(0);
+}
+
 static void boot_android_init(const char *stage) {
     if (!stage || !*stage)
         stage = "selinux_setup";
@@ -2104,7 +2431,7 @@ static void boot_android_init(const char *stage) {
     char msg[192];
     snprintf(msg, sizeof(msg),
              "[+] Launching Android /system/bin/init (%s) in isolated PID 1 namespace...\n"
-             "[+] Streaming live /dev/kmsg to serial! (Press Ctrl+C to abort & return to sailfish#)\n\n",
+             "[+] Streaming live /dev/kmsg to serial! (Press Ctrl+C to return to shell)\n\n",
              stage);
     usb_write(msg);
 
@@ -2169,30 +2496,6 @@ static void boot_android_init(const char *stage) {
                 NULL
             };
 
-            /* Auto-start Mesa Freedreno graphics stack & BootAnimation once Android property_service is up */
-            pid_t gfx_bg = fork();
-            if (gfx_bg == 0) {
-                int nfd = open("/dev/null", O_RDWR);
-                if (nfd >= 0) {
-                    dup2(nfd, 0);
-                    dup2(nfd, 1);
-                    dup2(nfd, 2);
-                    if (nfd > 2) close(nfd);
-                }
-                setsid();
-                for (int w = 0; w < 60; w++) {
-                    if (access("/dev/socket/property_service", F_OK) == 0 &&
-                        access("/data/start_graphics.sh", F_OK) == 0) {
-                        break;
-                    }
-                    usleep(500000);
-                }
-                sleep(3);
-                char *gargv[] = { (char *)"/system/bin/sh", (char *)"/data/start_graphics.sh", NULL };
-                execve("/system/bin/sh", gargv, envp);
-                _exit(0);
-            }
-
             if (strcmp(stage, "first_stage") == 0 || strcmp(stage, "none") == 0) {
                 execve("/system/bin/init", argv_plain, envp);
             } else {
@@ -2209,6 +2512,9 @@ static void boot_android_init(const char *stage) {
             _exit(WEXITSTATUS(st));
         _exit(128 + WTERMSIG(st));
     }
+
+    /* Spawn background supervisor to monitor boot and apply runtime properties */
+    spawn_android_supervisor();
 
     int status = 0;
     while (1) {
@@ -2228,9 +2534,8 @@ static void boot_android_init(const char *stage) {
                 ssize_t n = read(g_ttygs_fd, rx, sizeof(rx));
                 for (ssize_t i = 0; i < n; i++) {
                     if (rx[i] == 0x03) { /* Ctrl+C */
-                        usb_write("\n[!] Ctrl+C received; terminating Android init namespace...\n");
-                        kill(outer, SIGKILL);
-                        waitpid(outer, &status, 0);
+                        usb_write("\n[!] Ctrl+C detected: Detaching log stream; Android init continues running in background.\n");
+                        usb_write("[+] Type 'sh' to enter Android root shell, or 'boot_android' to resume log stream.\n");
                         goto done;
                     }
                 }
@@ -2450,7 +2755,36 @@ static void handle_usb_cmd(char *cmd) {
     } else if (strcmp(cmd, "android_sh") == 0 || strcmp(cmd, "sh") == 0) {
         launch_android_shell();
     } else if (strcmp(cmd, "boot_android") == 0 || strcmp(cmd, "boot") == 0) {
-        boot_android_init("selinux_setup");
+        pid_t cur_init = find_android_init_pid();
+        if (cur_init > 1) {
+            char amsg[256];
+            snprintf(amsg, sizeof(amsg),
+                     "[!] Android init is already running (PID %d)! Streaming /dev/kmsg...\n"
+                     "[+] Press Ctrl+C to return to sailfish# shell, or type 'sh' to enter Android root shell.\n\n",
+                     (int)cur_init);
+            usb_write(amsg);
+            int kfd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+            if (kfd >= 0) lseek(kfd, 0, SEEK_END);
+            while (1) {
+                drain_kmsg_to_usb(kfd);
+                if (g_ttygs_fd >= 0) {
+                    struct pollfd pfd = { .fd = g_ttygs_fd, .events = POLLIN, .revents = 0 };
+                    if (poll(&pfd, 1, 50) > 0 && (pfd.revents & POLLIN)) {
+                        char rx[16];
+                        ssize_t n = read(g_ttygs_fd, rx, sizeof(rx));
+                        for (ssize_t i = 0; i < n; i++) {
+                            if (rx[i] == 0x03) goto stream_done;
+                        }
+                    }
+                } else {
+                    usleep(50000);
+                }
+            }
+stream_done:
+            if (kfd >= 0) close(kfd);
+        } else {
+            boot_android_init("selinux_setup");
+        }
     } else if (strncmp(cmd, "boot_android ", 13) == 0) {
         const char *st = cmd + 13;
         while (*st == ' ') st++;
@@ -2652,32 +2986,11 @@ int main(void) {
     print_msg("[+] USB serial shell waiting for host on /dev/ttyGS0 (/dev/ttyACM0)\n");
     print_msg("======================================================\n");
 
-    /* Automated: Auto-boot Android 17 userspace after 2s countdown unless a key is pressed */
-    print_msg("[+] Auto-booting Android 17 in 2 seconds (send any key over serial to cancel)...\n");
-    bool auto_boot = true;
-    for (int i = 0; i < 20; i++) {
-        if (!usb_bound) usb_bound = setup_usb_gadget();
-        open_ttygs_if_ready();
-        if (g_ttygs_fd >= 0) {
-            struct pollfd pfd;
-            pfd.fd = g_ttygs_fd;
-            pfd.events = POLLIN;
-            pfd.revents = 0;
-            if (poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLIN)) {
-                char dummy[16];
-                read(g_ttygs_fd, dummy, sizeof(dummy));
-                auto_boot = false;
-                print_msg("[+] Auto-boot canceled; entering sailfish# shell.\n");
-                break;
-            }
-        } else {
-            usleep(100000);
-        }
-    }
-    if (auto_boot) {
-        print_msg("[+] Auto-starting Android 17 userspace...\n");
-        boot_android_init("selinux_setup");
-    }
+    /* Automated: Auto-boot Android 17 userspace immediately on boot */
+    if (!usb_bound) usb_bound = setup_usb_gadget();
+    open_ttygs_if_ready();
+    print_msg("[+] Auto-starting Android 17 userspace immediately...\n");
+    boot_android_init("selinux_setup");
 
     char cmd_buf[256];
     size_t cmd_len = 0;

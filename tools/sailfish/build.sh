@@ -67,6 +67,14 @@ if [ ! -f "$SCRIPT_DIR/pause_stub/pause_stub" ]; then
 fi
 cp "$SCRIPT_DIR/pause_stub/pause_stub" "$OUT_DIR/initramfs_root/tools/pause_stub"
 chmod +x "$OUT_DIR/initramfs_root/tools/pause_stub"
+
+if [ ! -f "$SCRIPT_DIR/wrap_preload/wrap_preload" ]; then
+    mkdir -p "$SCRIPT_DIR/wrap_preload"
+    aarch64-linux-gnu-gcc -nostdlib -static -s -O2 -o "$SCRIPT_DIR/wrap_preload/wrap_preload" "$SCRIPT_DIR/wrap_preload/wrap_preload.c"
+fi
+cp "$SCRIPT_DIR/wrap_preload/wrap_preload" "$OUT_DIR/initramfs_root/tools/wrap_preload"
+chmod +x "$OUT_DIR/initramfs_root/tools/wrap_preload"
+
 cp "$SCRIPT_DIR/qservice_daemon/qservice_daemon" "$OUT_DIR/initramfs_root/tools/qservice_daemon"
 chmod +x "$OUT_DIR/initramfs_root/tools/qservice_daemon"
 cp "$SCRIPT_DIR/android.hardware.graphics.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.graphics.xml"
