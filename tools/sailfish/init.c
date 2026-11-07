@@ -1215,8 +1215,45 @@ static bool prepare_android_rootfs(bool for_shell) {
     mkdir("/mnt/system_a/vendor", 0755);
     mount("/mnt/vendor_a", "/mnt/system_a/vendor", NULL, MS_BIND | MS_REC, NULL);
 
-    /* Automated: Bind-mount modern Bionic EGL/GLES shim over legacy vendor Adreno blobs */
-    if (access("/tools/libEGL_adreno_shim.so", F_OK) == 0) {
+    /* Preferred: Mesa Freedreno (gallium/msm) real GLES driver.
+     * Build a tmpfs copy of /vendor/lib64/egl, overlay the Mesa libs (named *_adreno.so so
+     * ro.hardware.egl=adreno keeps working) plus libgallium_dri.so (found via RUNPATH=$ORIGIN),
+     * then bind it over the read-only vendor egl directory. */
+    bool mesa_installed = false;
+    if (access("/tools/mesa/libgallium_dri.so", F_OK) == 0 &&
+        access("/mnt/system_a/vendor/lib64/egl", F_OK) == 0) {
+        mkdir("/mesa_egl", 0755);
+        if (mount("tmpfs", "/mesa_egl", "tmpfs", 0, "mode=0755") == 0) {
+            const char *dirs[] = { "/mnt/system_a/vendor/lib64/egl", "/tools/mesa" };
+            for (int d = 0; d < 2; d++) {
+                DIR *dp = opendir(dirs[d]);
+                if (!dp) continue;
+                struct dirent *de;
+                while ((de = readdir(dp)) != NULL) {
+                    if (de->d_name[0] == '.') continue;
+                    char src[512], dst[512];
+                    snprintf(src, sizeof(src), "%s/%s", dirs[d], de->d_name);
+                    snprintf(dst, sizeof(dst), "/mesa_egl/%s", de->d_name);
+                    unlink(dst);
+                    if (copy_file(src, dst)) {
+                        chmod(dst, 0644);
+                        set_selinux_label(dst, "u:object_r:same_process_hal_file:s0");
+                    }
+                }
+                closedir(dp);
+            }
+            set_selinux_label("/mesa_egl", "u:object_r:same_process_hal_file:s0");
+            if (mount("/mesa_egl", "/mnt/system_a/vendor/lib64/egl", NULL, MS_BIND, NULL) == 0) {
+                mesa_installed = true;
+                usb_write("[+] Automated: Mesa Freedreno GLES installed over /vendor/lib64/egl\n");
+            } else {
+                usb_write("[-] Mesa egl bind failed, falling back to EGL shim\n");
+            }
+        }
+    }
+
+    /* Fallback: Bind-mount mock Bionic EGL/GLES shim over legacy vendor Adreno blobs */
+    if (!mesa_installed && access("/tools/libEGL_adreno_shim.so", F_OK) == 0) {
         if (access("/mnt/system_a/vendor/lib64/egl/libEGL_adreno.so", F_OK) == 0) {
             if (mount("/tools/libEGL_adreno_shim.so", "/mnt/system_a/vendor/lib64/egl/libEGL_adreno.so", NULL, MS_BIND, NULL) == 0) {
                 usb_write("[+] Automated: Bound libEGL_adreno_shim.so -> /vendor/lib64/egl/libEGL_adreno.so\n");
@@ -1467,7 +1504,10 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "[ ! -e /dev/graphics/fb0 ] && [ -e /dev/fb0 ] && ln -sf /dev/fb0 /dev/graphics/fb0\n"
                     "mkdir -p /dev/dri 2>/dev/null\n"
                     "[ ! -e /dev/dri/card0 ] && [ -e /dev/dri/card1 ] && ln -sf /dev/dri/card1 /dev/dri/card0\n"
-                    "if [ -f /data/libEGL_adreno_shim.so ]; then\n"
+                    "chmod 666 /dev/dri/* 2>/dev/null\n"
+                    "if [ -f /vendor/lib64/egl/libgallium_dri.so ]; then\n"
+                    "    echo '[+] Using Mesa Freedreno GLES driver'\n"
+                    "elif [ -f /data/libEGL_adreno_shim.so ]; then\n"
                     "    mount -o bind /data/libEGL_adreno_shim.so /vendor/lib64/egl/libEGL_adreno.so 2>/dev/null || true\n"
                     "    mount -o bind /data/libEGL_adreno_shim.so /vendor/lib64/egl/libGLESv2_adreno.so 2>/dev/null || true\n"
                     "fi\n"

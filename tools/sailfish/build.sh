@@ -41,6 +41,13 @@ fi
 echo "[+] Staging Android 17 graphics compatibility shims into initramfs"
 mkdir -p "$OUT_DIR/initramfs_root/tools"
 cp "$SCRIPT_DIR/egl_shim/libEGL_adreno_shim.so" "$OUT_DIR/initramfs_root/tools/libEGL_adreno_shim.so"
+# Mesa Freedreno GLES driver (built + staged by tools/sailfish/mesa/stage_mesa.sh).
+# When present, init.c prefers it over the mock EGL shim.
+if [ -f "$SCRIPT_DIR/mesa/lib64/libgallium_dri.so" ]; then
+    echo "[+] Staging Mesa Freedreno GLES libs"
+    mkdir -p "$OUT_DIR/initramfs_root/tools/mesa"
+    cp "$SCRIPT_DIR/mesa/lib64/"*.so "$OUT_DIR/initramfs_root/tools/mesa/"
+fi
 if [ -f "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" ]; then
     cp "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" "$OUT_DIR/initramfs_root/tools/libsdm_shim.so"
 fi
