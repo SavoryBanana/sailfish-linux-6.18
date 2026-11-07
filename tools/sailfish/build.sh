@@ -54,6 +54,12 @@ fi
 if [ -f "$SCRIPT_DIR/adreno_utils/libadreno_utils.so" ]; then
     cp "$SCRIPT_DIR/adreno_utils/libadreno_utils.so" "$OUT_DIR/initramfs_root/tools/libadreno_utils.so"
 fi
+if [ ! -f "$SCRIPT_DIR/vdc_stub/vdc_stub" ]; then
+    mkdir -p "$SCRIPT_DIR/vdc_stub"
+    echo -e ".global _start\n.text\n_start:\n  mov x8, 93\n  mov x0, 0\n  svc 0\n" | aarch64-linux-gnu-gcc -x assembler -nostdlib -static -s -o "$SCRIPT_DIR/vdc_stub/vdc_stub" -
+fi
+cp "$SCRIPT_DIR/vdc_stub/vdc_stub" "$OUT_DIR/initramfs_root/tools/vdc_stub"
+chmod +x "$OUT_DIR/initramfs_root/tools/vdc_stub"
 cp "$SCRIPT_DIR/qservice_daemon/qservice_daemon" "$OUT_DIR/initramfs_root/tools/qservice_daemon"
 chmod +x "$OUT_DIR/initramfs_root/tools/qservice_daemon"
 cp "$SCRIPT_DIR/android.hardware.graphics.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.graphics.xml"

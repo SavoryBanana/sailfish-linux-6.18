@@ -1284,6 +1284,47 @@ static bool prepare_android_rootfs(bool for_shell) {
         }
     }
 
+    /* Automated: Strip /data (fileencryption=ice) from /vendor/etc/fstab.sailfish so mount_all --late
+     * preserves our in-memory tmpfs /data and never triggers FBE keymaster waits */
+    if (access("/mnt/system_a/vendor/etc/fstab.sailfish", F_OK) == 0) {
+        mkdir("/tmp", 0755);
+        FILE *fs_in = fopen("/mnt/system_a/vendor/etc/fstab.sailfish", "r");
+        FILE *fs_out = fopen("/tmp/fstab.sailfish", "w");
+        if (fs_in && fs_out) {
+            char line[512];
+            while (fgets(line, sizeof(line), fs_in)) {
+                if (strstr(line, "/userdata") || strstr(line, "\t/data\t") || strstr(line, " /data "))
+                    continue;
+                fputs(line, fs_out);
+            }
+        }
+        if (fs_in) fclose(fs_in);
+        if (fs_out) {
+            fclose(fs_out);
+            chmod("/tmp/fstab.sailfish", 0644);
+            set_selinux_label("/tmp/fstab.sailfish", "u:object_r:vendor_configs_file:s0");
+            if (mount("/tmp/fstab.sailfish", "/mnt/system_a/vendor/etc/fstab.sailfish", NULL, MS_BIND, NULL) == 0) {
+                usb_write("[+] Automated: Overlaid /vendor/etc/fstab.sailfish (unencrypted tmpfs /data)\n");
+            }
+        }
+    }
+
+    /* Automated: Stub /system/bin/vdc with instant exit 0 binary so vdc keymaster earlyBootEnded
+     * never blocks vold on missing android.security.maintenance / keymaster@3.0 */
+    if (access("/mnt/system_a/system/bin/vdc", F_OK) == 0) {
+        const char *stub_src = (access("/tools/vdc_stub", F_OK) == 0) ? "/tools/vdc_stub" : NULL;
+        if (!stub_src) {
+            mkdir("/tmp", 0755);
+            write_file_str("/tmp/vdc_noop", "#!/system/bin/sh\nexit 0\n");
+            stub_src = "/tmp/vdc_noop";
+        }
+        chmod(stub_src, 0755);
+        set_selinux_label(stub_src, "u:object_r:vdc_exec:s0");
+        if (mount(stub_src, "/mnt/system_a/system/bin/vdc", NULL, MS_BIND, NULL) == 0) {
+            usb_write("[+] Automated: Bound no-op vdc stub -> /system/bin/vdc\n");
+        }
+    }
+
     /* Automated: Sync SELinux sha256 checksums to vendor so precompiled_sepolicy loads */
     const char *sha_pairs[][2] = {
         { "/mnt/system_a/system/etc/selinux/plat_sepolicy_and_mapping.sha256",
@@ -1515,11 +1556,17 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "setenforce 0 2>/dev/null\n"
                     "export LD_LIBRARY_PATH=/apex/com.android.i18n/lib64:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/system/lib64:/vendor/lib64\n"
                     "setprop ctl.stop vendor.qseecomd 2>/dev/null\n"
-                    "killall -9 qseecomd 2>/dev/null\n"
+                    "setprop ctl.stop vendor.time_daemon 2>/dev/null\n"
+                    "setprop ctl.stop vendor.keymaster-3-0 2>/dev/null\n"
+                    "setprop ctl.stop vendor.configstore-hal 2>/dev/null\n"
+                    "killall -9 qseecomd time_daemon android.hardware.keymaster@3.0-service android.hardware.configstore@1.1-service 2>/dev/null\n"
+                    "setprop ro.crypto.state unencrypted 2>/dev/null\n"
                     "setprop sys.use_memfd true 2>/dev/null\n"
                     "setprop debug.gralloc.gfx_ubwc_disable 1 2>/dev/null\n"
                     "setprop debug.gralloc.enable_fb_ubwc 0 2>/dev/null\n"
                     "setprop service.sf.prime_shader_cache 0 2>/dev/null\n"
+                    "setprop sys.listeners.registered true 2>/dev/null\n"
+                    "setprop sys.time.set true 2>/dev/null\n"
                     "chmod 666 /dev/ion 2>/dev/null\n"
                     "chmod 666 /dev/dma_heap/* 2>/dev/null\n"
                     "mkdir -p /dev/graphics 2>/dev/null\n"
