@@ -59,7 +59,11 @@ if [ -f "$SCRIPT_DIR/setup_composer_sysfs.sh" ]; then
     chmod +x "$OUT_DIR/initramfs_root/tools/setup_composer_sysfs.sh"
 fi
 
-(cd "$OUT_DIR/initramfs_root" && find . | cpio -o -H newc | gzip -9 > "$OUT_DIR/initramfs.cpio.gz")
+# Note: initramfs_root is embedded directly into the kernel Image via
+# CONFIG_INITRAMFS_SOURCE (compressed with XZ). Provide a minimal valid
+# cpio.gz stub for mkbootimg --ramdisk so Qualcomm aboot is satisfied
+# without duplicating the 5 MB ramdisk a second time in boot.img.
+(cd "$OUT_DIR/initramfs_root" && printf ".\n" | cpio -o -H newc --quiet | gzip -9 > "$OUT_DIR/initramfs.cpio.gz")
 
 echo "=== 2. Configuring Kernel (sailfish_defconfig) ==="
 make sailfish_defconfig ARCH=arm64 LLVM=1
