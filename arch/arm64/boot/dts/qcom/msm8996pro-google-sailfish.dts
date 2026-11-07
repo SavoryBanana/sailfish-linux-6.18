@@ -352,6 +352,17 @@
 	};
 };
 
+/*
+ * Keep GPU clock within the fixed bootloader nominal vdd_gfx voltage corner
+ * (<= 401.8 MHz) since dynamic CPR3/APM rail scaling is not active.
+ */
+&gpu_opp_table {
+	/delete-node/ opp-652800000;
+	/delete-node/ opp-624000000;
+	/delete-node/ opp-560000000;
+	/delete-node/ opp-510000000;
+};
+
 &mdss_dsi0 {
 	/delete-property/ assigned-clocks;
 	/delete-property/ assigned-clock-parents;

@@ -566,6 +566,14 @@ void msm_submit_retire(struct msm_gem_submit *submit)
 						       ((p & 0x000000ffU) << 16);
 					}
 					msm_gem_put_vaddr(obj);
+					{
+						static int retire_scanout_cnt;
+						if (retire_scanout_cnt < 5) {
+							pr_info("msm_submit_retire: scanned out frame %d (seqno=%u size=%zu)\n",
+								retire_scanout_cnt + 1, submit->seqno, obj->size);
+							retire_scanout_cnt++;
+						}
+					}
 				}
 			}
 		}

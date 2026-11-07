@@ -118,7 +118,14 @@ struct msm_gpu *adreno_load_gpu(struct drm_device *dev)
 		goto err_put_rpm;
 	}
 
-	pm_runtime_put_autosuspend(&pdev->dev);
+	/*
+	 * Keep the runtime PM reference active on Sailfish (MSM8996) where
+	 * GPU_GDSC, GPU_GX_GDSC, and vdd_gfx are always-on. Allowing runtime
+	 * PM to autosuspend and later re-run a5xx_hw_init() / zap-shader
+	 * resume on an uncollapsed GPU triggers a fatal TrustZone CNOC_ERROR.
+	 */
+	pr_info("adreno_load_gpu: %s hw_init succeeded, keeping runtime PM active\n",
+		gpu->name);
 
 #ifdef CONFIG_DEBUG_FS
 	if (gpu->funcs->debugfs_init) {

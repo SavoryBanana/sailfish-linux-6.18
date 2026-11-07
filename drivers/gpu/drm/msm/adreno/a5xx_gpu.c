@@ -247,6 +247,15 @@ static void a5xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 
 	/* Check to see if we need to start preemption */
 	a5xx_preempt_trigger(gpu);
+
+	{
+		static int submit_log_cnt;
+		if (submit_log_cnt < 5) {
+			pr_info("a5xx_submit: seqno=%u ring=%d nr_cmds=%u ibs=%u\n",
+				submit->seqno, ring->id, submit->nr_cmds, ibs);
+			submit_log_cnt++;
+		}
+	}
 }
 
 static const struct adreno_five_hwcg_regs {
@@ -643,22 +652,15 @@ static int a5xx_ucode_load(struct msm_gpu *gpu)
 
 static int a5xx_zap_shader_resume(struct msm_gpu *gpu)
 {
-	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
-	int ret;
-
 	/*
-	 * Adreno 506 have CPZ Retention feature and doesn't require
-	 * to resume zap shader
+	 * On Sailfish (MSM8996), GPU_GDSC, GPU_GX_GDSC, and vdd_gfx are
+	 * permanently uncollapsed, so the GPU and TrustZone PAS 13 never
+	 * power-collapse. Calling qcom_scm_set_remote_state(0, 13) triggers
+	 * a fatal TrustZone CNOC_ERROR.
 	 */
-	if (adreno_is_a506(adreno_gpu))
-		return 0;
-
-	ret = qcom_scm_set_remote_state(SCM_GPU_ZAP_SHADER_RESUME, GPU_PAS_ID);
-	if (ret)
-		DRM_ERROR("%s: zap-shader resume failed: %d\n",
-			gpu->name, ret);
-
-	return ret;
+	pr_info("%s: skipping zap-shader SCM resume on always-on GDSC\n",
+		gpu->name);
+	return 0;
 }
 
 static int a5xx_zap_shader_init(struct msm_gpu *gpu)

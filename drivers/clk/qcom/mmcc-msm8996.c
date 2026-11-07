@@ -1310,7 +1310,7 @@ static struct clk_branch mmss_misc_ahb_clk = {
 				&ahb_clk_src.clkr.hw
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -1327,6 +1327,7 @@ static struct clk_branch mmss_misc_cxo_clk = {
 				{ .fw_name = "xo", .name = "xo_board" },
 			},
 			.num_parents = 1,
+			.flags = CLK_IGNORE_UNUSED,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -1683,7 +1684,7 @@ static struct clk_branch gpu_gx_gfx3d_clk = {
 				&gfx3d_clk_src.rcg.clkr.hw
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -1700,7 +1701,7 @@ static struct clk_branch gpu_gx_rbbmtimer_clk = {
 				&rbbmtimer_clk_src.clkr.hw
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -1717,7 +1718,7 @@ static struct clk_branch gpu_ahb_clk = {
 				&ahb_clk_src.clkr.hw
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -1734,7 +1735,7 @@ static struct clk_branch gpu_aon_isense_clk = {
 				&isense_clk_src.clkr.hw
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -1785,7 +1786,7 @@ static struct clk_branch mmss_rbcpr_clk = {
 				&rbcpr_clk_src.clkr.hw
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -1802,7 +1803,7 @@ static struct clk_branch mmss_rbcpr_ahb_clk = {
 				&ahb_clk_src.clkr.hw
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -3655,6 +3656,9 @@ static int mmcc_msm8996_probe(struct platform_device *pdev)
 		regmap_update_bits(regmap, 0x4300, BIT(0), 0);
 		regmap_update_bits(regmap, 0x4024, BIT(0), 0);
 		regmap_update_bits(regmap, 0x4028, BIT(14) | BIT(13), BIT(14) | BIT(13));
+		regmap_update_bits(regmap, 0x4044, BIT(0), BIT(0));
+		regmap_update_bits(regmap, 0x5018, BIT(0), BIT(0));
+		regmap_update_bits(regmap, 0x5014, BIT(0), BIT(0));
 		udelay(100);
 		regmap_read(regmap, 0x4024, &val);
 		pr_info("MMCC: GPU_GX_GDSC uncollapsed, status(0x4024)=0x%08x\n", val);
