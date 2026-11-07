@@ -535,17 +535,21 @@ static void submit_cleanup(struct msm_gem_submit *submit, bool error)
 
 void msm_submit_retire(struct msm_gem_submit *submit)
 {
+	bool scanned_out = false;
 	int i;
 
-	for (i = 0; i < submit->nr_bos; i++) {
+	for (i = submit->nr_bos - 1; i >= 0; i--) {
 		struct drm_gem_object *obj = submit->bos[i].obj;
 		struct drm_gpuvm_bo *vm_bo = submit->bos[i].vm_bo;
 
 		/* When Mesa Freedreno finishes rendering a full-screen 1080x1920
 		 * Android RGBA_8888 DMA-BUF, scan it out to the active DRM/KMS
-		 * framebuffer (XRGB8888) on the physical panel.
+		 * framebuffer (XRGB8888) on the physical panel and trigger
+		 * drm_fb_helper_damage_area() so MDP5 flushes the DSI command-mode
+		 * panel on every frame.
 		 */
-		if (drm_gem_is_imported(obj) &&
+		if (!scanned_out &&
+		    drm_gem_is_imported(obj) &&
 		    (submit->bos[i].flags & MSM_SUBMIT_BO_WRITE) &&
 		    obj->size >= 1080 * 1920 * 4 &&
 		    obj->size <= 9000000 &&
@@ -575,6 +579,8 @@ void msm_submit_retire(struct msm_gem_submit *submit)
 						}
 					}
 					msm_gem_put_vaddr(obj);
+					drm_fb_helper_damage_area(fbh->info, 0, 0, 1080, 1920);
+					scanned_out = true;
 					{
 						static int retire_scanout_cnt;
 						if (retire_scanout_cnt < 5) {

@@ -1514,6 +1514,8 @@ static bool prepare_android_rootfs(bool for_shell) {
         fprintf(gf, "#!/system/bin/sh\n"
                     "setenforce 0 2>/dev/null\n"
                     "export LD_LIBRARY_PATH=/apex/com.android.i18n/lib64:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/system/lib64:/vendor/lib64\n"
+                    "setprop ctl.stop vendor.qseecomd 2>/dev/null\n"
+                    "killall -9 qseecomd 2>/dev/null\n"
                     "setprop sys.use_memfd true 2>/dev/null\n"
                     "setprop debug.gralloc.gfx_ubwc_disable 1 2>/dev/null\n"
                     "setprop debug.gralloc.enable_fb_ubwc 0 2>/dev/null\n"
@@ -2065,6 +2067,30 @@ static void boot_android_init(const char *stage) {
                 "TERM=linux",
                 NULL
             };
+
+            /* Auto-start Mesa Freedreno graphics stack & BootAnimation once Android property_service is up */
+            pid_t gfx_bg = fork();
+            if (gfx_bg == 0) {
+                int nfd = open("/dev/null", O_RDWR);
+                if (nfd >= 0) {
+                    dup2(nfd, 0);
+                    dup2(nfd, 1);
+                    dup2(nfd, 2);
+                    if (nfd > 2) close(nfd);
+                }
+                setsid();
+                for (int w = 0; w < 60; w++) {
+                    if (access("/dev/socket/property_service", F_OK) == 0 &&
+                        access("/data/start_graphics.sh", F_OK) == 0) {
+                        break;
+                    }
+                    usleep(500000);
+                }
+                sleep(3);
+                char *gargv[] = { (char *)"/system/bin/sh", (char *)"/data/start_graphics.sh", NULL };
+                execve("/system/bin/sh", gargv, envp);
+                _exit(0);
+            }
 
             if (strcmp(stage, "first_stage") == 0 || strcmp(stage, "none") == 0) {
                 execve("/system/bin/init", argv_plain, envp);

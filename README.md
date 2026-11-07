@@ -19,11 +19,12 @@ This repository contains the complete board support package, device tree source,
 | **USB Peripheral** | DWC3 High-Speed (`6a00000.usb`) ConfigFS | **Working** | Interactive high-speed CDC-ACM serial shell (`18d1:d001`) |
 | **Crash Logging** | `pstore` / ramoops (`0x83500000`, 1 MB) | **Working** | `earlyramoops` console & `/sys/fs/pstore` accessible live |
 | **Battery & Charging** | PMI8994 Switch-Mode Charger & Fuel Gauge | **Working** | 1.5A fast charging, USB status, monotonic SoC & voltage reporting |
-| **GPU (3D)** | Freedreno Adreno 530 (`&gpu`, `&adreno_smmu`) | **Working** | Authentic OEM signed zap shader authenticated via TrustZone PAS; non-secure mode cleared; `/dev/dri/card1` & `/dev/dri/renderD128` operational |
-| **Android 17 Userspace** | Android 17 AOSP GSI (`CP2A.260605.012`) | **Booting / Active** | `init`, `apexd`, `zygote64`, and `system_server` online; executes bootstrap services up to `DisplayManagerService` |
-| **RenderEngine / EGL** | Custom ARM64 Bionic EGL Shim (`libEGL_adreno_shim.so`) | **Working** | SurfaceFlinger RenderEngine / SkiaGL initialized cleanly without legacy `/dev/kgsl-3d0` or `/dev/ion` panics |
+| **GPU (3D)** | Freedreno Adreno 530 (`&gpu`, `&adreno_smmu`) | **Working** | Authentic OEM signed zap shader authenticated via TrustZone PAS; single-ring (`ring=0`) submission at 401.8 MHz; `/dev/dri/card1` & `/dev/dri/renderD128` active |
+| **Android 17 Userspace** | Android 17 AOSP GSI (`CP2A.260605.012`) | **Working** | `init`, `apexd`, `SurfaceFlinger`, and `bootanimation` running with hardware 3D acceleration |
+| **Mesa 25.2.8 Freedreno** | `libEGL_adreno.so`, `libGLESv2_adreno.so`, `libgallium_dri.so` | **Working** | Mainline Mesa 25.2.8 `gallium/freedreno` (`msm` KMD) powering Skia Ganesh GLES in `SurfaceFlinger` and `BootAnimation` |
+| **Gralloc & Adreno Utils** | Open-source `libadreno_utils.so` + `ion_compat` DMA-BUF heap | **Working** | 64-pixel width (`1088` stride) & 32-pixel height alignment for Adreno 530 GMEM; `/dev/ion` compatibility bridge over `system-uncached` DMA-BUF heap |
 | **VINTF Compatibility** | Custom HIDL Manifest Fragment (`android.hardware.graphics.xml`) | **Working** | Declares `composer@2.1` & `allocator@2.0` with `hwbinder` transport, satisfying Android 17 `hwservicemanager` |
-| **Display HAL & QService** | `hwcomposer.msm8996` + `libsdmcore` + `qservice_daemon` | **Core Created / HWDevice In Progress** | `qservice_daemon` active on `/dev/vndbinder` via AIDL servicemanager shim; `caps` reverse-engineered with 10 pipes (4 VIG, 4 DMA, 2 Cursor), `hw_rev=268894210`, `clk_fudge_factor=105 100`; `CoreInterface::CreateCore` succeeds; currently solving `HWDevice::Init: Primary Display Device should be present` (`GetFBNodeIndex`) |
+| **Display HAL & Scanout** | `hwcomposer.msm8996` + `libsdm_shim` + DRM/KMS `msm_submit_retire` | **Working** | Live hardware-rendered `BootAnimation` scanning out to the physical 1080x1920 AMOLED panel and `screencap` capturing valid PNGs |
 
 ---
 
@@ -129,10 +130,11 @@ This repository contains the complete board support package, device tree source,
      - Spawns an interactive root diagnostic shell that joins Android `init`'s mount and PID namespaces (`CLONE_NEWNS` / `CLONE_NEWPID`) without disrupting runtime properties or socket bindings.
    - **Framework Lifecycle:** Android `init` starts critical core daemons (`servicemanager`, `hwservicemanager`, `vndservicemanager`), initializes `zygote64`, and boots `system_server`. Core bootstrap services (`ActivityManagerService`, `PowerManagerService`, `BatteryService`) run stably, reaching `DisplayManagerService`.
 
-10. **RenderEngine / EGL Compatibility Shim ([`tools/sailfish/egl_shim/`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/egl_shim/)):**
-    - **Root Cause:** In Android 17, SurfaceFlinger uses RenderEngine (SkiaGL). Qualcomm's legacy Android 10 proprietary blobs (`libEGL_adreno.so` / `libGLESv2_adreno.so`) crash under modern Linux kernels because legacy downstream drivers `/dev/kgsl-3d0` and `/dev/ion` no longer exist.
-    - **Shim Implementation:** Built a standalone Bionic ARM64 EGL/GLES shim ([`libEGL_adreno_shim.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/egl_shim/libEGL_adreno_shim.c)) bind-mounted over `/vendor/lib64/egl/libEGL_adreno.so` and `/vendor/lib64/egl/libGLESv2_adreno.so`.
-    - **SurfaceFlinger RenderEngine Breakthrough:** The shim handles `eglGetDisplay`, `eglInitialize`, config querying, surface creation, and context creation, completely resolving EGLConfig aborts and allowing SurfaceFlinger's RenderEngine to initialize without errors.
+10. **Mesa 25.2.8 Freedreno (`FD530`) GLES Driver & Open-Source `libadreno_utils.so` ([`tools/sailfish/mesa/`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/mesa/), [`tools/sailfish/adreno_utils/`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/adreno_utils/)):**
+    - **Root Cause:** Qualcomm's legacy Android 10 proprietary blobs (`libEGL_adreno.so`, `libGLESv2_adreno.so`, `libadreno_utils.so`) require downstream `/dev/kgsl-3d0` and `/dev/ion`.
+    - **Mesa 25.2.8 Freedreno Integration:** Cross-compiled Mesa 25.2.8 (`gallium/freedreno` over mainline `drm/msm`) linked solely against Android 17 LLNDK libraries (`libc`, `libm`, `libdl`, `liblog`, `libnativewindow`, `libsync`) and bind-mounted into `/vendor/lib64/egl/`.
+    - **Adreno 530 GMEM Stride Alignment (`libadreno_utils.so`):** Authored an open-source replacement [`libadreno_utils.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/adreno_utils/libadreno_utils.c) bind-mounted over `/vendor/lib64/libadreno_utils.so` that aligns buffer widths to 64 pixels (`1088` pixels = `4352` bytes for `1080x1920`) and heights to 32 pixels to match Freedreno's `gmem_align_w = 64`, plus exports Android 17 `Gralloc2Mapper::validateBufferSize` and `gralloc1` validation symbols.
+    - **Single-Ring Adreno A530 Command Submission:** Configured [`a5xx_gpu.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/gpu/drm/msm/adreno/a5xx_gpu.c) with `nr_rings = 1` (`ring=0`), `has_whereami = false`, runtime PM stay-awake after initial `hw_init`, and `401.8 MHz` nominal OPP cap, completing every hardware 3D command stream in ~9 ms via `a5xx_irq: CACHE_FLUSH_TS`.
 
 11. **Android 17 VINTF HIDL Compliance ([`tools/sailfish/android.hardware.graphics.xml`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/android.hardware.graphics.xml)):**
     - **VINTF Enforcement:** Android 17's `hwservicemanager` strictly checks both Device and Framework HAL manifests. Legacy vendor manifest on Sailfish lacked explicit transport declarations, causing `hwservicemanager` to reject `android.hardware.graphics.composer@2.1` and `android.hardware.graphics.allocator@2.0` with `Transport::EMPTY`.
@@ -163,11 +165,10 @@ This repository contains the complete board support package, device tree source,
         - Pipe types parsed: `vig` (increments `num_vig_pipe`), `dma` (increments `num_dma_pipe`), `rgb` (increments `num_rgb_pipe`), `cursor` (increments `num_cursor_pipe`).
       - Populated complete 10-pipe architecture (4 VIG, 4 DMA, 2 Cursor).
       - **Result:** `HWInfo::GetHWResourceInfo: SDE Version = 500, SDE Revision = 10070002, RGB = 0, VIG = 4, DMA = 4, Cursor = 2`.
-      - **Milestone:** `CoreInterface::CreateCore` succeeded! `ResourceImpl::Init: Number of H/W pipes is Zero!` completely eliminated.
-    - **Current Milestone & Blocker (`HWDevice::Init`):**
-      - `HWCDisplay::Init: Display create failed. Error = 11 (kErrorResources)`.
-      - Root cause: `HWDevice::Init` calls `GetFBNodeIndex(kDevicePrimary)`. While node 0 opened (`/sys/devices/virtual/graphics/fb0/msm_fb_panel_info`), `GetFBNodeIndex` returned `-1` and logged `HWDevice::Init: Primary Display Device should be present`.
-      - In progress: Reverse-engineering `_ZN3sdm8HWDevice14GetFBNodeIndexENS_12HWDeviceTypeE` and `GetHWPanelInfoByNode` / `GetHWDisplayPortAndMode` to determine the exact sysfs attribute or mode string expected to accept `fb0` as the primary panel.
+      - **Milestone:** `CoreInterface::CreateCore` and `HWCDisplayPrimary::Create` succeed!
+    - **Hardware-Accelerated Scanout & `libsdm_shim.so` ([`tools/sailfish/sdm_shim/libsdm_shim.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/sdm_shim/libsdm_shim.c)):**
+      - Intercepts legacy MSMFB ioctls (`MSMFB_METADATA_GET`, `MSMFB_OVERLAY_VSYNC_CTRL`, `MSMFB_DISPLAY_COMMIT`), provides 60 Hz hardware VSYNC pacing (`VSYNC=<ns>`), and patches `libsdmcore.so`'s output buffer check in memory.
+      - In [`drivers/gpu/drm/msm/msm_gem_submit.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/drivers/gpu/drm/msm/msm_gem_submit.c), `msm_submit_retire()` invalidates CPU D-cache lines (`dc civac`), converts completed `1080x1920` (`1088`-stride) `RGBA_8888` GPU buffers to `XRGB_8888` in `fbh->info->screen_buffer`, and triggers `drm_fb_helper_damage_area()` so MDP5 flushes every rendered frame to the physical AMOLED panel.
 
 14. **Kernel & Storage Primitives for Modern Android GSI:**
     - **Ext4 Shared Blocks (`fs/ext4/ext4.h`):** Enabled `EXT4_FEATURE_RO_COMPAT_SHARED_BLOCKS` support to allow mounting modern deduplicated ext4 Android 17 GSI images (`system.img`).
@@ -303,7 +304,6 @@ When restoring the phone back to stock Android 10 and returning later to resume 
      ```bash
      sudo picocom -b 115200 /dev/ttyACM0
      ```
-   - Compatibility shims in `tools/sailfish/init.c` automatically bind modern `servicemanager` over `vndservicemanager`, sync SELinux sha256 checksums, mount APEXes, and populate the MDSS sysfs mock architecture (`/sys/devices/virtual/graphics/fb0/mdp/caps`, `msm_fb_panel_info`, etc.) on early boot.
-   - Run `/data/start_graphics.sh` to launch vendor binder, `qservice_daemon`, allocator, and composer.
-   - Pick up directly from reverse-engineering `libsdmcore.so`'s `GetFBNodeIndex` / `GetHWPanelInfoByNode`.
+   - Compatibility shims in `tools/sailfish/init.c` automatically bind Mesa 25.2.8 Freedreno (`libEGL_adreno.so`, `libGLESv2_adreno.so`, `libgallium_dri.so`) and `libadreno_utils.so`, modernize `vndservicemanager`, sync SELinux sha256 checksums, mount APEXes, and populate the MDSS sysfs mock architecture on early boot.
+   - Running `boot_android` from the `sailfish#` console automatically starts Android `init` and launches `/data/start_graphics.sh` (`vndservicemanager`, `qservice_daemon`, `allocator@2.0`, `composer@2.1`, `surfaceflinger`, and `bootanimation`) in the background once `property_service` comes online.
 
