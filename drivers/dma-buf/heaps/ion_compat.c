@@ -100,7 +100,9 @@ static long ion_compat_ioctl(struct file *file, unsigned int cmd, unsigned long 
 		if (copy_from_user(&data, uarg, sizeof(data)))
 			return -EFAULT;
 
-		heap = dma_heap_find("system");
+		heap = dma_heap_find("system-uncached");
+		if (!heap)
+			heap = dma_heap_find("system");
 		if (!heap)
 			return -ENODEV;
 

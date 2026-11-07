@@ -8,8 +8,10 @@
 #include <linux/file.h>
 #include <linux/sync_file.h>
 #include <linux/uaccess.h>
+#include <linux/fb.h>
 
 #include <drm/drm_drv.h>
+#include <drm/drm_fb_helper.h>
 #include <drm/drm_file.h>
 #include <drm/drm_syncobj.h>
 
@@ -538,6 +540,35 @@ void msm_submit_retire(struct msm_gem_submit *submit)
 	for (i = 0; i < submit->nr_bos; i++) {
 		struct drm_gem_object *obj = submit->bos[i].obj;
 		struct drm_gpuvm_bo *vm_bo = submit->bos[i].vm_bo;
+
+		/* When Mesa Freedreno finishes rendering a full-screen 1080x1920
+		 * Android RGBA_8888 DMA-BUF, scan it out to the active DRM/KMS
+		 * framebuffer (XRGB8888) on the physical panel.
+		 */
+		if (drm_gem_is_imported(obj) &&
+		    (submit->bos[i].flags & MSM_SUBMIT_BO_WRITE) &&
+		    obj->size >= 1080 * 1920 * 4 &&
+		    obj->size <= 8454144 &&
+		    submit->dev && submit->dev->fb_helper) {
+			struct drm_fb_helper *fbh = submit->dev->fb_helper;
+			if (fbh->info && fbh->info->screen_buffer) {
+				void *src = msm_gem_get_vaddr(obj);
+				if (!IS_ERR_OR_NULL(src)) {
+					u32 *s = (u32 *)src;
+					u32 *d = (u32 *)fbh->info->screen_buffer;
+					size_t n = min_t(size_t, obj->size,
+							 fbh->info->screen_size) / 4;
+					size_t j;
+					for (j = 0; j < n; j++) {
+						u32 p = s[j];
+						d[j] = (p & 0xff00ff00U) |
+						       ((p & 0x00ff0000U) >> 16) |
+						       ((p & 0x000000ffU) << 16);
+					}
+					msm_gem_put_vaddr(obj);
+				}
+			}
+		}
 
 		msm_gem_lock(obj);
 		drm_gpuvm_bo_put(vm_bo);

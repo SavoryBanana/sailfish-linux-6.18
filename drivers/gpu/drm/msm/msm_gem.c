@@ -736,7 +736,7 @@ static void *get_vaddr(struct drm_gem_object *obj, unsigned madv)
 
 	msm_gem_assert_locked(obj);
 
-	if (drm_gem_is_imported(obj))
+	if (drm_gem_is_imported(obj) && !msm_obj->pages)
 		return ERR_PTR(-ENODEV);
 
 	pages = msm_gem_get_pages_locked(obj, madv);
