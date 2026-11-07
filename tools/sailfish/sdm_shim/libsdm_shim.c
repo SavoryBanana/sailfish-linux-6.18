@@ -18,6 +18,16 @@ static volatile char g_is_vsync_fd[1024];
 static volatile int g_vsync_enabled = 1;
 static volatile uint64_t g_last_vsync_ns = 0;
 
+__attribute__((weak)) int *__errno(void);
+
+static inline long sys_ret(long r) {
+    if (r < 0 && r >= -4095) {
+        if (__errno) *__errno() = (int)(-r);
+        return -1;
+    }
+    return r;
+}
+
 static inline long sys_openat(int dfd, const char *filename, int flags, int mode) {
     register long x0 __asm__("x0") = dfd;
     register long x1 __asm__("x1") = (long)filename;
@@ -233,7 +243,7 @@ int ioctl(int fd, unsigned long req, void *arg) {
     register long x2 __asm__("x2") = (long)arg;
     register long x8 __asm__("x8") = 29;
     __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x8) : "memory", "cc");
-    return (int)x0;
+    return (int)sys_ret(x0);
 }
 
 int openat(int dfd, const char *filename, int flags, int mode) {
@@ -243,7 +253,7 @@ int openat(int dfd, const char *filename, int flags, int mode) {
         if (ret < 1024) g_is_vsync_fd[ret] = 1;
         sys_write(2, "[+] libsdm_shim: Tracked vsync_event fd\n", 40);
     }
-    return (int)ret;
+    return (int)sys_ret(ret);
 }
 
 int open(const char *filename, int flags, int mode) {
@@ -263,7 +273,7 @@ int close(int fd) {
         g_is_vsync_fd[fd] = 0;
         if (fd == g_vsync_fd) g_vsync_fd = -1;
     }
-    return (int)sys_close(fd);
+    return (int)sys_ret(sys_close(fd));
 }
 
 long pread(int fd, void *buf, unsigned long count, unsigned long offset) {
@@ -301,7 +311,7 @@ long pread(int fd, void *buf, unsigned long count, unsigned long offset) {
         }
         return (long)count;
     }
-    return sys_pread64(fd, buf, count, offset);
+    return sys_ret(sys_pread64(fd, buf, count, offset));
 }
 
 long pread64(int fd, void *buf, unsigned long count, unsigned long offset) {
@@ -312,7 +322,7 @@ long read(int fd, void *buf, unsigned long count) {
     if (is_vsync(fd) && buf && count > 0) {
         return pread(fd, buf, count, 0);
     }
-    return sys_read(fd, buf, count);
+    return sys_ret(sys_read(fd, buf, count));
 }
 
 int poll(struct pollfd *fds, unsigned long nfds, int timeout) {
@@ -336,7 +346,7 @@ int poll(struct pollfd *fds, unsigned long nfds, int timeout) {
             ts.tv_nsec = (timeout % 1000) * 1000000L;
             tsp = &ts;
         }
-        return (int)sys_ppoll(fds, nfds, tsp, 0, 8);
+        return (int)sys_ret(sys_ppoll(fds, nfds, tsp, 0, 8));
     }
 
     while (1) {
@@ -401,7 +411,10 @@ int _ZNK7android14Gralloc2Mapper28validateBufferDescriptorInfoEPNS_8hardware8gra
     if (info) {
         uint64_t *usage = (uint64_t *)((char *)info + 0x10);
         *usage &= 0x0fffffffULL;
-        *usage |= 0x200ULL;
+        /* Set HW_RENDER (0x200) + SW_READ_OFTEN | SW_WRITE_OFTEN (0x33) so stock
+         * msm8996 gralloc allocates linear (non-UBWC, non-macrotiled) buffers
+         * compatible with Mesa Freedreno a5xx and mainline MDP5 scanout. */
+        *usage |= 0x233ULL;
     }
     return 0;
 }

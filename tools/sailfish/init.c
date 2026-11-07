@@ -1520,6 +1520,8 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "sleep 0.5\n"
                     "stop vendor.hwcomposer-2-1 2>/dev/null\n"
                     "killall -9 android.hardware.graphics.composer@2.1-service 2>/dev/null\n"
+                    "setprop debug.gralloc.gfx_ubwc_disable 1 2>/dev/null\n"
+                    "setprop debug.gralloc.enable_fb_ubwc 0 2>/dev/null\n"
                     "/vendor/bin/hw/android.hardware.graphics.allocator@2.0-service >/dev/null 2>&1 &\n"
                     "touch /sys/devices/virtual/graphics/fb0/vsync_event 2>/dev/null\n"
                     "chmod 666 /sys/devices/virtual/graphics/fb0/vsync_event 2>/dev/null\n"
