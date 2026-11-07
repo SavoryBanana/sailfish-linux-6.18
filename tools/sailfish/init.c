@@ -1796,11 +1796,16 @@ static void launch_android_shell(void) {
                     _exit(WIFEXITED(ist) ? WEXITSTATUS(ist) : 0);
                 }
 
-                /* Child: assign own process group and make it foreground on controlling tty */
+                /* Child: assign own process group and make it foreground on controlling tty.
+                 * After setpgid() we are a *background* pgrp, so tcsetpgrp() raises SIGTTOU,
+                 * whose default action STOPS us -> parent waitpid() hangs forever and the
+                 * serial console appears frozen. Ignore SIGTTOU around the call. */
+                signal(SIGTTOU, SIG_IGN);
                 setpgid(0, 0);
                 if (g_ttygs_fd >= 0) {
                     tcsetpgrp(0, getpgrp());
                 }
+                signal(SIGTTOU, SIG_DFL);
                 signal(SIGINT, SIG_DFL);
                 signal(SIGQUIT, SIG_DFL);
                 signal(SIGTSTP, SIG_DFL);
