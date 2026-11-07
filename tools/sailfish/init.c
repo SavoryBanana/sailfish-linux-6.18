@@ -1325,6 +1325,54 @@ static bool prepare_android_rootfs(bool for_shell) {
         }
     }
 
+    /* Automated: Bind pause_stub over failing legacy vendor daemons (qseecomd, time_daemon, keymaster, configstore)
+     * so Android init sees them running stably without crash loops */
+    if (access("/tools/pause_stub", F_OK) == 0) {
+        set_selinux_label("/tools/pause_stub", "u:object_r:vendor_file:s0");
+        chmod("/tools/pause_stub", 0755);
+        const char *legacy_daemons[] = {
+            "/mnt/system_a/vendor/bin/qseecomd",
+            "/mnt/system_a/vendor/bin/time_daemon",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.keymaster@3.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.configstore@1.1-service",
+            NULL
+        };
+        for (int d = 0; legacy_daemons[d]; d++) {
+            if (access(legacy_daemons[d], F_OK) == 0) {
+                if (mount("/tools/pause_stub", legacy_daemons[d], NULL, MS_BIND, NULL) == 0) {
+                    char dmsg[160];
+                    snprintf(dmsg, sizeof(dmsg), "[+] Automated: Bound pause_stub -> %s\n", legacy_daemons[d]);
+                    usb_write(dmsg);
+                }
+            }
+        }
+    }
+
+    /* Automated: Create /init.sailfish.rc so Android init sets essential properties on boot */
+    const char *rc_content =
+        "on early-init\n"
+        "    setprop ro.crypto.state unencrypted\n"
+        "    setprop sys.use_memfd true\n"
+        "    setprop debug.gralloc.gfx_ubwc_disable 1\n"
+        "    setprop debug.gralloc.enable_fb_ubwc 0\n"
+        "    setprop service.sf.prime_shader_cache 0\n"
+        "\n"
+        "on post-fs\n"
+        "    setprop sys.listeners.registered true\n"
+        "\n"
+        "on post-fs-data\n"
+        "    setprop sys.time.set true\n"
+        "    exec_background - root root -- /system/bin/sh /data/start_graphics.sh\n";
+
+    write_file_str("/mnt/system_a/init.sailfish.rc", rc_content);
+    chmod("/mnt/system_a/init.sailfish.rc", 0644);
+    set_selinux_label("/mnt/system_a/init.sailfish.rc", "u:object_r:rootfs:s0");
+
+    mkdir("/mnt/system_a/vendor/etc/init/hw", 0755);
+    write_file_str("/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", rc_content);
+    chmod("/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", 0644);
+    set_selinux_label("/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", "u:object_r:vendor_configs_file:s0");
+
     /* Automated: Sync SELinux sha256 checksums to vendor so precompiled_sepolicy loads */
     const char *sha_pairs[][2] = {
         { "/mnt/system_a/system/etc/selinux/plat_sepolicy_and_mapping.sha256",
@@ -1782,6 +1830,11 @@ static pid_t find_android_init_pid(void) {
         char comm_path[128], comm[64];
         snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", (int)p);
         if (read_first_line(comm_path, comm, sizeof(comm)) && strcmp(comm, "init") == 0) {
+            char test_sh[128];
+            snprintf(test_sh, sizeof(test_sh), "/proc/%d/root/system/bin/sh", (int)p);
+            if (access(test_sh, F_OK) != 0)
+                continue;
+
             /* Prefer the PID that is PID 1 inside its own PID namespace */
             char status_path[128], line[256];
             snprintf(status_path, sizeof(status_path), "/proc/%d/status", (int)p);
@@ -2105,6 +2158,7 @@ static void boot_android_init(const char *stage) {
             char *argv_plain[] = { (char *)"/system/bin/init", NULL };
             char *envp[] = {
                 "PATH=/sbin:/system/sbin:/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/apex/com.android.runtime/bin",
+                "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/apex/com.android.i18n/lib64",
                 "ANDROID_ROOT=/system",
                 "ANDROID_DATA=/data",
                 "ANDROID_STORAGE=/storage",
@@ -2597,6 +2651,33 @@ int main(void) {
 
     print_msg("[+] USB serial shell waiting for host on /dev/ttyGS0 (/dev/ttyACM0)\n");
     print_msg("======================================================\n");
+
+    /* Automated: Auto-boot Android 17 userspace after 2s countdown unless a key is pressed */
+    print_msg("[+] Auto-booting Android 17 in 2 seconds (send any key over serial to cancel)...\n");
+    bool auto_boot = true;
+    for (int i = 0; i < 20; i++) {
+        if (!usb_bound) usb_bound = setup_usb_gadget();
+        open_ttygs_if_ready();
+        if (g_ttygs_fd >= 0) {
+            struct pollfd pfd;
+            pfd.fd = g_ttygs_fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            if (poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLIN)) {
+                char dummy[16];
+                read(g_ttygs_fd, dummy, sizeof(dummy));
+                auto_boot = false;
+                print_msg("[+] Auto-boot canceled; entering sailfish# shell.\n");
+                break;
+            }
+        } else {
+            usleep(100000);
+        }
+    }
+    if (auto_boot) {
+        print_msg("[+] Auto-starting Android 17 userspace...\n");
+        boot_android_init("selinux_setup");
+    }
 
     char cmd_buf[256];
     size_t cmd_len = 0;

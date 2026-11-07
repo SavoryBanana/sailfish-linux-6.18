@@ -60,6 +60,13 @@ if [ ! -f "$SCRIPT_DIR/vdc_stub/vdc_stub" ]; then
 fi
 cp "$SCRIPT_DIR/vdc_stub/vdc_stub" "$OUT_DIR/initramfs_root/tools/vdc_stub"
 chmod +x "$OUT_DIR/initramfs_root/tools/vdc_stub"
+
+if [ ! -f "$SCRIPT_DIR/pause_stub/pause_stub" ]; then
+    mkdir -p "$SCRIPT_DIR/pause_stub"
+    echo -e ".global _start\n.text\n_start:\n1:\n  mov x8, 22\n  svc 0\n  b 1b\n" | aarch64-linux-gnu-gcc -x assembler -nostdlib -static -s -o "$SCRIPT_DIR/pause_stub/pause_stub" -
+fi
+cp "$SCRIPT_DIR/pause_stub/pause_stub" "$OUT_DIR/initramfs_root/tools/pause_stub"
+chmod +x "$OUT_DIR/initramfs_root/tools/pause_stub"
 cp "$SCRIPT_DIR/qservice_daemon/qservice_daemon" "$OUT_DIR/initramfs_root/tools/qservice_daemon"
 chmod +x "$OUT_DIR/initramfs_root/tools/qservice_daemon"
 cp "$SCRIPT_DIR/android.hardware.graphics.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.graphics.xml"
