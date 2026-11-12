@@ -48,9 +48,37 @@ if [ -f "$SCRIPT_DIR/mesa/lib64/libgallium_dri.so" ]; then
     mkdir -p "$OUT_DIR/initramfs_root/tools/mesa"
     cp "$SCRIPT_DIR/mesa/lib64/"*.so "$OUT_DIR/initramfs_root/tools/mesa/"
 fi
+if [ -f "$SCRIPT_DIR/sdm_shim/libsdm_shim.c" ]; then
+    echo "[+] Building libsdm_shim.so"
+    aarch64-linux-gnu-gcc -shared -fPIC -O2 -nostdlib "$SCRIPT_DIR/sdm_shim/libsdm_shim.c" -o "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" -Wl,-z,max-page-size=4096
+fi
 if [ -f "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" ]; then
     cp "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" "$OUT_DIR/initramfs_root/tools/libsdm_shim.so"
+    mkdir -p "$OUT_DIR/initramfs_root/tools/lib64"
+    cp "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" "$OUT_DIR/initramfs_root/tools/lib64/libsdm_shim.so"
 fi
+if [ -f "$SCRIPT_DIR/libui_patched.so" ]; then
+    echo "[+] Staging patched libui.so (Gralloc 2.x support)"
+    cp "$SCRIPT_DIR/libui_patched.so" "$OUT_DIR/initramfs_root/tools/libui.so"
+fi
+mkdir -p "$OUT_DIR/initramfs_root/tools/lib64"
+CRIT_LIBS="libbase.so libcutils.so liblog.so libc++.so libunwindstack.so liblzma.so libz.so libfs_mgr.so libselinux.so libutils.so libcrypto.so libcrypto_utils.so liblp.so libprocessgroup.so libprocessgroup_setup.so libvendorsupport.so libext4_utils.so libgsi.so libsparse.so libbootloader_message.so libjsoncpp.so libext2_uuid.so liblogwrap.so libexpat.so"
+for lib in $CRIT_LIBS; do
+    if [ -f "$SCRIPT_DIR/$lib" ]; then
+        echo "[+] Staging clean 64-bit $lib"
+        cp "$SCRIPT_DIR/$lib" "$OUT_DIR/initramfs_root/tools/lib64/$lib"
+    fi
+    # Avoid duplicate copy directly under tools/ to keep boot.img under 32MB limit
+    rm -f "$OUT_DIR/initramfs_root/tools/$lib"
+done
+
+mkdir -p "$OUT_DIR/initramfs_root/tools/lib32"
+for lib in libbase.so libcutils.so liblog.so libc++.so; do
+    if [ -f "$SCRIPT_DIR/lib32/$lib" ]; then
+        echo "[+] Staging clean 32-bit $lib"
+        cp "$SCRIPT_DIR/lib32/$lib" "$OUT_DIR/initramfs_root/tools/lib32/$lib"
+    fi
+done
 if [ -f "$SCRIPT_DIR/adreno_utils/libadreno_utils.so" ]; then
     cp "$SCRIPT_DIR/adreno_utils/libadreno_utils.so" "$OUT_DIR/initramfs_root/tools/libadreno_utils.so"
 fi
@@ -68,10 +96,8 @@ fi
 cp "$SCRIPT_DIR/pause_stub/pause_stub" "$OUT_DIR/initramfs_root/tools/pause_stub"
 chmod +x "$OUT_DIR/initramfs_root/tools/pause_stub"
 
-if [ ! -f "$SCRIPT_DIR/wrap_preload/wrap_preload" ]; then
-    mkdir -p "$SCRIPT_DIR/wrap_preload"
-    aarch64-linux-gnu-gcc -nostdlib -static -s -O2 -o "$SCRIPT_DIR/wrap_preload/wrap_preload" "$SCRIPT_DIR/wrap_preload/wrap_preload.c"
-fi
+mkdir -p "$SCRIPT_DIR/wrap_preload"
+aarch64-linux-gnu-gcc -nostdlib -static -s -O2 -o "$SCRIPT_DIR/wrap_preload/wrap_preload" "$SCRIPT_DIR/wrap_preload/wrap_preload.c"
 cp "$SCRIPT_DIR/wrap_preload/wrap_preload" "$OUT_DIR/initramfs_root/tools/wrap_preload"
 chmod +x "$OUT_DIR/initramfs_root/tools/wrap_preload"
 

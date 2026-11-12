@@ -212,6 +212,29 @@ __attribute__((constructor)) void shim_init(void) {
 }
 
 int ioctl(int fd, unsigned long req, void *arg) {
+    unsigned int nr = (unsigned int)(req & 0xff);
+    unsigned int type = (unsigned int)((req >> 8) & 0xff);
+
+    if (type == 'I') {
+        if (nr == 5 /* ION_IOC_IMPORT */) {
+            if (arg) {
+                int *p = (int *)arg;
+                int buffer_fd = p[1];
+                if (buffer_fd <= 0 && p[2] > 0) buffer_fd = p[2];
+                if (buffer_fd <= 0) buffer_fd = 1;
+                p[0] = buffer_fd;
+            }
+            sys_write(2, "[+] libsdm_shim: Intercepted ION_IOC_IMPORT -> handle OK\n", 57);
+            return 0;
+        }
+        if (fd < 0) {
+            /* Any other ION ioctl on unopened fd (e.g. ION_IOC_FREE) */
+            return 0;
+        }
+    }
+    if (fd < 0) {
+        return (int)sys_ret(-9); /* -EBADF */
+    }
     if ((req & 0xffff) == 0x6da6) {
         uint32_t *op = (uint32_t *)arg;
         if (op && *op == 2) {
@@ -534,4 +557,25 @@ int _ZNK7android14Gralloc2Mapper28validateBufferDescriptorInfoEPNS_8hardware8gra
     }
     return 0;
 }
+
+int _ZN8gralloc19Allocator12ImportBufferEi(void *this, int fd) {
+    (void)this;
+    sys_write(2, "[+] libsdm_shim: Allocator::ImportBuffer -> OK\n", 47);
+    return (fd > 0) ? fd : 1;
+}
+
+int _ZN8gralloc18IonAlloc12ImportBufferEi(void *this, int fd) {
+    (void)this;
+    sys_write(2, "[+] libsdm_shim: IonAlloc::ImportBuffer -> OK\n", 46);
+    return (fd > 0) ? fd : 1;
+}
+
+/* Android 10 libbase Trim compatibility for Health HAL */
+void _ZN7android4base4TrimIRKNSt3__112basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEEEES8_OT_(void *ret, const void *src);
+
+__attribute__((visibility("default")))
+void _ZN7android4base4TrimERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE(void *ret, const void *src) {
+    _ZN7android4base4TrimIRKNSt3__112basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEEEES8_OT_(ret, src);
+}
+
 

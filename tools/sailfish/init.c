@@ -28,6 +28,7 @@
 #include <sched.h>
 
 static int g_ttygs_fd = -1;
+static bool g_usb_bound = false;
 
 static void write_str(const char *path, const char *val) {
     int fd = open(path, O_WRONLY);
@@ -161,11 +162,8 @@ static void usb_write_ex(const char *msg, bool wait_drain) {
     }
 }
 
-static void usb_write(const char *msg) {
-    usb_write_ex(msg, true);
-}
-
 static void print_msg_local(const char *msg) {
+    if (!msg) return;
     const char *devs[] = { "/dev/tty0", "/dev/kmsg", "/dev/pmsg0" };
     for (size_t i = 0; i < sizeof(devs) / sizeof(devs[0]); i++) {
         int fd = open(devs[i], O_WRONLY | O_NOCTTY | O_NONBLOCK);
@@ -174,6 +172,10 @@ static void print_msg_local(const char *msg) {
             close(fd);
         }
     }
+}
+
+static void usb_write(const char *msg) {
+    usb_write_ex(msg, true);
 }
 
 static void print_msg(const char *msg) {
@@ -1086,6 +1088,340 @@ static void write_file_str(const char *path, const char *val) {
     }
 }
 
+/* Remove 0-byte regular placeholder files from a lib dir without touching symlinks. */
+static void clean_zero_byte_libs(const char *dir_path) {
+    DIR *d = opendir(dir_path);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char sp[256];
+        snprintf(sp, sizeof(sp), "%s/%s", dir_path, de->d_name);
+        struct stat st;
+        if (lstat(sp, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 0) {
+            unlink(sp);
+        }
+    }
+    closedir(d);
+}
+
+/* Ensure every library in libs exists as a valid ELF binary of elf_class (1=32, 2=64). */
+static void ensure_elf_libs(const char *dst_dir, const char *src_dir,
+                            unsigned char elf_class, const char *const *libs) {
+    for (int i = 0; libs[i]; i++) {
+        char target[256], src[256];
+        snprintf(target, sizeof(target), "%s/%s", dst_dir, libs[i]);
+        snprintf(src, sizeof(src), "%s/%s", src_dir, libs[i]);
+        if (elf_class == 2 && access(src, F_OK) != 0)
+            snprintf(src, sizeof(src), "/tools/%s", libs[i]);
+
+        struct stat st;
+        bool need_restore = (lstat(target, &st) != 0 || S_ISLNK(st.st_mode) || st.st_size < 10000);
+        if (!need_restore) {
+            int fd = open(target, O_RDONLY);
+            if (fd >= 0) {
+                unsigned char ehdr[5] = {0};
+                if (read(fd, ehdr, 5) != 5 || ehdr[0] != 0x7f || ehdr[4] != elf_class)
+                    need_restore = true;
+                close(fd);
+            } else {
+                need_restore = true;
+            }
+        }
+        if (need_restore && access(src, F_OK) == 0) {
+            unlink(target);
+            if (!copy_file(src, target)) {
+                int dummy = creat(target, 0644);
+                if (dummy >= 0) close(dummy);
+                mount(src, target, NULL, MS_BIND, NULL);
+            } else {
+                chmod(target, 0644);
+                set_selinux_label(target, "u:object_r:system_lib_file:s0");
+            }
+            char rmsg[128];
+            snprintf(rmsg, sizeof(rmsg), "[+] Restored %s-bit %s\n",
+                     elf_class == 2 ? "64" : "32", libs[i]);
+            usb_write(rmsg);
+        }
+    }
+}
+
+/* Non-destructively overlay an Android ueventd.rc file with 0666 ION/DMA-BUF/DRM rules. */
+static void overlay_ueventd_file(const char *src_rc, const char *tmp_rc, const char *label) {
+    if (access(src_rc, F_OK) != 0) return;
+
+    mkdir("/tmp", 0755);
+    FILE *in = fopen(src_rc, "r");
+    FILE *out = fopen(tmp_rc, "w");
+    if (!in || !out) {
+        if (in) fclose(in);
+        if (out) fclose(out);
+        return;
+    }
+
+    char line[512];
+    while (fgets(line, sizeof(line), in)) {
+        if (strncmp(line, "/dev/ion", 8) == 0 ||
+            strncmp(line, "/dev/dma_heap/system ", 21) == 0 ||
+            strncmp(line, "/dev/dma_heap/system\t", 21) == 0 ||
+            strncmp(line, "/dev/dma_heap/system-uncached", 29) == 0 ||
+            strncmp(line, "/dev/dri/*", 10) == 0) {
+            continue;
+        }
+        fputs(line, out);
+    }
+    fprintf(out,
+        "\n# Sailfish mainline DMA-BUF/ION/DRM permissions\n"
+        "/dev/ion                                  0666   root       root\n"
+        "/dev/dma_heap/system                      0666   system     system\n"
+        "/dev/dma_heap/system-uncached             0666   system     system\n"
+        "/dev/dri/*                                0666   root       graphics\n");
+    fclose(in);
+    fclose(out);
+
+    chmod(tmp_rc, 0644);
+    set_selinux_label(tmp_rc, label);
+    if (mount(tmp_rc, src_rc, NULL, MS_BIND, NULL) == 0) {
+        char msg[192];
+        snprintf(msg, sizeof(msg), "[+] Automated: Overlaid %s with 0666 ION/DMA-BUF/DRM rules\n", src_rc);
+        usb_write(msg);
+    }
+}
+
+/* Write a permissive multi-arch (${LIB}) linkerconfig enabling all APEX & system namespaces. */
+static void umount_all(const char *path) {
+    for (int tries = 0; tries < 32; tries++) {
+        if (umount2(path, MNT_DETACH) != 0) break;
+    }
+}
+
+static int bind_mount_clean(const char *src, const char *dst) {
+    umount_all(dst);
+    return mount(src, dst, NULL, MS_BIND, NULL);
+}
+
+static void unmount_android_mounts(void) {
+    for (int pass = 0; pass < 8; pass++) {
+        FILE *f = fopen("/proc/mounts", "r");
+        if (!f) break;
+        char mps[512][256];
+        int count = 0;
+        char line[1024];
+        while (fgets(line, sizeof(line), f) && count < 512) {
+            char dev[256], mp[256];
+            if (sscanf(line, "%255s %255s", dev, mp) == 2) {
+                if (strcmp(mp, "/mnt/system_a") == 0 ||
+                    strncmp(mp, "/mnt/system_a/", 14) == 0 ||
+                    strcmp(mp, "/mnt/vendor_a") == 0 ||
+                    strncmp(mp, "/mnt/vendor_a/", 14) == 0) {
+                    snprintf(mps[count], sizeof(mps[count]), "%s", mp);
+                    count++;
+                }
+            }
+        }
+        fclose(f);
+        if (count == 0) break;
+
+        for (int i = 0; i < count - 1; i++) {
+            for (int j = i + 1; j < count; j++) {
+                if (strlen(mps[i]) < strlen(mps[j])) {
+                    char tmp[256];
+                    memcpy(tmp, mps[i], sizeof(tmp));
+                    memcpy(mps[i], mps[j], sizeof(tmp));
+                    memcpy(mps[j], tmp, sizeof(tmp));
+                }
+            }
+        }
+        int unmounted = 0;
+        for (int i = 0; i < count; i++) {
+            mount(NULL, mps[i], NULL, MS_PRIVATE, NULL);
+            if (umount2(mps[i], MNT_DETACH) == 0) {
+                unmounted++;
+            }
+        }
+        if (unmounted == 0) break;
+    }
+}
+
+static bool is_valid_wrap_target(const char *path) {
+    struct stat st, wst;
+    if (stat(path, &st) != 0 || st.st_size <= 4096) return false;
+    if (stat("/tools/wrap_preload", &wst) == 0 && st.st_size == wst.st_size) {
+        unsigned char a[512], b[512];
+        int fa = open(path, O_RDONLY);
+        int fb = open("/tools/wrap_preload", O_RDONLY);
+        bool same = false;
+        if (fa >= 0 && fb >= 0) {
+            ssize_t na = read(fa, a, sizeof(a));
+            ssize_t nb = read(fb, b, sizeof(b));
+            if (na > 0 && na == nb && memcmp(a, b, (size_t)na) == 0) {
+                same = true;
+            }
+        }
+        if (fa >= 0) close(fa);
+        if (fb >= 0) close(fb);
+        if (same) return false;
+    }
+    return true;
+}
+
+static void write_proc_sysctl(const char *path, const char *val) {
+    int fd = open(path, O_WRONLY);
+    if (fd >= 0) {
+        ssize_t n = write(fd, val, strlen(val));
+        (void)n;
+        close(fd);
+    }
+}
+
+static bool write_permissive_ld_config(const char *path, const char *label) {
+    FILE *ldf = fopen(path, "w");
+    if (!ldf) return false;
+
+    fprintf(ldf,
+        "# sailfish-permissive-ldconfig\n"
+        "dir.system = /system/bin\n"
+        "dir.system = /system/xbin\n"
+        "dir.system = /system/apex\n"
+        "dir.system = /apex\n"
+        "dir.system = /data\n"
+        "dir.system_ext = /system_ext/bin\n"
+        "dir.product = /product/bin\n"
+        "dir.vendor = /vendor/bin\n"
+        "dir.vendor = /odm/bin\n\n"
+    );
+
+    static const char *const apex_ns[] = {
+        "system", "system_ext", "product", "com_android_art", "com_android_i18n",
+        "com_android_conscrypt", "com_android_media", "com_android_tethering",
+        "com_android_os_statsd", "com_android_sdkext", "com_android_adbd",
+        "com_android_resolv", "com_android_neuralnetworks", "com_android_bt",
+        "com_android_configinfrastructure", "com_android_appsearch",
+        "com_android_uprobestats", "com_android_uwb", "com_android_virt",
+        "com_android_permission", "com_android_wifi", "com_android_mediaprovider",
+        "com_android_adservices", "com_android_rkpd", NULL
+    };
+
+    const char *common_paths =
+        "/bootstrap-apex/com.android.art/${LIB}:/bootstrap-apex/com.android.runtime/${LIB}:/bootstrap-apex/com.android.runtime/${LIB}/bionic:"
+        "/bootstrap-apex/com.android.i18n/${LIB}:"
+        "/apex/com.android.art/${LIB}:/apex/com.android.runtime/${LIB}:/apex/com.android.runtime/${LIB}/bionic:"
+        "/apex/com.android.i18n/${LIB}:/apex/com.android.adbd/${LIB}:/apex/com.android.tethering/${LIB}:"
+        "/apex/com.android.os.statsd/${LIB}:/apex/com.android.conscrypt/${LIB}:/apex/com.android.media/${LIB}:"
+        "/apex/com.android.media.swcodec/${LIB}:/apex/com.android.resolv/${LIB}:/apex/com.android.neuralnetworks/${LIB}:"
+        "/apex/com.android.bt/${LIB}:/apex/com.android.configinfrastructure/${LIB}:/apex/com.android.appsearch/${LIB}:"
+        "/apex/com.android.uprobestats/${LIB}:/apex/com.android.uwb/${LIB}:/apex/com.android.virt/${LIB}:"
+        "/apex/com.android.permission/${LIB}:/apex/com.android.wifi/${LIB}:/apex/com.android.mediaprovider/${LIB}:"
+        "/apex/com.android.adservices/${LIB}:/apex/com.android.sdkext/${LIB}:/apex/com.android.rkpd/${LIB}:"
+        "/apex/com.android.vndk.v34/${LIB}:/apex/com.android.vndk.v33/${LIB}:/apex/com.android.vndk.v32/${LIB}:/apex/com.android.vndk.v31/${LIB}:"
+        "/system/${LIB}:/system/${LIB}/bootstrap:/system_ext/${LIB}:/product/${LIB}:/vendor/${LIB}";
+
+    static const char *const sections[] = { "system", "system_ext", "product", "data", "vendor", NULL };
+    for (int s = 0; sections[s]; s++) {
+        fprintf(ldf, "[%s]\n", sections[s]);
+        fprintf(ldf, "additional.namespaces = ");
+        for (int i = 0; apex_ns[i]; i++) {
+            fprintf(ldf, "%s%s", apex_ns[i], apex_ns[i + 1] ? "," : "\n");
+        }
+        fprintf(ldf, "namespace.default.isolated = false\n");
+        fprintf(ldf, "namespace.default.visible = true\n");
+        fprintf(ldf, "namespace.default.search.paths = %s\n", common_paths);
+        fprintf(ldf, "namespace.default.permitted.paths = /\n");
+        fprintf(ldf, "namespace.default.links = ");
+        for (int i = 0; apex_ns[i]; i++) {
+            fprintf(ldf, "%s%s", apex_ns[i], apex_ns[i + 1] ? "," : "\n");
+        }
+        for (int i = 0; apex_ns[i]; i++) {
+            fprintf(ldf, "namespace.default.link.%s.allow_all_shared_libs = true\n", apex_ns[i]);
+        }
+        fprintf(ldf, "\n");
+
+        for (int i = 0; apex_ns[i]; i++) {
+            const char *ns = apex_ns[i];
+            fprintf(ldf, "namespace.%s.isolated = false\n", ns);
+            fprintf(ldf, "namespace.%s.visible = true\n", ns);
+            fprintf(ldf, "namespace.%s.search.paths = %s\n", ns, common_paths);
+            fprintf(ldf, "namespace.%s.permitted.paths = /\n", ns);
+            fprintf(ldf, "namespace.%s.links = default\n", ns);
+            fprintf(ldf, "namespace.%s.link.default.allow_all_shared_libs = true\n\n", ns);
+        }
+    }
+    fclose(ldf);
+    chmod(path, 0644);
+    set_selinux_label(path, label);
+    return true;
+}
+
+/* Restore a single ld.config.txt if Android init/apexd truncated or overwrote it. */
+static bool restore_single_ld_config(const char *lc_src, off_t src_size,
+                                     const char *dir, const char *label) {
+    struct stat dir_st, dst_st;
+    if (stat(dir, &dir_st) != 0 || !S_ISDIR(dir_st.st_mode)) return false;
+
+    char lc_dst[192];
+    snprintf(lc_dst, sizeof(lc_dst), "%s/ld.config.txt", dir);
+
+    bool need_restore = (lstat(lc_dst, &dst_st) != 0 || dst_st.st_size != src_size);
+    if (!need_restore) {
+        char hdr[32] = {0};
+        int fd = open(lc_dst, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = read(fd, hdr, sizeof(hdr) - 1);
+            close(fd);
+            if (n < 30 || memcmp(hdr, "# sailfish-permissive-ldconfig", 30) != 0) {
+                need_restore = true;
+            }
+        } else {
+            need_restore = true;
+        }
+    }
+
+    if (!need_restore) return false;
+
+    char lc_tmp[208];
+    snprintf(lc_tmp, sizeof(lc_tmp), "%s/.ld.config.tmp", dir);
+    bool restored = false;
+    if (copy_file(lc_src, lc_tmp)) {
+        chmod(lc_tmp, 0644);
+        set_selinux_label(lc_tmp, "u:object_r:linkerconfig_file:s0");
+        if (rename(lc_tmp, lc_dst) == 0) {
+            restored = true;
+        }
+    }
+    if (!restored) {
+        unlink(lc_tmp);
+        if (copy_file(lc_src, lc_dst)) {
+            chmod(lc_dst, 0644);
+            set_selinux_label(lc_dst, "u:object_r:linkerconfig_file:s0");
+            restored = true;
+        }
+    }
+    if (restored) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "[+] Supervisor: Restored permissive %s/ld.config.txt\n", label);
+        usb_write(msg);
+    }
+    return restored;
+}
+
+/* Restore /linkerconfig/{,default/,bootstrap/}ld.config.txt if init/apexd overwrote them. */
+static void restore_linkerconfig_if_needed(pid_t init_pid) {
+    if (init_pid <= 1) return;
+    char lc_src[128];
+    snprintf(lc_src, sizeof(lc_src), "/proc/%d/root/data/ld.config.sailfish.txt", (int)init_pid);
+
+    struct stat src_st;
+    if (stat(lc_src, &src_st) != 0 || src_st.st_size < 256) return;
+
+    const char *subdirs[] = { "", "/default", "/bootstrap" };
+    const char *labels[] = { "/linkerconfig", "/linkerconfig/default", "/linkerconfig/bootstrap" };
+    for (int i = 0; i < 3; i++) {
+        char dir[160];
+        snprintf(dir, sizeof(dir), "/proc/%d/root/linkerconfig%s", (int)init_pid, subdirs[i]);
+        restore_single_ld_config(lc_src, src_st.st_size, dir, labels[i]);
+    }
+}
+
 static void setup_mdss_sysfs_mock(void) {
     /* Create tmpfs overlay for MDSS graphics sysfs */
     mkdir("/sys/devices/virtual/graphics", 0755);
@@ -1346,6 +1682,26 @@ static bool prepare_android_rootfs(bool for_shell) {
                 }
             }
         }
+
+        /* Stub odsign separately with its system SELinux context so missing keymaster/fs-verity
+         * never causes 4 crashes before boot_completed (which triggers InitFatalReboot). */
+        const char *odsign_bin = "/mnt/system_a/system/bin/odsign";
+        if (access(odsign_bin, F_OK) == 0) {
+            mkdir("/tmp", 0755);
+            const char *odsign_stub = "/tmp/odsign_stub";
+            if (copy_file("/tools/pause_stub", odsign_stub)) {
+                char od_lbl[128] = {0};
+                const char *use_od_lbl = "u:object_r:system_file:s0";
+                if (getxattr(odsign_bin, "security.selinux", od_lbl, sizeof(od_lbl) - 1) > 0) {
+                    use_od_lbl = od_lbl;
+                }
+                chmod(odsign_stub, 0755);
+                set_selinux_label(odsign_stub, use_od_lbl);
+                if (mount(odsign_stub, odsign_bin, NULL, MS_BIND, NULL) == 0) {
+                    usb_write("[+] Automated: Bound pause_stub -> /system/bin/odsign\n");
+                }
+            }
+        }
     }
 
     /* Automated: Strip 'onrestart restart surfaceflinger' from composer service definition so
@@ -1395,6 +1751,12 @@ static bool prepare_android_rootfs(bool for_shell) {
             { "/mnt/system_a/system/bin/bootanimation",
               "/mnt/system_a/system/bin/bootanimation.real",
               "u:object_r:bootanim_exec:s0" },
+            { "/mnt/system_a/vendor/bin/hw/android.hardware.health@2.0-service.marlin",
+              "/mnt/system_a/system/bin/android.hardware.health@2.0-service.marlin.real",
+              "u:object_r:hal_health_default_exec:s0" },
+            { "/mnt/system_a/vendor/bin/hw/android.hardware.power@1.1-service.marlin",
+              "/mnt/system_a/system/bin/android.hardware.power@1.1-service.marlin.real",
+              "u:object_r:hal_power_default_exec:s0" },
             { NULL, NULL, NULL }
         };
 
@@ -1403,23 +1765,44 @@ static bool prepare_android_rootfs(bool for_shell) {
             const char *real = wrap_targets[i].real_path;
             const char *lbl = wrap_targets[i].label;
 
-            if (access(svc, F_OK) == 0) {
-                FILE *rf = fopen(real, "w");
-                if (rf) fclose(rf);
-                chmod(real, 0755);
-                set_selinux_label(real, lbl);
+            umount_all(svc);
+            umount_all(real);
 
-                if (mount(svc, real, NULL, MS_BIND, NULL) == 0) {
+            if (access(svc, F_OK) == 0) {
+                if (!is_valid_wrap_target(svc)) {
+                    char msg[192];
+                    snprintf(msg, sizeof(msg), "[!] Automated: Skipping invalid/wrapped target -> %s\n", svc);
+                    usb_write(msg);
+                    continue;
+                }
+
+                char lbl_buf[128] = {0};
+                const char *use_lbl = lbl;
+                if (getxattr(svc, "security.selinux", lbl_buf, sizeof(lbl_buf) - 1) > 0) {
+                    use_lbl = lbl_buf;
+                }
+
+                unlink(real);
+                if (access(real, F_OK) != 0) {
+                    int rfd = open(real, O_WRONLY | O_CREAT | O_EXCL, 0755);
+                    if (rfd >= 0) close(rfd);
+                }
+                chmod(real, 0755);
+                set_selinux_label(real, use_lbl);
+
+                if (bind_mount_clean(svc, real) == 0) {
                     char wrap_copy[128];
                     snprintf(wrap_copy, sizeof(wrap_copy), "/tmp/wrap_%d", i);
                     copy_file("/tools/wrap_preload", wrap_copy);
                     chmod(wrap_copy, 0755);
-                    set_selinux_label(wrap_copy, lbl);
+                    set_selinux_label(wrap_copy, use_lbl);
 
-                    if (mount(wrap_copy, svc, NULL, MS_BIND, NULL) == 0) {
+                    if (bind_mount_clean(wrap_copy, svc) == 0) {
                         char msg[192];
                         snprintf(msg, sizeof(msg), "[+] Automated: Bound LD_PRELOAD wrapper -> %s\n", svc);
                         usb_write(msg);
+                    } else {
+                        umount_all(real);
                     }
                 }
             }
@@ -1435,6 +1818,10 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    setprop debug.gralloc.gfx_ubwc_disable 1\n"
         "    setprop debug.gralloc.enable_fb_ubwc 0\n"
         "    setprop service.sf.prime_shader_cache 0\n"
+        "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
+        "    chmod 0644 /linkerconfig/ld.config.txt\n"
+        "    chmod 0666 /dev/ion\n"
+        "    chmod 0666 /dev/dri/card0\n"
         "\n"
         "on post-fs\n"
         "    stop vendor.qseecomd\n"
@@ -1442,15 +1829,61 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    stop vendor.keymaster-3-0\n"
         "    stop vendor.configstore-hal\n"
         "    setprop sys.listeners.registered true\n"
+        "    setprop keystore.module_hash.sent true\n"
+        "    setprop odsign.key.done 1\n"
+        "    setprop odsign.verification.done 1\n"
+        "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
+        "    chmod 0644 /linkerconfig/ld.config.txt\n"
+        "    chmod 0666 /dev/ion\n"
+        "    chmod 0666 /dev/dma_heap/system\n"
+        "    chmod 0666 /dev/dma_heap/system-uncached\n"
         "\n"
         "on post-fs-data\n"
-        "    setprop sys.time.set true\n";
+        "    setprop sys.time.set true\n"
+        "    setprop keystore.module_hash.sent true\n"
+        "    setprop odsign.key.done 1\n"
+        "    setprop odsign.verification.done 1\n"
+        "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
+        "    chmod 0644 /linkerconfig/ld.config.txt\n"
+        "\n"
+        "on early-fs\n"
+        "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
+        "    chmod 0644 /linkerconfig/ld.config.txt\n"
+        "    copy /data/ld.config.sailfish.txt /linkerconfig/bootstrap/ld.config.txt\n"
+        "    chmod 0644 /linkerconfig/bootstrap/ld.config.txt\n"
+        "    copy /data/ld.config.sailfish.txt /linkerconfig/default/ld.config.txt\n"
+        "    chmod 0644 /linkerconfig/default/ld.config.txt\n"
+        "\n"
+        "on property:apexd.status=activated\n"
+        "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
+        "    chmod 0644 /linkerconfig/ld.config.txt\n"
+        "\n"
+        "on load-bpf-programs\n"
+        "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
+        "    chmod 0644 /linkerconfig/ld.config.txt\n"
+        "\n"
+        "on zygote-start\n"
+        "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
+        "    chmod 0644 /linkerconfig/ld.config.txt\n"
+        "\n"
+        "on boot\n"
+        "    chmod 0666 /dev/ion\n"
+        "    chmod 0666 /dev/dma_heap/system\n"
+        "    chmod 0666 /dev/dma_heap/system-uncached\n"
+        "    chmod 0666 /dev/dri/card0\n"
+        "    class_start hal\n"
+        "    class_start core\n"
+        "    trigger nonencrypted\n";
 
     mkdir("/mnt/system_a/system/etc/init", 0755);
     write_file_str("/mnt/system_a/system/etc/init/sailfish_boot.rc", rc_content);
     chmod("/mnt/system_a/system/etc/init/sailfish_boot.rc", 0644);
     set_selinux_label("/mnt/system_a/system/etc/init/sailfish_boot.rc", "u:object_r:system_file:s0");
 
+    mkdir("/tmp", 0755);
+    write_file_str("/tmp/init.sailfish.rc", rc_content);
+    chmod("/tmp/init.sailfish.rc", 0644);
+    set_selinux_label("/tmp/init.sailfish.rc", "u:object_r:vendor_configs_file:s0");
     mkdir("/mnt/system_a/vendor/etc/init", 0755);
     write_file_str("/mnt/system_a/vendor/etc/init/sailfish_boot.rc", rc_content);
     chmod("/mnt/system_a/vendor/etc/init/sailfish_boot.rc", 0644);
@@ -1460,6 +1893,9 @@ static bool prepare_android_rootfs(bool for_shell) {
     write_file_str("/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", rc_content);
     chmod("/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", 0644);
     set_selinux_label("/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", "u:object_r:vendor_configs_file:s0");
+    if (access("/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", F_OK) == 0) {
+        mount("/tmp/init.sailfish.rc", "/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", NULL, MS_BIND, NULL);
+    }
 
     write_file_str("/mnt/system_a/init.sailfish.rc", rc_content);
     chmod("/mnt/system_a/init.sailfish.rc", 0644);
@@ -1556,6 +1992,90 @@ static bool prepare_android_rootfs(bool for_shell) {
         }
     }
 
+    /* Automated: Clean any stale linker configs left on persistent flash */
+    unlink("/mnt/system_a/system/etc/ld.config.arm64.txt");
+    unlink("/mnt/system_a/system/etc/ld.config.arm.txt");
+    unlink("/mnt/system_a/system/etc/ld.config.txt");
+    unlink("/mnt/system_a/system/etc/ld.config.vndk_lite.txt");
+    unlink("/mnt/system_a/linkerconfig/ld.config.txt");
+    unlink("/mnt/system_a/linkerconfig/ld.config.arm64.txt");
+
+    /* Automated: Clean 0-byte placeholder files in /system/lib64 and /system/lib (NEVER unlink symlinks) */
+    clean_zero_byte_libs("/mnt/system_a/system/lib64");
+    clean_zero_byte_libs("/mnt/system_a/system/lib");
+
+    /* Automated: Overlay ueventd.rc so /dev/ion, /dev/dma_heap/, and /dev/dri/ stay accessible */
+    overlay_ueventd_file("/mnt/system_a/system/etc/ueventd.rc", "/tmp/ueventd.rc", "u:object_r:system_file:s0");
+    overlay_ueventd_file("/mnt/system_a/vendor/ueventd.rc", "/tmp/vendor_ueventd.rc", "u:object_r:vendor_configs_file:s0");
+
+    /* Automated: Restore critical Bionic C library symlinks in /system/lib64 and /system/lib */
+    const char *bionic_libs[] = {
+        "libc.so", "libm.so", "libdl.so", "libdl_android.so", NULL
+    };
+    for (int b = 0; bionic_libs[b]; b++) {
+        /* 64-bit in /system/lib64 */
+        char target64[256], rel64[128];
+        snprintf(target64, sizeof(target64), "/mnt/system_a/system/lib64/%s", bionic_libs[b]);
+        snprintf(rel64, sizeof(rel64), "bootstrap/%s", bionic_libs[b]);
+        struct stat st64;
+        if (stat(target64, &st64) != 0 || (S_ISREG(st64.st_mode) && st64.st_size == 0)) {
+            unlink(target64);
+            symlink(rel64, target64);
+            chmod(target64, 0755);
+            set_selinux_label(target64, "u:object_r:system_lib_file:s0");
+            char bmsg[128];
+            snprintf(bmsg, sizeof(bmsg), "[+] Restored 64-bit Bionic: %s -> %s\n", target64, rel64);
+            usb_write(bmsg);
+        }
+
+        /* 32-bit in /system/lib */
+        char target32[256], rel32[128];
+        snprintf(target32, sizeof(target32), "/mnt/system_a/system/lib/%s", bionic_libs[b]);
+        snprintf(rel32, sizeof(rel32), "bootstrap/%s", bionic_libs[b]);
+        struct stat st32;
+        if (stat(target32, &st32) != 0 || (S_ISREG(st32.st_mode) && st32.st_size == 0)) {
+            unlink(target32);
+            symlink(rel32, target32);
+            chmod(target32, 0755);
+            set_selinux_label(target32, "u:object_r:system_lib_file:s0");
+        }
+    }
+
+    /* Ensure dynamic linkers exist */
+    struct stat st_lnk;
+    if (stat("/mnt/system_a/system/bin/linker64", &st_lnk) != 0) {
+        unlink("/mnt/system_a/system/bin/linker64");
+        symlink("bootstrap/linker64", "/mnt/system_a/system/bin/linker64");
+        chmod("/mnt/system_a/system/bin/linker64", 0755);
+        set_selinux_label("/mnt/system_a/system/bin/linker64", "u:object_r:system_file:s0");
+    }
+    if (stat("/mnt/system_a/system/bin/linker", &st_lnk) != 0) {
+        unlink("/mnt/system_a/system/bin/linker");
+        symlink("bootstrap/linker", "/mnt/system_a/system/bin/linker");
+        chmod("/mnt/system_a/system/bin/linker", 0755);
+        set_selinux_label("/mnt/system_a/system/bin/linker", "u:object_r:system_file:s0");
+    }
+
+    /* Automated: Ensure critical 64-bit and 32-bit bionic/system libraries on disk are genuine ELF binaries */
+    const char *crit_libs[] = {
+        "libbase.so", "libcutils.so", "liblog.so", "libc++.so",
+        "libunwindstack.so", "liblzma.so", "libz.so",
+        "libfs_mgr.so", "libselinux.so", "libutils.so",
+        "libcrypto.so", "libcrypto_utils.so", "liblp.so",
+        "libprocessgroup.so", "libprocessgroup_setup.so",
+        "libvendorsupport.so", "libext4_utils.so", "libgsi.so",
+        "libsparse.so", "libbootloader_message.so", "libjsoncpp.so",
+        "libext2_uuid.so", "liblogwrap.so", "libsdm_shim.so",
+        "libexpat.so",
+        NULL
+    };
+    ensure_elf_libs("/mnt/system_a/system/lib64", "/tools/lib64", 2, crit_libs);
+
+    const char *crit_libs32[] = {
+        "libbase.so", "libc++.so", "libcutils.so", "liblog.so", NULL
+    };
+    ensure_elf_libs("/mnt/system_a/system/lib", "/tools/lib32", 1, crit_libs32);
+
     /* Mount tmpfs on system_a/apex, bootstrap-apex, and linkerconfig */
     mkdir("/mnt/system_a/apex", 0755);
     umount2("/mnt/system_a/apex", MNT_DETACH);
@@ -1569,27 +2089,63 @@ static bool prepare_android_rootfs(bool for_shell) {
     umount2("/mnt/system_a/linkerconfig", MNT_DETACH);
     mount("tmpfs", "/mnt/system_a/linkerconfig", "tmpfs", 0, "mode=0755,uid=0,gid=0");
 
-    /* Bootstrap fallback inside com.android.runtime when launching interactive sh */
-    if (for_shell) {
-        const char *apex_roots[] = { "/mnt/system_a/apex", "/mnt/system_a/bootstrap-apex", NULL };
-        for (int a = 0; apex_roots[a]; a++) {
-            char ap[256];
-            snprintf(ap, sizeof(ap), "%s/com.android.runtime", apex_roots[a]);
-            mkdir(ap, 0755);
-            snprintf(ap, sizeof(ap), "%s/com.android.runtime/bin", apex_roots[a]);
-            mkdir(ap, 0755);
-            snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib64", apex_roots[a]);
-            mkdir(ap, 0755);
-            snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib64/bionic", apex_roots[a]);
-            mkdir(ap, 0755);
-            snprintf(ap, sizeof(ap), "%s/com.android.runtime/bin/linker64", apex_roots[a]);
-            symlink("/system/bin/bootstrap/linker64", ap);
-            snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib64/bionic/libc.so", apex_roots[a]);
-            symlink("/system/lib64/bootstrap/libc.so", ap);
-            snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib64/bionic/libm.so", apex_roots[a]);
-            symlink("/system/lib64/bootstrap/libm.so", ap);
-            snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib64/bionic/libdl.so", apex_roots[a]);
-            symlink("/system/lib64/bootstrap/libdl.so", ap);
+    /* Automated: Populate permissive multi-arch /linkerconfig/ld.config.txt */
+    if (write_permissive_ld_config("/mnt/system_a/linkerconfig/ld.config.txt", "u:object_r:linkerconfig_file:s0")) {
+        usb_write("[+] Automated: Generated permissive /linkerconfig/ld.config.txt\n");
+    }
+
+    /* Automated: Populate com.android.runtime Bionic libraries in /apex and /bootstrap-apex */
+    const char *apex_roots[] = { "/mnt/system_a/apex", "/mnt/system_a/bootstrap-apex", NULL };
+    for (int a = 0; apex_roots[a]; a++) {
+        char ap[256];
+        snprintf(ap, sizeof(ap), "%s/com.android.runtime", apex_roots[a]);
+        mkdir(ap, 0755);
+        set_selinux_label(ap, "u:object_r:system_file:s0");
+
+        snprintf(ap, sizeof(ap), "%s/com.android.runtime/bin", apex_roots[a]);
+        mkdir(ap, 0755);
+        set_selinux_label(ap, "u:object_r:system_file:s0");
+
+        snprintf(ap, sizeof(ap), "%s/com.android.runtime/bin/linker64", apex_roots[a]);
+        symlink("/system/bin/bootstrap/linker64", ap);
+        snprintf(ap, sizeof(ap), "%s/com.android.runtime/bin/linker", apex_roots[a]);
+        symlink("/system/bin/bootstrap/linker", ap);
+
+        /* 64-bit */
+        snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib64", apex_roots[a]);
+        mkdir(ap, 0755);
+        set_selinux_label(ap, "u:object_r:system_file:s0");
+        snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib64/bionic", apex_roots[a]);
+        mkdir(ap, 0755);
+        set_selinux_label(ap, "u:object_r:system_file:s0");
+
+        const char *bionic_rt[] = { "libc.so", "libm.so", "libdl.so", "libdl_android.so", NULL };
+        for (int b = 0; bionic_rt[b]; b++) {
+            snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib64/bionic/%s", apex_roots[a], bionic_rt[b]);
+            char src[128];
+            snprintf(src, sizeof(src), "/system/lib64/bootstrap/%s", bionic_rt[b]);
+            symlink(src, ap);
+
+            snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib64/%s", apex_roots[a], bionic_rt[b]);
+            symlink(src, ap);
+        }
+
+        /* 32-bit */
+        snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib", apex_roots[a]);
+        mkdir(ap, 0755);
+        set_selinux_label(ap, "u:object_r:system_file:s0");
+        snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib/bionic", apex_roots[a]);
+        mkdir(ap, 0755);
+        set_selinux_label(ap, "u:object_r:system_file:s0");
+
+        for (int b = 0; bionic_rt[b]; b++) {
+            snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib/bionic/%s", apex_roots[a], bionic_rt[b]);
+            char src[128];
+            snprintf(src, sizeof(src), "/system/lib/bootstrap/%s", bionic_rt[b]);
+            symlink(src, ap);
+
+            snprintf(ap, sizeof(ap), "%s/com.android.runtime/lib/%s", apex_roots[a], bionic_rt[b]);
+            symlink(src, ap);
         }
     }
 
@@ -1604,12 +2160,20 @@ static bool prepare_android_rootfs(bool for_shell) {
     mount("/proc", "/mnt/system_a/proc", NULL, MS_BIND | MS_REC, NULL);
 
     mkdir("/mnt/system_a/sys", 0755);
+    /* Pre-enable BPF JIT and clear unprivileged restriction before netbpfload starts */
+    write_proc_sysctl("/proc/sys/kernel/unprivileged_bpf_disabled", "0\n");
+    write_proc_sysctl("/proc/sys/net/core/bpf_jit_enable", "1\n");
+    write_proc_sysctl("/proc/sys/net/core/bpf_jit_kallsyms", "1\n");
+
+    umount_all("/mnt/system_a/sys/fs/selinux");
+    umount_all("/mnt/system_a/sys");
     mount("/sys", "/mnt/system_a/sys", NULL, MS_BIND | MS_REC, NULL);
 
     mkdir("/mnt/system_a/sys/fs/selinux", 0755);
     mount("none", "/mnt/system_a/sys/fs/selinux", "selinuxfs", 0, NULL);
 
     /* Mount configfs for Android USB gadget at /config */
+    umount_all("/mnt/system_a/config");
     mkdir("/mnt/system_a/config", 0755);
     mount("none", "/mnt/system_a/config", "configfs", 0, NULL);
 
@@ -1650,6 +2214,7 @@ static bool prepare_android_rootfs(bool for_shell) {
     set_selinux_label("/mnt/system_a/init", "u:object_r:init_exec:s0");
 
     /* Mount in-memory tmpfs for /data (bypasses Qualcomm ICE encryption dependency) */
+    umount_all("/mnt/system_a/data");
     mkdir("/mnt/system_a/data", 0771);
     mount("tmpfs", "/mnt/system_a/data", "tmpfs", 0, "mode=0771,uid=1000,gid=1000");
     set_selinux_label("/mnt/system_a/data", "u:object_r:system_data_root_file:s0");
@@ -1670,18 +2235,56 @@ static bool prepare_android_rootfs(bool for_shell) {
         usb_write("[+] Automated: Installed /data/setup_composer_sysfs.sh\n");
     }
 
-    /* Automated: Install libsdm_shim.so into /system/lib64 and /data */
+    /* Automated: Install libsdm_shim.so into /system/lib64, /vendor/lib64, and /data */
     if (access("/tools/libsdm_shim.so", F_OK) == 0) {
         mkdir("/mnt/system_a/system/lib64", 0755);
-        copy_file("/tools/libsdm_shim.so", "/mnt/system_a/system/lib64/libsdm_shim.so");
-        chmod("/mnt/system_a/system/lib64/libsdm_shim.so", 0755);
-        set_selinux_label("/mnt/system_a/system/lib64/libsdm_shim.so", "u:object_r:system_file:s0");
-        usb_write("[+] Automated: Installed /system/lib64/libsdm_shim.so\n");
+        mkdir("/mnt/system_a/vendor/lib64", 0755);
 
         copy_file("/tools/libsdm_shim.so", "/mnt/system_a/data/libsdm_shim.so");
         chmod("/mnt/system_a/data/libsdm_shim.so", 0755);
         set_selinux_label("/mnt/system_a/data/libsdm_shim.so", "u:object_r:system_file:s0");
         usb_write("[+] Automated: Installed /data/libsdm_shim.so\n");
+
+        const char *sys_shim = "/mnt/system_a/system/lib64/libsdm_shim.so";
+        struct stat st_shim;
+        umount_all(sys_shim);
+        if (lstat(sys_shim, &st_shim) != 0 || st_shim.st_size < 1000) {
+            unlink(sys_shim);
+            if (!copy_file("/tools/libsdm_shim.so", sys_shim)) {
+                int sfd = open(sys_shim, O_WRONLY | O_CREAT | O_EXCL, 0755);
+                if (sfd >= 0) close(sfd);
+                bind_mount_clean("/tools/libsdm_shim.so", sys_shim);
+            }
+        }
+        chmod(sys_shim, 0755);
+        set_selinux_label(sys_shim, "u:object_r:system_file:s0");
+        usb_write("[+] Automated: Verified /system/lib64/libsdm_shim.so\n");
+
+        const char *ven_shim = "/mnt/system_a/vendor/lib64/libsdm_shim.so";
+        umount_all(ven_shim);
+        if (access(ven_shim, F_OK) != 0) {
+            int vfd = open(ven_shim, O_WRONLY | O_CREAT | O_EXCL, 0755);
+            if (vfd >= 0) close(vfd);
+        }
+        bind_mount_clean("/tools/libsdm_shim.so", ven_shim);
+        chmod(ven_shim, 0755);
+        set_selinux_label(ven_shim, "u:object_r:vendor_file:s0");
+    }
+
+    /* Automated: Install patched libui.so via writable /tmp to bypass Android 17 Gralloc 4/5 restriction */
+    const char *orig_libui = "/mnt/system_a/system/lib64/libui.so";
+    const char *tmp_libui = "/tmp/libui.so";
+    mkdir("/tmp", 0755);
+    bool libui_ready = false;
+    if (access("/tools/libui.so", F_OK) == 0 && copy_file("/tools/libui.so", tmp_libui)) {
+        chmod(tmp_libui, 0755);
+        set_selinux_label(tmp_libui, "u:object_r:system_lib_file:s0");
+        libui_ready = true;
+    }
+    if (libui_ready && access(tmp_libui, F_OK) == 0 && access(orig_libui, F_OK) == 0) {
+        if (mount(tmp_libui, orig_libui, NULL, MS_BIND, NULL) == 0) {
+            usb_write("[+] Automated: Successfully bind-mounted Gralloc2-enabled libui.so over /system/lib64/libui.so\n");
+        }
     }
     if (access("/tools/libEGL_adreno_shim.so", F_OK) == 0) {
         copy_file("/tools/libEGL_adreno_shim.so", "/mnt/system_a/data/libEGL_adreno_shim.so");
@@ -1696,24 +2299,16 @@ static bool prepare_android_rootfs(bool for_shell) {
         usb_write("[+] Automated: Installed /data/libadreno_utils.so\n");
     }
 
-    /* Automated: Generate /data/start_graphics.sh helper script */
+    /* Automated: Save permissive ld.config.txt copy on /data tmpfs so init/supervisor can restore it */
+    if (write_permissive_ld_config("/mnt/system_a/data/ld.config.sailfish.txt", "u:object_r:system_file:s0")) {
+        usb_write("[+] Automated: Installed /data/ld.config.sailfish.txt backup\n");
+    }
+
+    /* Automated: Generate /data/start_graphics.sh environment helper (init manages HAL/SF/bootanim via wrap_preload) */
     FILE *gf = fopen("/mnt/system_a/data/start_graphics.sh", "w");
     if (gf) {
         fprintf(gf, "#!/system/bin/sh\n"
                     "setenforce 0 2>/dev/null\n"
-                    "export LD_LIBRARY_PATH=/apex/com.android.i18n/lib64:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/system/lib64:/vendor/lib64\n"
-                    "setprop ctl.stop vendor.qseecomd 2>/dev/null\n"
-                    "setprop ctl.stop vendor.time_daemon 2>/dev/null\n"
-                    "setprop ctl.stop vendor.keymaster-3-0 2>/dev/null\n"
-                    "setprop ctl.stop vendor.configstore-hal 2>/dev/null\n"
-                    "killall -9 qseecomd time_daemon android.hardware.keymaster@3.0-service android.hardware.configstore@1.1-service 2>/dev/null\n"
-                    "setprop ro.crypto.state unencrypted 2>/dev/null\n"
-                    "setprop sys.use_memfd true 2>/dev/null\n"
-                    "setprop debug.gralloc.gfx_ubwc_disable 1 2>/dev/null\n"
-                    "setprop debug.gralloc.enable_fb_ubwc 0 2>/dev/null\n"
-                    "setprop service.sf.prime_shader_cache 0 2>/dev/null\n"
-                    "setprop sys.listeners.registered true 2>/dev/null\n"
-                    "setprop sys.time.set true 2>/dev/null\n"
                     "chmod 666 /dev/ion 2>/dev/null\n"
                     "chmod 666 /dev/dma_heap/* 2>/dev/null\n"
                     "mkdir -p /dev/graphics 2>/dev/null\n"
@@ -1721,68 +2316,32 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "mkdir -p /dev/dri 2>/dev/null\n"
                     "[ ! -e /dev/dri/card0 ] && [ -e /dev/dri/card1 ] && ln -sf /dev/dri/card1 /dev/dri/card0\n"
                     "chmod 666 /dev/dri/* 2>/dev/null\n"
-                    "if [ -f /data/libadreno_utils.so ]; then\n"
-                    "    mount -o bind /data/libadreno_utils.so /vendor/lib64/libadreno_utils.so 2>/dev/null || true\n"
-                    "fi\n"
-                    "if [ -f /vendor/lib64/egl/libgallium_dri.so ]; then\n"
-                    "    echo '[+] Using Mesa Freedreno GLES driver'\n"
-                    "elif [ -f /data/libEGL_adreno_shim.so ]; then\n"
-                    "    mount -o bind /data/libEGL_adreno_shim.so /vendor/lib64/egl/libEGL_adreno.so 2>/dev/null || true\n"
-                    "    mount -o bind /data/libEGL_adreno_shim.so /vendor/lib64/egl/libGLESv2_adreno.so 2>/dev/null || true\n"
-                    "fi\n"
-                    "killall -9 qservice_daemon 2>/dev/null\n"
-                    "if ! ps -A | grep -q vndservicemanager; then\n"
-                    "    /vendor/bin/vndservicemanager /dev/vndbinder >/dev/null 2>&1 &\n"
-                    "    sleep 0.5\n"
-                    "fi\n"
-                    "/data/qservice_daemon >/dev/null 2>&1 &\n"
-                    "sleep 0.5\n"
-                    "stop vendor.gralloc-2-0 2>/dev/null\n"
-                    "killall -9 android.hardware.graphics.allocator@2.0-service 2>/dev/null\n"
-                    "stop vendor.hwcomposer-2-1 2>/dev/null\n"
-                    "killall -9 android.hardware.graphics.composer@2.1-service 2>/dev/null\n"
-                    "if [ -f /data/libsdm_shim.so ]; then\n"
-                    "    LD_PRELOAD=/data/libsdm_shim.so /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service >/dev/null 2>&1 &\n"
-                    "else\n"
-                    "    /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service >/dev/null 2>&1 &\n"
-                    "fi\n"
                     "touch /sys/devices/virtual/graphics/fb0/vsync_event 2>/dev/null\n"
                     "chmod 666 /sys/devices/virtual/graphics/fb0/vsync_event 2>/dev/null\n"
                     "echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/null || true\n"
                     "echo 200 > /sys/class/backlight/994000.dsi.0/brightness 2>/dev/null || true\n"
-                    "if [ -f /data/libsdm_shim.so ]; then\n"
-                    "    LD_PRELOAD=/data/libsdm_shim.so /vendor/bin/hw/android.hardware.graphics.composer@2.1-service >/dev/null 2>&1 &\n"
-                    "else\n"
-                    "    /vendor/bin/hw/android.hardware.graphics.composer@2.1-service >/dev/null 2>&1 &\n"
+                    "if [ -f /data/libadreno_utils.so ]; then\n"
+                    "    mount -o bind /data/libadreno_utils.so /vendor/lib64/libadreno_utils.so 2>/dev/null || true\n"
                     "fi\n"
-                    "sleep 0.5\n"
-                    "killall -9 surfaceflinger 2>/dev/null\n"
-                    "rm -f /data/sf.log 2>/dev/null\n"
-                    "if [ -f /data/libsdm_shim.so ]; then\n"
-                    "    LD_PRELOAD=/data/libsdm_shim.so /system/bin/surfaceflinger >/data/sf.log 2>&1 &\n"
-                    "else\n"
-                    "    /system/bin/surfaceflinger >/data/sf.log 2>&1 &\n"
-                    "fi\n"
-                    "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do\n"
-                    "    if [ \"$(getprop init.svc.bootanim)\" = \"running\" ]; then\n"
-                    "        break\n"
-                    "    fi\n"
-                    "    sleep 0.5\n"
-                    "done\n"
-                    "setprop ctl.stop bootanim 2>/dev/null\n"
-                    "killall -9 bootanimation 2>/dev/null\n"
-                    "setprop service.bootanim.exit 0 2>/dev/null\n"
-                    "if [ -f /data/libsdm_shim.so ]; then\n"
-                    "    LD_PRELOAD=/data/libsdm_shim.so /system/bin/bootanimation >/dev/null 2>&1 &\n"
-                    "else\n"
-                    "    /system/bin/bootanimation >/dev/null 2>&1 &\n"
-                    "fi\n"
-                    "echo '[+] Graphics stack & BootAnimation launched in background!'\n");
+                    "(\n"
+                    "    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do\n"
+                    "        if pgrep -x vndservicemanager >/dev/null 2>&1; then\n"
+                    "            if ! pgrep -x qservice_daemon >/dev/null 2>&1; then\n"
+                    "                /data/qservice_daemon >/dev/null 2>&1 &\n"
+                    "            fi\n"
+                    "            break\n"
+                    "        fi\n"
+                    "        sleep 0.5\n"
+                    "    done\n"
+                    ") >/dev/null 2>&1 &\n"
+                    "echo '[+] Graphics environment & permissions ready!'\n");
         fclose(gf);
         chmod("/mnt/system_a/data/start_graphics.sh", 0755);
         set_selinux_label("/mnt/system_a/data/start_graphics.sh", "u:object_r:system_file:s0");
         usb_write("[+] Automated: Created /data/start_graphics.sh\n");
     }
+
+    /* NOTE: wrap_app_process64 removed — Android init runs /system/bin/app_process64 directly once ld.config.txt is intact */
 
     /* Mount in-memory tmpfs for cache and metadata */
     mkdir("/mnt/system_a/cache", 0770);
@@ -2031,6 +2590,7 @@ static void launch_android_shell(void) {
         usb_write(msg);
     } else {
         usb_write("[+] Preparing Android rootfs & APEX runtime...\n");
+        unmount_android_mounts();
         prepare_android_rootfs(true);
     }
 
@@ -2127,7 +2687,7 @@ static void launch_android_shell(void) {
 
         char *envp[] = {
             "PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/apex/com.android.runtime/bin:/apex/com.android.art/bin",
-            "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/apex/com.android.i18n/lib64",
+            "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/system/lib64/bootstrap:/apex/com.android.runtime/lib64/bionic:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/apex/com.android.i18n/lib64",
             "ANDROID_ROOT=/system",
             "ANDROID_DATA=/data",
             "ANDROID_STORAGE=/storage",
@@ -2141,7 +2701,7 @@ static void launch_android_shell(void) {
         };
 
         /* Auto-start vndservicemanager and qservice_daemon if /dev/vndbinder is ready */
-        if (access("/dev/vndbinder", F_OK) == 0 && access("/vendor/bin/vndservicemanager", F_OK) == 0) {
+        if (!joined_ns && access("/dev/vndbinder", F_OK) == 0 && access("/vendor/bin/vndservicemanager", F_OK) == 0) {
             pid_t bg = fork();
             if (bg == 0) {
                 int nfd = open("/dev/null", O_RDWR);
@@ -2197,7 +2757,8 @@ static void drain_kmsg_to_usb(int kfd) {
         return;
     char buf[4096];
     char out[4160];
-    while (1) {
+    int lines = 50;
+    while (lines-- > 0) {
         ssize_t n = read(kfd, buf, sizeof(buf) - 1);
         if (n < 0) {
             if (errno == EPIPE || errno == EINVAL)
@@ -2210,7 +2771,7 @@ static void drain_kmsg_to_usb(int kfd) {
         char *semi = strchr(buf, ';');
         const char *msg = semi ? semi + 1 : buf;
         snprintf(out, sizeof(out), "[kmsg] %s", msg);
-        usb_write(out);
+        usb_write_ex(out, false);
     }
 }
 
@@ -2262,7 +2823,7 @@ static void supervisor_setprop(pid_t init_pid, const char *key, const char *val)
         }
         char *envp[] = {
             "PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/apex/com.android.runtime/bin",
-            "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/apex/com.android.runtime/lib64",
+            "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/system/lib64/bootstrap:/apex/com.android.runtime/lib64/bionic:/apex/com.android.runtime/lib64",
             "ANDROID_ROOT=/system",
             "ANDROID_DATA=/data",
             NULL
@@ -2286,16 +2847,17 @@ static void spawn_android_supervisor(void) {
 
     /* Wait for Android init to start and property_service socket to appear */
     pid_t init_pid = -1;
-    for (int w = 0; w < 120; w++) {
+    for (int w = 0; w < 240; w++) {
         init_pid = find_android_init_pid();
         if (init_pid > 1) {
+            restore_linkerconfig_if_needed(init_pid);
             char prop_sock[128];
             snprintf(prop_sock, sizeof(prop_sock), "/proc/%d/root/dev/socket/property_service", (int)init_pid);
             if (access(prop_sock, F_OK) == 0) {
                 break;
             }
         }
-        usleep(500000);
+        usleep(250000);
     }
 
     if (init_pid <= 1) {
@@ -2304,7 +2866,10 @@ static void spawn_android_supervisor(void) {
     }
 
     /* Wait a moment for property_service to finish bind & listen */
-    usleep(1500000);
+    for (int r = 0; r < 6; r++) {
+        restore_linkerconfig_if_needed(init_pid);
+        usleep(250000);
+    }
     usb_write("[+] Supervisor: Android property_service is online!\n");
 
     /* Apply critical boot properties */
@@ -2320,6 +2885,9 @@ static void spawn_android_supervisor(void) {
         { "service.sf.prime_shader_cache", "0" },
         { "sys.listeners.registered", "true" },
         { "sys.time.set", "true" },
+        { "keystore.module_hash.sent", "true" },
+        { "odsign.key.done", "1" },
+        { "odsign.verification.done", "1" },
         { NULL, NULL }
     };
 
@@ -2327,7 +2895,8 @@ static void spawn_android_supervisor(void) {
         supervisor_setprop(init_pid, props[p][0], props[p][1]);
         usleep(50000);
     }
-    usb_write("[+] Supervisor: Boot properties applied (listeners=true, time=true, qseecomd=stopped)\n");
+    restore_linkerconfig_if_needed(init_pid);
+    usb_write("[+] Supervisor: Boot properties applied (keystore/odsign gates unblocked)\n");
 
     /* Execute /data/start_graphics.sh inside the namespace as guaranteed fallback */
     char test_script[128];
@@ -2356,7 +2925,7 @@ static void spawn_android_supervisor(void) {
             char *gargv[] = { (char *)"/system/bin/sh", (char *)"/data/start_graphics.sh", NULL };
             char *genvp[] = {
                 "PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/apex/com.android.runtime/bin",
-                "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/apex/com.android.i18n/lib64",
+                "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/system/lib64/bootstrap:/apex/com.android.runtime/lib64/bionic:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/apex/com.android.i18n/lib64",
                 "ANDROID_ROOT=/system",
                 "ANDROID_DATA=/data",
                 NULL
@@ -2371,9 +2940,10 @@ static void spawn_android_supervisor(void) {
         }
     }
 
-    /* Monitor boot milestones */
+    /* Monitor boot milestones (while keeping /linkerconfig/ld.config.txt intact) */
     bool sf_seen = false, ba_seen = false, zy_seen = false, sys_seen = false;
-    for (int m = 0; m < 90; m++) {
+    for (int m = 0; m < 240; m++) {
+        restore_linkerconfig_if_needed(init_pid);
         if (!sf_seen) {
             pid_t p = find_process_by_name("surfaceflinger");
             if (p > 0) {
@@ -2402,6 +2972,22 @@ static void spawn_android_supervisor(void) {
                 zy_seen = true;
             }
         }
+        if (init_pid > 1 && m > 15) {
+            char zy_sock[128], sec_sock[128];
+            snprintf(zy_sock, sizeof(zy_sock), "/proc/%d/root/dev/socket/zygote", (int)init_pid);
+            snprintf(sec_sock, sizeof(sec_sock), "/proc/%d/root/dev/socket/zygote_secondary", (int)init_pid);
+            if (access(zy_sock, F_OK) == 0 && access(sec_sock, F_OK) != 0) {
+                symlink("/dev/socket/zygote", sec_sock);
+                usb_write("[+] Supervisor: Linked /dev/socket/zygote_secondary -> zygote\n");
+            }
+            char usap_sock[128], usap_sec[128];
+            snprintf(usap_sock, sizeof(usap_sock), "/proc/%d/root/dev/socket/usap_pool_primary", (int)init_pid);
+            snprintf(usap_sec, sizeof(usap_sec), "/proc/%d/root/dev/socket/usap_pool_secondary", (int)init_pid);
+            if (access(usap_sock, F_OK) == 0 && access(usap_sec, F_OK) != 0) {
+                symlink("/dev/socket/usap_pool_primary", usap_sec);
+                usb_write("[+] Supervisor: Linked /dev/socket/usap_pool_secondary -> usap_pool_primary\n");
+            }
+        }
         if (!sys_seen) {
             pid_t p = find_process_by_name("system_server");
             if (p > 0) {
@@ -2411,7 +2997,10 @@ static void spawn_android_supervisor(void) {
                 sys_seen = true;
             }
         }
-        sleep(2);
+        for (int sub = 0; sub < 10; sub++) {
+            usleep(100000);
+            restore_linkerconfig_if_needed(init_pid);
+        }
     }
 
     _exit(0);
@@ -2421,7 +3010,16 @@ static void boot_android_init(const char *stage) {
     if (!stage || !*stage)
         stage = "selinux_setup";
 
+    /* Wait briefly for USB CDC-ACM gadget so early messages are captured */
+    for (int u = 0; u < 25; u++) {
+        if (!g_usb_bound) g_usb_bound = setup_usb_gadget();
+        open_ttygs_if_ready();
+        if (g_ttygs_fd >= 0) break;
+        usleep(100000);
+    }
+
     usb_write("[+] Preparing Android rootfs & filesystems...\n");
+    unmount_android_mounts();
     prepare_android_rootfs(false);
 
     int kfd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
@@ -2475,7 +3073,13 @@ static void boot_android_init(const char *stage) {
             mkdir("/proc", 0555);
             mount("proc", "/proc", "proc", 0, NULL);
 
-            /* Attach stdout/stderr to ttyGS0 so any early linker/init stderr is visible */
+            /* Direct early init stdout/stderr to kmsg and ttyGS0 */
+            int kfd_out = open("/dev/kmsg", O_WRONLY | O_NOCTTY);
+            if (kfd_out >= 0) {
+                dup2(kfd_out, 1);
+                dup2(kfd_out, 2);
+                close(kfd_out);
+            }
             if (g_ttygs_fd >= 0) {
                 dup2(g_ttygs_fd, 1);
                 dup2(g_ttygs_fd, 2);
@@ -2485,12 +3089,11 @@ static void boot_android_init(const char *stage) {
             char *argv_plain[] = { (char *)"/system/bin/init", NULL };
             char *envp[] = {
                 "PATH=/sbin:/system/sbin:/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/apex/com.android.runtime/bin",
-                "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/apex/com.android.i18n/lib64",
                 "ANDROID_ROOT=/system",
                 "ANDROID_DATA=/data",
                 "ANDROID_STORAGE=/storage",
-                "ANDROID_ART_ROOT=/apex/com.android.runtime",
-                "ANDROID_I18N_ROOT=/apex/com.android.tzdata",
+                "ANDROID_ART_ROOT=/apex/com.android.art",
+                "ANDROID_I18N_ROOT=/apex/com.android.i18n",
                 "ANDROID_TZDATA_ROOT=/apex/com.android.tzdata",
                 "TERM=linux",
                 NULL
@@ -2517,7 +3120,13 @@ static void boot_android_init(const char *stage) {
     spawn_android_supervisor();
 
     int status = 0;
+    bool user_detached = false;
     while (1) {
+        if (!g_usb_bound)
+            g_usb_bound = setup_usb_gadget();
+
+        open_ttygs_if_ready();
+
         drain_kmsg_to_usb(kfd);
 
         pid_t w = waitpid(outer, &status, WNOHANG);
@@ -2529,15 +3138,28 @@ static void boot_android_init(const char *stage) {
             pfd.fd = g_ttygs_fd;
             pfd.events = POLLIN;
             pfd.revents = 0;
-            if (poll(&pfd, 1, 50) > 0 && (pfd.revents & POLLIN)) {
-                char rx[16];
-                ssize_t n = read(g_ttygs_fd, rx, sizeof(rx));
-                for (ssize_t i = 0; i < n; i++) {
-                    if (rx[i] == 0x03) { /* Ctrl+C */
-                        usb_write("\n[!] Ctrl+C detected: Detaching log stream; Android init continues running in background.\n");
-                        usb_write("[+] Type 'sh' to enter Android root shell, or 'boot_android' to resume log stream.\n");
-                        goto done;
+            int prc = poll(&pfd, 1, 50);
+            if (prc > 0) {
+                if (pfd.revents & POLLIN) {
+                    char rx[64];
+                    ssize_t n = read(g_ttygs_fd, rx, sizeof(rx));
+                    if (n > 0) {
+                        for (ssize_t i = 0; i < n; i++) {
+                            if (rx[i] == 0x03) { /* Ctrl+C */
+                                user_detached = true;
+                                goto done;
+                            } else if (rx[i] == '\r' || rx[i] == '\n') {
+                                usb_write("\n[sailfish: streaming live /dev/kmsg. Press Ctrl+C for shell]\n");
+                            }
+                        }
+                    } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        close_ttygs();
+                        usleep(100000);
                     }
+                }
+                if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                    close_ttygs();
+                    usleep(100000);
                 }
             }
         } else {
@@ -2551,11 +3173,16 @@ done:
     if (kfd >= 0)
         close(kfd);
 
-    char exit_msg[160];
-    snprintf(exit_msg, sizeof(exit_msg),
-             "\n[+] Android /init exited (status=%d) — phone kept alive in sailfish# shell!\n",
-             WIFEXITED(status) ? WEXITSTATUS(status) : status);
-    usb_write(exit_msg);
+    if (user_detached) {
+        usb_write("\n[!] Ctrl+C detected: Detached log stream (Android init continues running in background)\n");
+        usb_write("[+] Type 'sh' for Android root shell, 'logcat' for logs, or 'boot_android' to stream.\n\n");
+    } else {
+        char exit_msg[160];
+        snprintf(exit_msg, sizeof(exit_msg),
+                 "\n[+] Android /init exited (status=%d) — phone kept alive in sailfish# shell!\n",
+                 WIFEXITED(status) ? WEXITSTATUS(status) : status);
+        usb_write(exit_msg);
+    }
 }
 
 static void boot_linux_init(void) {
@@ -2764,6 +3391,8 @@ static void handle_usb_cmd(char *cmd) {
                      (int)cur_init);
             usb_write(amsg);
             int kfd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+    if (kfd >= 0)
+        lseek(kfd, 0, SEEK_END);
             if (kfd >= 0) lseek(kfd, 0, SEEK_END);
             while (1) {
                 drain_kmsg_to_usb(kfd);
@@ -2945,8 +3574,8 @@ int main(void) {
         usleep(250000);
     }
 
-    bool usb_bound = setup_usb_gadget();
-    if (!usb_bound)
+    g_usb_bound = setup_usb_gadget();
+    if (!g_usb_bound)
         print_msg("[-] UDC not ready yet; will retry in loop\n");
 
     /* Mount installed system_a (sda33) read-write and vendor_a read-only */
@@ -2987,7 +3616,7 @@ int main(void) {
     print_msg("======================================================\n");
 
     /* Automated: Auto-boot Android 17 userspace immediately on boot */
-    if (!usb_bound) usb_bound = setup_usb_gadget();
+    if (!g_usb_bound) g_usb_bound = setup_usb_gadget();
     open_ttygs_if_ready();
     print_msg("[+] Auto-starting Android 17 userspace immediately...\n");
     boot_android_init("selinux_setup");
@@ -2998,8 +3627,8 @@ int main(void) {
     long last_hb_sec = start_sec;
 
     while (1) {
-        if (!usb_bound)
-            usb_bound = setup_usb_gadget();
+        if (!g_usb_bound)
+            g_usb_bound = setup_usb_gadget();
 
         open_ttygs_if_ready();
 

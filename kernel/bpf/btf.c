@@ -6060,6 +6060,66 @@ bool btf_is_projection_of(const char *pname, const char *tname)
 	return false;
 }
 
+static const char *find_fallback_prog_ctx_tname(enum bpf_prog_type prog_type)
+{
+	switch (prog_type) {
+#ifdef CONFIG_NET
+	case BPF_PROG_TYPE_SOCKET_FILTER:
+	case BPF_PROG_TYPE_SCHED_CLS:
+	case BPF_PROG_TYPE_SCHED_ACT:
+	case BPF_PROG_TYPE_LWT_IN:
+	case BPF_PROG_TYPE_LWT_OUT:
+	case BPF_PROG_TYPE_LWT_XMIT:
+	case BPF_PROG_TYPE_LWT_SEG6LOCAL:
+	case BPF_PROG_TYPE_SK_SKB:
+	case BPF_PROG_TYPE_FLOW_DISSECTOR:
+#ifdef CONFIG_CGROUP_BPF
+	case BPF_PROG_TYPE_CGROUP_SKB:
+#endif
+		return "__sk_buff";
+	case BPF_PROG_TYPE_XDP:
+		return "xdp_md";
+#ifdef CONFIG_CGROUP_BPF
+	case BPF_PROG_TYPE_CGROUP_SOCK:
+		return "bpf_sock";
+	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
+		return "bpf_sock_addr";
+#endif
+	case BPF_PROG_TYPE_SOCK_OPS:
+		return "bpf_sock_ops";
+	case BPF_PROG_TYPE_SK_MSG:
+		return "sk_msg_md";
+#endif
+#ifdef CONFIG_BPF_EVENTS
+	case BPF_PROG_TYPE_PERF_EVENT:
+		return "bpf_perf_event_data";
+	case BPF_PROG_TYPE_RAW_TRACEPOINT:
+	case BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE:
+		return "bpf_raw_tracepoint_args";
+#endif
+#ifdef CONFIG_CGROUP_BPF
+	case BPF_PROG_TYPE_CGROUP_DEVICE:
+		return "bpf_cgroup_dev_ctx";
+	case BPF_PROG_TYPE_CGROUP_SYSCTL:
+		return "bpf_sysctl";
+	case BPF_PROG_TYPE_CGROUP_SOCKOPT:
+		return "bpf_sockopt";
+#endif
+#ifdef CONFIG_INET
+	case BPF_PROG_TYPE_SK_REUSEPORT:
+		return "sk_reuseport_md";
+	case BPF_PROG_TYPE_SK_LOOKUP:
+		return "bpf_sk_lookup";
+#endif
+#ifdef CONFIG_NETFILTER_BPF_LINK
+	case BPF_PROG_TYPE_NETFILTER:
+		return "bpf_nf_ctx";
+#endif
+	default:
+		return NULL;
+	}
+}
+
 bool btf_is_prog_ctx_type(struct bpf_verifier_log *log, const struct btf *btf,
 			  const struct btf_type *t, enum bpf_prog_type prog_type,
 			  int arg)
@@ -6101,6 +6161,14 @@ bool btf_is_prog_ctx_type(struct bpf_verifier_log *log, const struct btf *btf,
 
 	ctx_type = find_canonical_prog_ctx_type(prog_type);
 	if (!ctx_type) {
+		if (!btf_vmlinux) {
+			ctx_tname = find_fallback_prog_ctx_tname(prog_type);
+			if (!ctx_tname)
+				return false;
+			if (btf_is_projection_of(ctx_tname, tname))
+				return true;
+			return strcmp(ctx_tname, tname) == 0;
+		}
 		bpf_log(log, "btf_vmlinux is malformed\n");
 		/* should not happen */
 		return false;
@@ -6253,6 +6321,18 @@ static int btf_validate_prog_ctx_type(struct bpf_verifier_log *log, const struct
 
 	ctx_type = find_canonical_prog_ctx_type(prog_type);
 	if (!ctx_type) {
+		if (!btf_vmlinux) {
+			ctx_tname = find_fallback_prog_ctx_tname(prog_type);
+			if (!ctx_tname) {
+				bpf_log(log, "arg#%d should be void pointer\n", arg);
+				return -EINVAL;
+			}
+			if (!__btf_type_is_struct(t) || strcmp(ctx_tname, tname) != 0) {
+				bpf_log(log, "arg#%d should be `struct %s *`\n", arg, ctx_tname);
+				return -EINVAL;
+			}
+			return 0;
+		}
 		/* should not happen */
 		bpf_log(log, "btf_vmlinux is malformed\n");
 		return -EINVAL;

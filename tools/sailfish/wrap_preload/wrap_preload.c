@@ -1,7 +1,7 @@
 #define SYS_execve 221
 #define SYS_exit 94
 
-static const char preload_str[] = "LD_PRELOAD=/system/lib64/libsdm_shim.so:/data/libsdm_shim.so";
+static const char preload_str[] = "LD_PRELOAD=/system/lib64/libsdm_shim.so";
 static const char sys_bin[] = "/system/bin/";
 static const char real_suffix[] = ".real";
 
@@ -43,11 +43,12 @@ void c_start(long *sp) {
     const char *p = sys_bin;
     while (*p) *d++ = *p++;
 
+    const char *orig_argv0 = argv[0];
     const char *slash = 0;
-    for (p = argv[0]; *p; p++) {
+    for (p = orig_argv0; *p; p++) {
         if (*p == '/') slash = p;
     }
-    const char *bname = slash ? slash + 1 : argv[0];
+    const char *bname = slash ? slash + 1 : orig_argv0;
     while (*bname) *d++ = *bname++;
 
     p = real_suffix;
@@ -60,7 +61,7 @@ void c_start(long *sp) {
     /* Strategy 2: <original_argv0>.real */
     char target2[256];
     d = target2;
-    p = argv[0];
+    p = orig_argv0;
     while (*p) *d++ = *p++;
     p = real_suffix;
     while (*p) *d++ = *p++;
