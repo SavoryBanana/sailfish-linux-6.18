@@ -1200,6 +1200,77 @@ static int bind_mount_clean(const char *src, const char *dst) {
     return mount(src, dst, NULL, MS_BIND, NULL);
 }
 
+/* Match an Android .rc directive line, ignoring leading whitespace and trailing comments/whitespace. */
+static bool is_rc_command_line(const char *line, const char *cmd) {
+    while (*line == ' ' || *line == '\t') line++;
+    size_t len = strlen(cmd);
+    if (strncmp(line, cmd, len) != 0) return false;
+    char next = line[len];
+    return next == '\0' || next == '\n' || next == '\r' ||
+           next == ' '  || next == '\t' || next == '#';
+}
+
+static bool drop_composer_restart(const char *line) {
+    return strstr(line, "onrestart restart surfaceflinger") != NULL;
+}
+
+static bool drop_start_netd(const char *line) {
+    return is_rc_command_line(line, "start netd");
+}
+
+static bool drop_netd1shot_reboot(const char *line) {
+    return is_rc_command_line(line, "reboot_on_failure reboot,netd1shot-fail");
+}
+
+/* Non-destructively bind-mount an Android .rc file in /tmp with matching lines removed. */
+static void overlay_filtered_rc(const char *src_rc, const char *tmp_rc,
+                                const char *fallback_label,
+                                bool (*should_drop)(const char *),
+                                const char *usb_msg) {
+    umount_all(src_rc);
+    if (access(src_rc, F_OK) != 0) return;
+
+    char label[128] = {0};
+    ssize_t llen = getxattr(src_rc, "security.selinux", label, sizeof(label) - 1);
+    if (llen <= 0) {
+        snprintf(label, sizeof(label), "%s", fallback_label);
+    } else {
+        label[llen] = '\0';
+    }
+
+    mkdir("/tmp", 0755);
+    FILE *in = fopen(src_rc, "r");
+    FILE *out = fopen(tmp_rc, "w");
+    if (!in || !out) {
+        if (in) fclose(in);
+        if (out) fclose(out);
+        return;
+    }
+
+    char line[2048];
+    bool dropped = false;
+    while (fgets(line, sizeof(line), in)) {
+        if (should_drop(line)) {
+            dropped = true;
+            continue;
+        }
+        fputs(line, out);
+    }
+    fclose(in);
+    fclose(out);
+
+    if (!dropped) {
+        unlink(tmp_rc);
+        return;
+    }
+
+    chmod(tmp_rc, 0644);
+    set_selinux_label(tmp_rc, label);
+    if (bind_mount_clean(tmp_rc, src_rc) == 0 && usb_msg) {
+        usb_write(usb_msg);
+    }
+}
+
 static void unmount_android_mounts(void) {
     for (int pass = 0; pass < 8; pass++) {
         FILE *f = fopen("/proc/mounts", "r");
@@ -1280,15 +1351,15 @@ static bool write_permissive_ld_config(const char *path, const char *label) {
 
     fprintf(ldf,
         "# sailfish-permissive-ldconfig\n"
+        "dir.vendor = /vendor/bin\n"
+        "dir.vendor = /odm/bin\n"
         "dir.system = /system/bin\n"
         "dir.system = /system/xbin\n"
         "dir.system = /system/apex\n"
         "dir.system = /apex\n"
         "dir.system = /data\n"
         "dir.system_ext = /system_ext/bin\n"
-        "dir.product = /product/bin\n"
-        "dir.vendor = /vendor/bin\n"
-        "dir.vendor = /odm/bin\n\n"
+        "dir.product = /product/bin\n\n"
     );
 
     static const char *const apex_ns[] = {
@@ -1302,10 +1373,12 @@ static bool write_permissive_ld_config(const char *path, const char *label) {
         "com_android_adservices", "com_android_rkpd", NULL
     };
 
-    const char *common_paths =
-        "/bootstrap-apex/com.android.art/${LIB}:/bootstrap-apex/com.android.runtime/${LIB}:/bootstrap-apex/com.android.runtime/${LIB}/bionic:"
-        "/bootstrap-apex/com.android.i18n/${LIB}:"
-        "/apex/com.android.art/${LIB}:/apex/com.android.runtime/${LIB}:/apex/com.android.runtime/${LIB}/bionic:"
+    const char *bionic_paths =
+        "/apex/com.android.runtime/${LIB}/bionic:/bootstrap-apex/com.android.runtime/${LIB}/bionic:/system/${LIB}/bootstrap:";
+    const char *sys_lib_paths =
+        "/system/${LIB}:/system_ext/${LIB}:/product/${LIB}:";
+    const char *apex_lib_paths =
+        "/apex/com.android.art/${LIB}:/apex/com.android.runtime/${LIB}:"
         "/apex/com.android.i18n/${LIB}:/apex/com.android.adbd/${LIB}:/apex/com.android.tethering/${LIB}:"
         "/apex/com.android.os.statsd/${LIB}:/apex/com.android.conscrypt/${LIB}:/apex/com.android.media/${LIB}:"
         "/apex/com.android.media.swcodec/${LIB}:/apex/com.android.resolv/${LIB}:/apex/com.android.neuralnetworks/${LIB}:"
@@ -1313,11 +1386,17 @@ static bool write_permissive_ld_config(const char *path, const char *label) {
         "/apex/com.android.uprobestats/${LIB}:/apex/com.android.uwb/${LIB}:/apex/com.android.virt/${LIB}:"
         "/apex/com.android.permission/${LIB}:/apex/com.android.wifi/${LIB}:/apex/com.android.mediaprovider/${LIB}:"
         "/apex/com.android.adservices/${LIB}:/apex/com.android.sdkext/${LIB}:/apex/com.android.rkpd/${LIB}:"
-        "/apex/com.android.vndk.v34/${LIB}:/apex/com.android.vndk.v33/${LIB}:/apex/com.android.vndk.v32/${LIB}:/apex/com.android.vndk.v31/${LIB}:"
-        "/system/${LIB}:/system/${LIB}/bootstrap:/system_ext/${LIB}:/product/${LIB}:/vendor/${LIB}";
+        "/bootstrap-apex/com.android.art/${LIB}:/bootstrap-apex/com.android.runtime/${LIB}:/bootstrap-apex/com.android.i18n/${LIB}:";
+    const char *vndk_paths =
+        "/vendor/${LIB}:/apex/com.android.vndk.v34/${LIB}:/apex/com.android.vndk.v33/${LIB}:/apex/com.android.vndk.v32/${LIB}:/apex/com.android.vndk.v31/${LIB}";
+
+    char common_paths[2048];
+    snprintf(common_paths, sizeof(common_paths), "%s%s%s%s",
+             bionic_paths, sys_lib_paths, apex_lib_paths, vndk_paths);
 
     static const char *const sections[] = { "system", "system_ext", "product", "data", "vendor", NULL };
     for (int s = 0; sections[s]; s++) {
+        const char *search_paths = common_paths;
         fprintf(ldf, "[%s]\n", sections[s]);
         fprintf(ldf, "additional.namespaces = ");
         for (int i = 0; apex_ns[i]; i++) {
@@ -1325,7 +1404,7 @@ static bool write_permissive_ld_config(const char *path, const char *label) {
         }
         fprintf(ldf, "namespace.default.isolated = false\n");
         fprintf(ldf, "namespace.default.visible = true\n");
-        fprintf(ldf, "namespace.default.search.paths = %s\n", common_paths);
+        fprintf(ldf, "namespace.default.search.paths = %s\n", search_paths);
         fprintf(ldf, "namespace.default.permitted.paths = /\n");
         fprintf(ldf, "namespace.default.links = ");
         for (int i = 0; apex_ns[i]; i++) {
@@ -1340,7 +1419,7 @@ static bool write_permissive_ld_config(const char *path, const char *label) {
             const char *ns = apex_ns[i];
             fprintf(ldf, "namespace.%s.isolated = false\n", ns);
             fprintf(ldf, "namespace.%s.visible = true\n", ns);
-            fprintf(ldf, "namespace.%s.search.paths = %s\n", ns, common_paths);
+            fprintf(ldf, "namespace.%s.search.paths = %s\n", ns, search_paths);
             fprintf(ldf, "namespace.%s.permitted.paths = /\n", ns);
             fprintf(ldf, "namespace.%s.links = default\n", ns);
             fprintf(ldf, "namespace.%s.link.default.allow_all_shared_libs = true\n\n", ns);
@@ -1510,7 +1589,9 @@ static void rm_rf(const char *path) {
 }
 
 static bool prepare_android_rootfs(bool for_shell) {
-    write_str("/proc/sys/kernel/printk_devkmsg", "on\n");
+    /* Keep kernel /dev/kmsg ratelimiting enabled so noisy BPF Rust loaders cannot
+     * stall early init/userspace for ~57s dumping unbuffered messages to /dev/kmsg. */
+    write_str("/proc/sys/kernel/printk_devkmsg", "ratelimit\n");
     rm_rf("/dev/__properties__");
     rm_rf("/dev/socket");
     mkdir("/dev/socket", 0755);
@@ -1645,60 +1726,84 @@ static bool prepare_android_rootfs(bool for_shell) {
         }
     }
 
-    /* Automated: Stub /system/bin/vdc with instant exit 0 binary so vdc keymaster earlyBootEnded
-     * never blocks vold on missing android.security.maintenance / keymaster@3.0 */
-    if (access("/mnt/system_a/system/bin/vdc", F_OK) == 0) {
-        const char *stub_src = (access("/tools/vdc_stub", F_OK) == 0) ? "/tools/vdc_stub" : NULL;
-        if (!stub_src) {
-            mkdir("/tmp", 0755);
-            write_file_str("/tmp/vdc_noop", "#!/system/bin/sh\nexit 0\n");
-            stub_src = "/tmp/vdc_noop";
-        }
-        chmod(stub_src, 0755);
-        set_selinux_label(stub_src, "u:object_r:vdc_exec:s0");
-        if (mount(stub_src, "/mnt/system_a/system/bin/vdc", NULL, MS_BIND, NULL) == 0) {
-            usb_write("[+] Automated: Bound no-op vdc stub -> /system/bin/vdc\n");
-        }
-    }
+    /* Keep real /system/bin/vdc active so hw/init.rc executes vdc checkpoint,
+     * vdc keymaster earlyBootEnded (against keystore2), and vdc cryptfs init_user0. */
 
-    /* Automated: Bind pause_stub over failing legacy vendor daemons (qseecomd, time_daemon, keymaster, configstore)
-     * so Android init sees them running stably without crash loops */
+    /* Automated: Bind pause_stub over failing/un-linkable Android 10 vendor daemons & HALs
+     * so Android init sees them sleeping cleanly (0% CPU) instead of crash-looping */
     if (access("/tools/pause_stub", F_OK) == 0) {
         set_selinux_label("/tools/pause_stub", "u:object_r:vendor_file:s0");
         chmod("/tools/pause_stub", 0755);
         const char *legacy_daemons[] = {
             "/mnt/system_a/vendor/bin/qseecomd",
             "/mnt/system_a/vendor/bin/time_daemon",
+            "/mnt/system_a/vendor/bin/adsprpcd",
+            "/mnt/system_a/vendor/bin/thermal-engine",
+            "/mnt/system_a/vendor/bin/cnd",
+            "/mnt/system_a/vendor/bin/netmgrd",
+            "/mnt/system_a/vendor/bin/imsdatadaemon",
+            "/mnt/system_a/vendor/bin/hw/rild",
             "/mnt/system_a/vendor/bin/hw/android.hardware.keymaster@3.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.audio@2.0-service",
             "/mnt/system_a/vendor/bin/hw/android.hardware.configstore@1.1-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.biometrics.fingerprint@2.1-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.bluetooth@1.0-service-qti",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.camera.provider@2.4-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.cas@1.1-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.drm@1.1-service.widevine",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.drm@1.2-service.clearkey",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.light@2.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.media.omx@1.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.nfc@1.1-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.sensors@1.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.thermal@2.0-service.pixel",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.usb@1.1-service.marlin",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.vibrator@1.0-service.marlin",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.vr@1.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.wifi@1.0-service",
+            "/mnt/system_a/vendor/bin/pm-proxy",
+            "/mnt/system_a/vendor/bin/nanohub_slpi",
             NULL
         };
         for (int d = 0; legacy_daemons[d]; d++) {
             if (access(legacy_daemons[d], F_OK) == 0) {
+                umount_all(legacy_daemons[d]);
                 if (mount("/tools/pause_stub", legacy_daemons[d], NULL, MS_BIND, NULL) == 0) {
-                    char dmsg[160];
+                    char dmsg[192];
                     snprintf(dmsg, sizeof(dmsg), "[+] Automated: Bound pause_stub -> %s\n", legacy_daemons[d]);
                     usb_write(dmsg);
                 }
             }
         }
 
-        /* Stub odsign separately with its system SELinux context so missing keymaster/fs-verity
-         * never causes 4 crashes before boot_completed (which triggers InitFatalReboot). */
-        const char *odsign_bin = "/mnt/system_a/system/bin/odsign";
-        if (access(odsign_bin, F_OK) == 0) {
-            mkdir("/tmp", 0755);
-            const char *odsign_stub = "/tmp/odsign_stub";
-            if (copy_file("/tools/pause_stub", odsign_stub)) {
-                char od_lbl[128] = {0};
-                const char *use_od_lbl = "u:object_r:system_file:s0";
-                if (getxattr(odsign_bin, "security.selinux", od_lbl, sizeof(od_lbl) - 1) > 0) {
-                    use_od_lbl = od_lbl;
+        /* Stub system daemons with their original SELinux contexts:
+         * - odsign: missing keymaster/fs-verity would trigger InitFatalReboot after 4 crashes
+         * - audioserver: A17 libaudiohal removed audio@2.0/4.0, causing NULL deref crash loop */
+        mkdir("/tmp", 0755);
+        struct {
+            const char *bin_path;
+            const char *stub_path;
+            const char *fallback_label;
+        } sys_stubs[] = {
+            { "/mnt/system_a/system/bin/odsign", "/tmp/odsign_stub", "u:object_r:system_file:s0" },
+            { "/mnt/system_a/system/bin/audioserver", "/tmp/audioserver_stub", "u:object_r:audioserver_exec:s0" },
+            { NULL, NULL, NULL }
+        };
+        for (int s = 0; sys_stubs[s].bin_path; s++) {
+            if (access(sys_stubs[s].bin_path, F_OK) == 0 &&
+                copy_file("/tools/pause_stub", sys_stubs[s].stub_path)) {
+                char lbl[128] = {0};
+                const char *use_lbl = sys_stubs[s].fallback_label;
+                if (getxattr(sys_stubs[s].bin_path, "security.selinux", lbl, sizeof(lbl) - 1) > 0) {
+                    use_lbl = lbl;
                 }
-                chmod(odsign_stub, 0755);
-                set_selinux_label(odsign_stub, use_od_lbl);
-                if (mount(odsign_stub, odsign_bin, NULL, MS_BIND, NULL) == 0) {
-                    usb_write("[+] Automated: Bound pause_stub -> /system/bin/odsign\n");
+                chmod(sys_stubs[s].stub_path, 0755);
+                set_selinux_label(sys_stubs[s].stub_path, use_lbl);
+                umount_all(sys_stubs[s].bin_path);
+                if (mount(sys_stubs[s].stub_path, sys_stubs[s].bin_path, NULL, MS_BIND, NULL) == 0) {
+                    char smsg[192];
+                    snprintf(smsg, sizeof(smsg), "[+] Automated: Bound pause_stub -> %s\n", sys_stubs[s].bin_path);
+                    usb_write(smsg);
                 }
             }
         }
@@ -1706,34 +1811,37 @@ static bool prepare_android_rootfs(bool for_shell) {
 
     /* Automated: Strip 'onrestart restart surfaceflinger' from composer service definition so
      * any HAL hiccup never kills SurfaceFlinger */
-    const char *comp_rc = "/mnt/system_a/vendor/etc/init/android.hardware.graphics.composer@2.1-service.rc";
-    if (access(comp_rc, F_OK) == 0) {
-        mkdir("/tmp", 0755);
-        FILE *cin = fopen(comp_rc, "r");
-        FILE *cout = fopen("/tmp/composer.rc", "w");
-        if (cin && cout) {
-            char line[512];
-            while (fgets(line, sizeof(line), cin)) {
-                if (strstr(line, "onrestart restart surfaceflinger"))
-                    continue;
-                fputs(line, cout);
-            }
-        }
-        if (cin) fclose(cin);
-        if (cout) {
-            fclose(cout);
-            chmod("/tmp/composer.rc", 0644);
-            set_selinux_label("/tmp/composer.rc", "u:object_r:vendor_configs_file:s0");
-            if (mount("/tmp/composer.rc", comp_rc, NULL, MS_BIND, NULL) == 0) {
-                usb_write("[+] Automated: Overlaid composer@2.1-service.rc (removed onrestart restart surfaceflinger)\n");
-            }
-        }
-    }
+    overlay_filtered_rc(
+        "/mnt/system_a/vendor/etc/init/android.hardware.graphics.composer@2.1-service.rc",
+        "/tmp/composer.rc",
+        "u:object_r:vendor_configs_file:s0",
+        drop_composer_restart,
+        "[+] Automated: Overlaid composer@2.1-service.rc (removed onrestart restart surfaceflinger)\n");
+
+    /* Automated: Prevent vendor init.rc 'on post-fs-data' from starting netd prematurely
+     * before 'on load-bpf-programs' sets bpf.progs_loaded=1 (stops netd crash-loop). */
+    overlay_filtered_rc(
+        "/mnt/system_a/vendor/etc/init/init.rc",
+        "/tmp/vendor_init.rc",
+        "u:object_r:vendor_configs_file:s0",
+        drop_start_netd,
+        "[+] Automated: Overlaid vendor/etc/init/init.rc (removed premature start netd)\n");
+
+    /* Bring-up safety: Strip reboot_on_failure from netd1shot so a netd1shot setup glitch
+     * does not trigger a hard bootloader reboot loop before we can inspect logs. */
+    overlay_filtered_rc(
+        "/mnt/system_a/system/etc/init/netd.rc",
+        "/tmp/netd.rc",
+        "u:object_r:system_file:s0",
+        drop_netd1shot_reboot,
+        "[+] Automated: Overlaid system/etc/init/netd.rc (removed netd1shot reboot_on_failure)\n");
 
     /* Automated: Bind wrap_preload over graphics HALs & surfaceflinger so they ALWAYS load libsdm_shim.so
      * natively on startup, preventing SIGSEGV in libsdmcore and unlocking hwcomposer + surfaceflinger */
     if (access("/tools/wrap_preload", F_OK) == 0) {
         chmod("/tools/wrap_preload", 0755);
+        /* Clean up any leftover empty /system/vendor_bin from earlier test boots */
+        rmdir("/mnt/system_a/system/vendor_bin");
         struct {
             const char *service_path;
             const char *real_path;
@@ -1757,6 +1865,9 @@ static bool prepare_android_rootfs(bool for_shell) {
             { "/mnt/system_a/vendor/bin/hw/android.hardware.power@1.1-service.marlin",
               "/mnt/system_a/system/bin/android.hardware.power@1.1-service.marlin.real",
               "u:object_r:hal_power_default_exec:s0" },
+            { "/mnt/system_a/system/bin/keystore2",
+              "/mnt/system_a/system/bin/keystore2.real",
+              "u:object_r:keystore_exec:s0" },
             { NULL, NULL, NULL }
         };
 
@@ -1843,6 +1954,7 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    setprop keystore.module_hash.sent true\n"
         "    setprop odsign.key.done 1\n"
         "    setprop odsign.verification.done 1\n"
+        "    chmod 0664 /sys/fs/cgroup/cgroup.procs\n"
         "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
         "    chmod 0644 /linkerconfig/ld.config.txt\n"
         "\n"
@@ -1875,31 +1987,86 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    class_start core\n"
         "    trigger nonencrypted\n";
 
+    /* Install sailfish_boot triggers only once before hw/init.rc actions so
+     * duplicate `on zygote-start` copies never truncate /linkerconfig/ld.config.txt
+     * concurrently with hw/init.rc starting zygote (app_process64). */
     mkdir("/mnt/system_a/system/etc/init", 0755);
-    write_file_str("/mnt/system_a/system/etc/init/sailfish_boot.rc", rc_content);
-    chmod("/mnt/system_a/system/etc/init/sailfish_boot.rc", 0644);
-    set_selinux_label("/mnt/system_a/system/etc/init/sailfish_boot.rc", "u:object_r:system_file:s0");
+    unlink("/mnt/system_a/system/etc/init/sailfish_boot.rc");
+    unlink("/mnt/system_a/vendor/etc/init/sailfish_boot.rc");
 
     mkdir("/tmp", 0755);
     write_file_str("/tmp/init.sailfish.rc", rc_content);
     chmod("/tmp/init.sailfish.rc", 0644);
     set_selinux_label("/tmp/init.sailfish.rc", "u:object_r:vendor_configs_file:s0");
-    mkdir("/mnt/system_a/vendor/etc/init", 0755);
-    write_file_str("/mnt/system_a/vendor/etc/init/sailfish_boot.rc", rc_content);
-    chmod("/mnt/system_a/vendor/etc/init/sailfish_boot.rc", 0644);
-    set_selinux_label("/mnt/system_a/vendor/etc/init/sailfish_boot.rc", "u:object_r:vendor_configs_file:s0");
 
-    mkdir("/mnt/system_a/vendor/etc/init/hw", 0755);
-    write_file_str("/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", rc_content);
-    chmod("/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", 0644);
-    set_selinux_label("/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", "u:object_r:vendor_configs_file:s0");
-    if (access("/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", F_OK) == 0) {
-        mount("/tmp/init.sailfish.rc", "/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", NULL, MS_BIND, NULL);
+    if (access("/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc", F_OK) == 0 &&
+        mount("/tmp/init.sailfish.rc", "/mnt/system_a/vendor/etc/init/hw/init.sailfish.rc",
+              NULL, MS_BIND, NULL) == 0) {
+        unlink("/mnt/system_a/init.sailfish.rc");
+    } else {
+        write_file_str("/mnt/system_a/init.sailfish.rc", rc_content);
+        chmod("/mnt/system_a/init.sailfish.rc", 0644);
+        set_selinux_label("/mnt/system_a/init.sailfish.rc", "u:object_r:rootfs:s0");
     }
 
-    write_file_str("/mnt/system_a/init.sailfish.rc", rc_content);
-    chmod("/mnt/system_a/init.sailfish.rc", 0644);
-    set_selinux_label("/mnt/system_a/init.sailfish.rc", "u:object_r:rootfs:s0");
+    /* Idempotent fallback after hw/init.rc init_user0 so User 0 DE/CE dirs and
+     * /data/data -> /data/user/0 bind mount always exist on unencrypted tmpfs /data. */
+    const char *ensure_user0_sh =
+        "#!/system/bin/sh\n"
+        "ensure_dir() {\n"
+        "    if [ ! -d \"$1\" ]; then\n"
+        "        mkdir -p \"$1\" 2>/dev/null || true\n"
+        "        chown \"$2\" \"$1\" 2>/dev/null || true\n"
+        "        chmod \"$3\" \"$1\" 2>/dev/null || true\n"
+        "        restorecon \"$1\" 2>/dev/null || true\n"
+        "    fi\n"
+        "}\n"
+        "ensure_dir /data/data system:system 0771\n"
+        "ensure_dir /data/user/0 system:system 0771\n"
+        "ensure_dir /data/user_de/0 system:system 0771\n"
+        "ensure_dir /data/system/users/0 system:system 0700\n"
+        "ensure_dir /data/system_de/0 system:system 0770\n"
+        "ensure_dir /data/system_ce/0 system:system 0770\n"
+        "ensure_dir /data/misc_de/0 system:misc 01771\n"
+        "ensure_dir /data/misc_ce/0 system:misc 01771\n"
+        "ensure_dir /data/vendor_de/0 root:root 0771\n"
+        "ensure_dir /data/vendor_ce/0 root:root 0771\n"
+        "ensure_dir /data/singleton_de/0 system:system 0771\n"
+        "ensure_dir /data/singleton_ce/0 system:system 0771\n"
+        "ensure_dir /data/misc/user/0 root:root 0700\n"
+        "ensure_dir /data/misc/profiles/cur/0 system:system 0771\n"
+        "ensure_dir /data/misc/profiles/ref/0 system:system 0771\n"
+        "ensure_dir /data/media/0 media_rw:media_rw 0770\n"
+        "ensure_dir /data/media/0/Android media_rw:media_rw 0770\n"
+        "ensure_dir /data/media/obb media_rw:media_rw 0770\n"
+        "if ! grep -q \" /data/user/0 \" /proc/mounts; then\n"
+        "    mount -o bind /data/data /data/user/0 2>/dev/null || true\n"
+        "fi\n"
+        "if [ ! -d /data/misc_de/0/vold ]; then\n"
+        "    /system/bin/vold_prepare_subdirs prepare \"\" 0 1 2>/dev/null || true\n"
+        "fi\n"
+        "if [ ! -d /data/misc_ce/0/vold ]; then\n"
+        "    /system/bin/vold_prepare_subdirs prepare \"\" 0 2 2>/dev/null || true\n"
+        "fi\n"
+        "if [ -s /data/ld.config.sailfish.txt ]; then\n"
+        "    if cp /data/ld.config.sailfish.txt /linkerconfig/.ld.config.tmp 2>/dev/null && [ -s /linkerconfig/.ld.config.tmp ]; then\n"
+        "        chmod 0644 /linkerconfig/.ld.config.tmp 2>/dev/null || true\n"
+        "        chcon u:object_r:linkerconfig_file:s0 /linkerconfig/.ld.config.tmp 2>/dev/null || restorecon /linkerconfig/.ld.config.tmp 2>/dev/null || true\n"
+        "        mv -f /linkerconfig/.ld.config.tmp /linkerconfig/ld.config.txt 2>/dev/null || rm -f /linkerconfig/.ld.config.tmp 2>/dev/null || true\n"
+        "    else\n"
+        "        rm -f /linkerconfig/.ld.config.tmp 2>/dev/null || true\n"
+        "    fi\n"
+        "fi\n";
+    write_file_str("/mnt/system_a/system/etc/sailfish_ensure_user0.sh", ensure_user0_sh);
+    chmod("/mnt/system_a/system/etc/sailfish_ensure_user0.sh", 0755);
+    set_selinux_label("/mnt/system_a/system/etc/sailfish_ensure_user0.sh", "u:object_r:system_file:s0");
+
+    const char *user0_rc =
+        "on post-fs-data\n"
+        "    exec - root root -- /system/bin/sh /system/etc/sailfish_ensure_user0.sh\n";
+    write_file_str("/mnt/system_a/system/etc/init/sailfish_user0_fallback.rc", user0_rc);
+    chmod("/mnt/system_a/system/etc/init/sailfish_user0_fallback.rc", 0644);
+    set_selinux_label("/mnt/system_a/system/etc/init/sailfish_user0_fallback.rc", "u:object_r:system_file:s0");
 
 
     /* Automated: Sync SELinux sha256 checksums to vendor so precompiled_sepolicy loads */
@@ -3067,6 +3234,8 @@ static void boot_android_init(const char *stage) {
         if (inner == 0) {
             /* Child is now PID 1 inside its own pid_namespace and mnt_namespace rooted at /mnt/system_a */
             mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL);
+            /* Restore shared propagation on /data so /data/data -> /data/user/0 propagates to /data_mirror */
+            mount(NULL, "/data", NULL, MS_SHARED, NULL);
 
             /* Mount fresh /proc for this PID namespace so /proc/1 is Android init */
             umount2("/proc", MNT_DETACH);

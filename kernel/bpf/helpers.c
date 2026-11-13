@@ -228,11 +228,18 @@ const struct bpf_func_proto bpf_ktime_get_tai_ns_proto = {
 BPF_CALL_0(bpf_get_current_pid_tgid)
 {
 	struct task_struct *task = current;
+	pid_t tgid, pid;
 
 	if (unlikely(!task))
 		return -EINVAL;
 
-	return (u64) task->tgid << 32 | task->pid;
+	/* Return PID/TGID in current's active PID namespace so BPF programs (e.g.
+	 * Android netd's netd_pid_map check) match userspace getpid()/gettid() when
+	 * Android init runs inside a CLONE_NEWPID container.
+	 */
+	tgid = task_tgid_vnr(task);
+	pid = task_pid_vnr(task);
+	return (u64)(u32)(tgid ?: task->tgid) << 32 | (u32)(pid ?: task->pid);
 }
 
 const struct bpf_func_proto bpf_get_current_pid_tgid_proto = {

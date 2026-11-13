@@ -21,6 +21,25 @@ static inline void my_exit(int code) {
     while(1);
 }
 
+/* Build <prefix><name>.real in a bounded stack buffer and execve with LD_PRELOAD. */
+static void try_exec_real(const char *prefix, const char *name, char **argv, char **new_env) {
+    char target[256];
+    unsigned long pos = 0;
+    const unsigned long cap = sizeof(target) - 1;
+    const char *parts[3] = { prefix, name, real_suffix };
+
+    for (int i = 0; i < 3; i++) {
+        for (const char *p = parts[i]; p && *p; p++) {
+            if (pos >= cap) return;
+            target[pos++] = *p;
+        }
+    }
+    target[pos] = 0;
+
+    argv[0] = target;
+    my_execve(target, argv, new_env);
+}
+
 void c_start(long *sp) {
     long argc = *sp;
     char **argv = (char **)(sp + 1);
@@ -37,38 +56,18 @@ void c_start(long *sp) {
     }
     new_env[idx] = 0;
 
-    /* Strategy 1: /system/bin/<basename>.real */
-    char target1[256];
-    char *d = target1;
-    const char *p = sys_bin;
-    while (*p) *d++ = *p++;
-
     const char *orig_argv0 = argv[0];
     const char *slash = 0;
-    for (p = orig_argv0; *p; p++) {
+    for (const char *p = orig_argv0; *p; p++) {
         if (*p == '/') slash = p;
     }
     const char *bname = slash ? slash + 1 : orig_argv0;
-    while (*bname) *d++ = *bname++;
 
-    p = real_suffix;
-    while (*p) *d++ = *p++;
-    *d = 0;
-
-    argv[0] = target1;
-    my_execve(target1, argv, new_env);
+    /* Strategy 1: /system/bin/<basename>.real */
+    try_exec_real(sys_bin, bname, argv, new_env);
 
     /* Strategy 2: <original_argv0>.real */
-    char target2[256];
-    d = target2;
-    p = orig_argv0;
-    while (*p) *d++ = *p++;
-    p = real_suffix;
-    while (*p) *d++ = *p++;
-    *d = 0;
-
-    argv[0] = target2;
-    my_execve(target2, argv, new_env);
+    try_exec_real("", orig_argv0, argv, new_env);
 
     my_exit(127);
 }

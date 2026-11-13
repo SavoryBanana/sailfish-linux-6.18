@@ -89,10 +89,10 @@ fi
 cp "$SCRIPT_DIR/vdc_stub/vdc_stub" "$OUT_DIR/initramfs_root/tools/vdc_stub"
 chmod +x "$OUT_DIR/initramfs_root/tools/vdc_stub"
 
-if [ ! -f "$SCRIPT_DIR/pause_stub/pause_stub" ]; then
-    mkdir -p "$SCRIPT_DIR/pause_stub"
-    echo -e ".global _start\n.text\n_start:\n1:\n  mov x8, 22\n  svc 0\n  b 1b\n" | aarch64-linux-gnu-gcc -x assembler -nostdlib -static -s -o "$SCRIPT_DIR/pause_stub/pause_stub" -
-fi
+mkdir -p "$SCRIPT_DIR/pause_stub"
+# Call __NR_ppoll(NULL, 0, NULL, NULL, 0) (aarch64 syscall 73) so stubbed daemons
+# sleep in TASK_INTERRUPTIBLE with 0% CPU instead of busy-looping on epoll_pwait (22).
+echo -e ".global _start\n.text\n_start:\n1:\n  mov x0, 0\n  mov x1, 0\n  mov x2, 0\n  mov x3, 0\n  mov x4, 0\n  mov x8, 73\n  svc 0\n  b 1b\n" | aarch64-linux-gnu-gcc -x assembler -nostdlib -static -s -o "$SCRIPT_DIR/pause_stub/pause_stub" -
 cp "$SCRIPT_DIR/pause_stub/pause_stub" "$OUT_DIR/initramfs_root/tools/pause_stub"
 chmod +x "$OUT_DIR/initramfs_root/tools/pause_stub"
 
