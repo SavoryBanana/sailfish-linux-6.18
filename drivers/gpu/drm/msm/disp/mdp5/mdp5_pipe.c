@@ -66,6 +66,10 @@ int mdp5_pipe_assign(struct drm_atomic_state *s, struct drm_plane *plane,
 					struct mdp5_hw_pipe *r_cur =
 							mdp5_kms->hwpipes[j];
 
+					if (new_state->hwpipe_to_plane[r_cur->idx] ||
+					    old_state->hwpipe_to_plane[r_cur->idx])
+						continue;
+
 					/* reject different types of hwpipes */
 					if (r_cur->caps != cur->caps)
 						continue;
@@ -135,8 +139,8 @@ int mdp5_pipe_release(struct drm_atomic_state *s, struct mdp5_hw_pipe *hwpipe)
 
 	new_state = &state->hwpipe;
 
-	if (WARN_ON(!new_state->hwpipe_to_plane[hwpipe->idx]))
-		return -EINVAL;
+	if (!new_state->hwpipe_to_plane[hwpipe->idx])
+		return 0;
 
 	DBG("%s: release from plane %s", hwpipe->name,
 		new_state->hwpipe_to_plane[hwpipe->idx]->name);

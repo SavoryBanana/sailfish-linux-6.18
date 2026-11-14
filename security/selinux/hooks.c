@@ -3592,6 +3592,51 @@ static int selinux_inode_getsecurity(struct mnt_idmap *idmap,
 		return -EOPNOTSUPP;
 
 	/*
+	 * Compatibility: Android 10 vendor precompiled_sepolicy lacks
+	 * Android 14-17 fs_bpf_<subdir> types and genfscon bpf rules.
+	 * Synthesize the expected per-subdirectory context on bpffs
+	 * when userspace queries security.selinux (getfilecon).
+	 */
+	if (inode->i_sb && inode->i_sb->s_type &&
+	    !strcmp(inode->i_sb->s_type->name, "bpf")) {
+		struct dentry *dentry = d_find_any_alias(inode);
+
+		if (dentry) {
+			struct dentry *cur;
+			char sub[128];
+			bool found = false;
+
+			rcu_read_lock();
+			cur = dentry;
+			while (!IS_ROOT(cur) && !IS_ROOT(cur->d_parent))
+				cur = READ_ONCE(cur->d_parent);
+			if (!IS_ROOT(cur) && IS_ROOT(cur->d_parent) &&
+			    d_is_dir(cur) && cur->d_name.len > 0 &&
+			    cur->d_name.len < sizeof(sub)) {
+				memcpy(sub, cur->d_name.name, cur->d_name.len);
+				sub[cur->d_name.len] = '\0';
+				found = true;
+			}
+			rcu_read_unlock();
+			dput(dentry);
+
+			if (found) {
+				context = kasprintf(GFP_KERNEL,
+						    "u:object_r:fs_bpf_%s:s0",
+						    sub);
+				if (!context)
+					return -ENOMEM;
+				size = strlen(context) + 1;
+				if (alloc)
+					*buffer = context;
+				else
+					kfree(context);
+				return size;
+			}
+		}
+	}
+
+	/*
 	 * If the caller has CAP_MAC_ADMIN, then get the raw context
 	 * value even if it is not defined by current policy; otherwise,
 	 * use the in-core value under current policy.

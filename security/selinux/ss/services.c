@@ -2895,6 +2895,19 @@ retry:
 	policydb = &policy->policydb;
 	sidtab = policy->sidtab;
 
+	if (sbsec->flags & SE_SBGENFS) {
+		rc = __security_genfs_sid(policy, fstype, "/",
+					  SECCLASS_DIR, &sbsec->sid);
+		if (rc == -ESTALE) {
+			rcu_read_unlock();
+			goto retry;
+		}
+		if (!rc) {
+			sbsec->behavior = SECURITY_FS_USE_GENFS;
+			goto out;
+		}
+	}
+
 	c = policydb->ocontexts[OCON_FSUSE];
 	while (c) {
 		if (strcmp(fstype, c->u.name) == 0)

@@ -1200,6 +1200,47 @@ static int bind_mount_clean(const char *src, const char *dst) {
     return mount(src, dst, NULL, MS_BIND, NULL);
 }
 
+struct bin_patch {
+    off_t offset;
+    const void *bytes;
+    size_t len;
+};
+
+/* Copy a shared library to /tmp, apply binary patches, and bind-mount over the original. */
+static void patch_and_bind_lib(const char *src, const char *tmp_path,
+                               const char *label,
+                               const struct bin_patch *patches, size_t count,
+                               const char *usb_msg) {
+    umount_all(src);
+    if (access(src, F_OK) != 0) return;
+
+    mkdir("/tmp", 0755);
+    if (!copy_file(src, tmp_path)) return;
+
+    int fd = open(tmp_path, O_RDWR);
+    if (fd < 0) return;
+
+    bool ok = true;
+    for (size_t i = 0; i < count; i++) {
+        if (pwrite(fd, patches[i].bytes, patches[i].len, patches[i].offset) !=
+            (ssize_t)patches[i].len) {
+            ok = false;
+            break;
+        }
+    }
+    close(fd);
+    if (!ok) {
+        unlink(tmp_path);
+        return;
+    }
+
+    chmod(tmp_path, 0644);
+    set_selinux_label(tmp_path, label);
+    if (mount(tmp_path, src, NULL, MS_BIND, NULL) == 0 && usb_msg) {
+        usb_write(usb_msg);
+    }
+}
+
 /* Match an Android .rc directive line, ignoring leading whitespace and trailing comments/whitespace. */
 static bool is_rc_command_line(const char *line, const char *cmd) {
     while (*line == ' ' || *line == '\t') line++;
@@ -1222,7 +1263,7 @@ static bool drop_netd1shot_reboot(const char *line) {
     return is_rc_command_line(line, "reboot_on_failure reboot,netd1shot-fail");
 }
 
-/* Non-destructively bind-mount an Android .rc file in /tmp with matching lines removed. */
+/* Non-destructively bind-mount an Android .rc/.cil file in /tmp with matching lines removed. */
 static void overlay_filtered_rc(const char *src_rc, const char *tmp_rc,
                                 const char *fallback_label,
                                 bool (*should_drop)(const char *),
@@ -1247,15 +1288,17 @@ static void overlay_filtered_rc(const char *src_rc, const char *tmp_rc,
         return;
     }
 
-    char line[2048];
+    char *line = NULL;
+    size_t cap = 0;
     bool dropped = false;
-    while (fgets(line, sizeof(line), in)) {
+    while (getline(&line, &cap, in) >= 0) {
         if (should_drop(line)) {
             dropped = true;
             continue;
         }
         fputs(line, out);
     }
+    free(line);
     fclose(in);
     fclose(out);
 
@@ -1740,29 +1783,51 @@ static bool prepare_android_rootfs(bool for_shell) {
             "/mnt/system_a/vendor/bin/adsprpcd",
             "/mnt/system_a/vendor/bin/thermal-engine",
             "/mnt/system_a/vendor/bin/cnd",
+            "/mnt/system_a/vendor/bin/cnss-daemon",
+            "/mnt/system_a/vendor/bin/msm_irqbalance",
             "/mnt/system_a/vendor/bin/netmgrd",
             "/mnt/system_a/vendor/bin/imsdatadaemon",
             "/mnt/system_a/vendor/bin/hw/rild",
             "/mnt/system_a/vendor/bin/hw/android.hardware.keymaster@3.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.atrace@1.0-service",
             "/mnt/system_a/vendor/bin/hw/android.hardware.audio@2.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.boot@1.0-service",
             "/mnt/system_a/vendor/bin/hw/android.hardware.configstore@1.1-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.contexthub@1.0-service",
             "/mnt/system_a/vendor/bin/hw/android.hardware.biometrics.fingerprint@2.1-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.bluetooth@1.0-service",
             "/mnt/system_a/vendor/bin/hw/android.hardware.bluetooth@1.0-service-qti",
             "/mnt/system_a/vendor/bin/hw/android.hardware.camera.provider@2.4-service",
             "/mnt/system_a/vendor/bin/hw/android.hardware.cas@1.1-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.drm@1.0-service",
             "/mnt/system_a/vendor/bin/hw/android.hardware.drm@1.1-service.widevine",
             "/mnt/system_a/vendor/bin/hw/android.hardware.drm@1.2-service.clearkey",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.dumpstate@1.0-service.marlin",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.gatekeeper@1.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.gnss@1.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.gnss@1.0-service-qti",
             "/mnt/system_a/vendor/bin/hw/android.hardware.light@2.0-service",
             "/mnt/system_a/vendor/bin/hw/android.hardware.media.omx@1.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.memtrack@1.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.memtrack@1.0-service.marlin",
             "/mnt/system_a/vendor/bin/hw/android.hardware.nfc@1.1-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.oemlock@1.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.radio.deprecated@1.0-service",
             "/mnt/system_a/vendor/bin/hw/android.hardware.sensors@1.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.soundtrigger@2.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.tetheroffload.config@1.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.tetheroffload.control@1.0-service",
             "/mnt/system_a/vendor/bin/hw/android.hardware.thermal@2.0-service.pixel",
             "/mnt/system_a/vendor/bin/hw/android.hardware.usb@1.1-service.marlin",
             "/mnt/system_a/vendor/bin/hw/android.hardware.vibrator@1.0-service.marlin",
             "/mnt/system_a/vendor/bin/hw/android.hardware.vr@1.0-service",
+            "/mnt/system_a/vendor/bin/hw/android.hardware.weaver@1.0-service",
             "/mnt/system_a/vendor/bin/hw/android.hardware.wifi@1.0-service",
+            "/mnt/system_a/vendor/bin/pm-service",
             "/mnt/system_a/vendor/bin/pm-proxy",
             "/mnt/system_a/vendor/bin/nanohub_slpi",
+            "/mnt/system_a/vendor/bin/loc_launcher",
             NULL
         };
         for (int d = 0; legacy_daemons[d]; d++) {
@@ -1778,20 +1843,27 @@ static bool prepare_android_rootfs(bool for_shell) {
 
         /* Stub system daemons with their original SELinux contexts:
          * - odsign: missing keymaster/fs-verity would trigger InitFatalReboot after 4 crashes
-         * - audioserver: A17 libaudiohal removed audio@2.0/4.0, causing NULL deref crash loop */
+         * - audioserver: A17 libaudiohal removed audio@2.0/4.0, causing NULL deref crash loop
+         * - traced/traced_probes: exit(1) loop triggers flags_health_check UPDATABLE_CRASHING CPU storm
+         * - flags_health_check: bind vdc_stub so SVC_EXEC returns 0 immediately at 0% CPU */
         mkdir("/tmp", 0755);
         struct {
+            const char *src_stub;
             const char *bin_path;
             const char *stub_path;
             const char *fallback_label;
         } sys_stubs[] = {
-            { "/mnt/system_a/system/bin/odsign", "/tmp/odsign_stub", "u:object_r:system_file:s0" },
-            { "/mnt/system_a/system/bin/audioserver", "/tmp/audioserver_stub", "u:object_r:audioserver_exec:s0" },
-            { NULL, NULL, NULL }
+            { "/tools/pause_stub", "/mnt/system_a/system/bin/odsign", "/tmp/odsign_stub", "u:object_r:system_file:s0" },
+            { "/tools/pause_stub", "/mnt/system_a/system/bin/audioserver", "/tmp/audioserver_stub", "u:object_r:audioserver_exec:s0" },
+            { "/tools/pause_stub", "/mnt/system_a/system/bin/traced", "/tmp/traced_stub", "u:object_r:traced_exec:s0" },
+            { "/tools/pause_stub", "/mnt/system_a/system/bin/traced_probes", "/tmp/traced_probes_stub", "u:object_r:traced_probes_exec:s0" },
+            { "/tools/vdc_stub", "/mnt/system_a/system/bin/flags_health_check", "/tmp/flags_health_check_stub", "u:object_r:system_file:s0" },
+            { NULL, NULL, NULL, NULL }
         };
         for (int s = 0; sys_stubs[s].bin_path; s++) {
-            if (access(sys_stubs[s].bin_path, F_OK) == 0 &&
-                copy_file("/tools/pause_stub", sys_stubs[s].stub_path)) {
+            if (access(sys_stubs[s].src_stub, F_OK) == 0 &&
+                access(sys_stubs[s].bin_path, F_OK) == 0 &&
+                copy_file(sys_stubs[s].src_stub, sys_stubs[s].stub_path)) {
                 char lbl[128] = {0};
                 const char *use_lbl = sys_stubs[s].fallback_label;
                 if (getxattr(sys_stubs[s].bin_path, "security.selinux", lbl, sizeof(lbl) - 1) > 0) {
@@ -1802,9 +1874,67 @@ static bool prepare_android_rootfs(bool for_shell) {
                 umount_all(sys_stubs[s].bin_path);
                 if (mount(sys_stubs[s].stub_path, sys_stubs[s].bin_path, NULL, MS_BIND, NULL) == 0) {
                     char smsg[192];
-                    snprintf(smsg, sizeof(smsg), "[+] Automated: Bound pause_stub -> %s\n", sys_stubs[s].bin_path);
+                    snprintf(smsg, sizeof(smsg), "[+] Automated: Bound %s -> %s\n", sys_stubs[s].src_stub, sys_stubs[s].bin_path);
                     usb_write(smsg);
                 }
+            }
+        }
+    }
+
+    /* Automated: Hide unused crash-looping/unneeded APKs so PackageManagerService skips them */
+    mkdir("/tmp", 0755);
+    mkdir("/tmp/empty_app_dir", 0755);
+    umount_all("/tmp/empty_app_dir");
+    if (mount("tmpfs", "/tmp/empty_app_dir", "tmpfs", 0, "mode=0755,uid=0,gid=0") == 0) {
+        set_selinux_label("/tmp/empty_app_dir", "u:object_r:system_file:s0");
+        const char *empty_app_dirs[] = {
+            "/mnt/system_a/system/app/NfcNci",
+            "/mnt/system_a/system/priv-app/Tag",
+            "/mnt/system_a/vendor/app",
+            NULL
+        };
+        for (int i = 0; empty_app_dirs[i]; i++) {
+            if (access(empty_app_dirs[i], F_OK) == 0 &&
+                bind_mount_clean("/tmp/empty_app_dir", empty_app_dirs[i]) == 0) {
+                char amsg[192];
+                snprintf(amsg, sizeof(amsg), "[+] Automated: Overlaid empty dir -> %s\n", empty_app_dirs[i]);
+                usb_write(amsg);
+            }
+        }
+    }
+
+    /* Automated: Filter NFC permissions out of /vendor/etc/permissions so PackageManagerService
+     * does not declare android.hardware.nfc or respawn com.android.nfc (NfcNciApex). */
+    const char *vperm_dir = "/mnt/system_a/vendor/etc/permissions";
+    if (access(vperm_dir, F_OK) == 0) {
+        mkdir("/tmp", 0755);
+        mkdir("/tmp/vendor_permissions", 0755);
+        umount_all("/tmp/vendor_permissions");
+        if (mount("tmpfs", "/tmp/vendor_permissions", "tmpfs", 0, "mode=0755,uid=0,gid=0") == 0) {
+            set_selinux_label("/tmp/vendor_permissions", "u:object_r:vendor_configs_file:s0");
+            DIR *pd = opendir(vperm_dir);
+            if (pd) {
+                struct dirent *de;
+                while ((de = readdir(pd)) != NULL) {
+                    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                        continue;
+                    if (strcasestr(de->d_name, "nfc") || strcasestr(de->d_name, "mifare"))
+                        continue;
+                    char src_path[512], dst_path[512];
+                    snprintf(src_path, sizeof(src_path), "%s/%s", vperm_dir, de->d_name);
+                    snprintf(dst_path, sizeof(dst_path), "/tmp/vendor_permissions/%s", de->d_name);
+                    struct stat pst;
+                    if (stat(src_path, &pst) == 0 && S_ISREG(pst.st_mode)) {
+                        if (copy_file(src_path, dst_path)) {
+                            chmod(dst_path, 0644);
+                            set_selinux_label(dst_path, "u:object_r:vendor_configs_file:s0");
+                        }
+                    }
+                }
+                closedir(pd);
+            }
+            if (bind_mount_clean("/tmp/vendor_permissions", vperm_dir) == 0) {
+                usb_write("[+] Automated: Filtered NFC/Mifare XMLs out of /vendor/etc/permissions\n");
             }
         }
     }
@@ -1925,10 +2055,15 @@ static bool prepare_android_rootfs(bool for_shell) {
     const char *rc_content =
         "on early-init\n"
         "    setprop ro.crypto.state unencrypted\n"
+        "    setprop ro.hw_timeout_multiplier 10\n"
         "    setprop sys.use_memfd true\n"
         "    setprop debug.gralloc.gfx_ubwc_disable 1\n"
         "    setprop debug.gralloc.enable_fb_ubwc 0\n"
         "    setprop service.sf.prime_shader_cache 0\n"
+        "    setprop dalvik.vm.dexopt-flags v=n\n"
+        "    setprop dalvik.vm.extra-opts -Xverify:none\n"
+        "    setprop pm.dexopt.first-boot skip\n"
+        "    setprop pm.dexopt.boot-after-ota skip\n"
         "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
         "    chmod 0644 /linkerconfig/ld.config.txt\n"
         "    chmod 0666 /dev/ion\n"
@@ -1954,9 +2089,15 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    setprop keystore.module_hash.sent true\n"
         "    setprop odsign.key.done 1\n"
         "    setprop odsign.verification.done 1\n"
+        "    setprop dalvik.vm.dexopt-flags v=n\n"
+        "    setprop dalvik.vm.extra-opts -Xverify:none\n"
+        "    setprop pm.dexopt.first-boot skip\n"
+        "    setprop pm.dexopt.boot-after-ota skip\n"
         "    chmod 0664 /sys/fs/cgroup/cgroup.procs\n"
         "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
         "    chmod 0644 /linkerconfig/ld.config.txt\n"
+        "    exec - root root -- /system/bin/sh /data/sailfish_ensure_user0.sh\n"
+        "    start vndservicemanager\n"
         "\n"
         "on early-fs\n"
         "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
@@ -1975,8 +2116,22 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    chmod 0644 /linkerconfig/ld.config.txt\n"
         "\n"
         "on zygote-start\n"
+        "    setprop dalvik.vm.dexopt-flags v=n\n"
+        "    setprop dalvik.vm.extra-opts -Xverify:none\n"
+        "    setprop pm.dexopt.first-boot skip\n"
+        "    setprop pm.dexopt.boot-after-ota skip\n"
         "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
         "    chmod 0644 /linkerconfig/ld.config.txt\n"
+        "\n"
+        "service sailfish_power_aidl /system/bin/android.hardware.power-service.sailfish\n"
+        "    class hal\n"
+        "    user system\n"
+        "    group system\n"
+        "\n"
+        "service sailfish_sensors_aidl /system/bin/android.hardware.sensors-service.sailfish\n"
+        "    class hal\n"
+        "    user system\n"
+        "    group system\n"
         "\n"
         "on boot\n"
         "    chmod 0666 /dev/ion\n"
@@ -1993,6 +2148,18 @@ static bool prepare_android_rootfs(bool for_shell) {
     mkdir("/mnt/system_a/system/etc/init", 0755);
     unlink("/mnt/system_a/system/etc/init/sailfish_boot.rc");
     unlink("/mnt/system_a/vendor/etc/init/sailfish_boot.rc");
+
+    mkdir("/tmp", 0755);
+    if (access("/mnt/system_a/vendor/etc/init/sailfish_boot.rc", F_OK) == 0) {
+        write_file_str("/tmp/empty.rc", "# neutralized stale vendor sailfish_boot.rc\n");
+        chmod("/tmp/empty.rc", 0644);
+        set_selinux_label("/tmp/empty.rc", "u:object_r:vendor_configs_file:s0");
+        umount_all("/mnt/system_a/vendor/etc/init/sailfish_boot.rc");
+        if (mount("/tmp/empty.rc", "/mnt/system_a/vendor/etc/init/sailfish_boot.rc",
+                  NULL, MS_BIND, NULL) == 0) {
+            usb_write("[+] Automated: Neutralized stale /vendor/etc/init/sailfish_boot.rc\n");
+        }
+    }
 
     mkdir("/tmp", 0755);
     write_file_str("/tmp/init.sailfish.rc", rc_content);
@@ -2056,10 +2223,32 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    else\n"
         "        rm -f /linkerconfig/.ld.config.tmp 2>/dev/null || true\n"
         "    fi\n"
+        "fi\n"
+        "if ! losetup /dev/block/loop95 >/dev/null 2>&1; then\n"
+        "    dd if=/dev/zero of=/data/frp.img bs=1024 count=512 2>/dev/null || true\n"
+        "    losetup /dev/block/loop95 /data/frp.img 2>/dev/null || true\n"
+        "fi\n"
+        "chown system:system /dev/block/loop95 2>/dev/null || true\n"
+        "chmod 0660 /dev/block/loop95 2>/dev/null || true\n"
+        "chcon u:object_r:frp_block_device:s0 /dev/block/loop95 2>/dev/null || true\n"
+        "ln -sf /dev/block/loop95 /dev/block/platform/soc/624000.ufshc/by-name/frp 2>/dev/null || true\n"
+        "ln -sf /dev/block/loop95 /dev/block/bootdevice/by-name/frp 2>/dev/null || true\n"
+        "ln -sf /dev/block/loop95 /dev/block/by-name/frp 2>/dev/null || true\n"
+        "for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do\n"
+        "    echo performance > \"$g\" 2>/dev/null || true\n"
+        "done\n"
+        "if [ -d /apex/com.android.nfcservices/priv-app ]; then\n"
+        "    mount -t tmpfs tmpfs /apex/com.android.nfcservices/priv-app 2>/dev/null || true\n"
         "fi\n";
+    write_file_str("/tmp/sailfish_ensure_user0.sh", ensure_user0_sh);
+    chmod("/tmp/sailfish_ensure_user0.sh", 0755);
+    set_selinux_label("/tmp/sailfish_ensure_user0.sh", "u:object_r:system_file:s0");
     write_file_str("/mnt/system_a/system/etc/sailfish_ensure_user0.sh", ensure_user0_sh);
     chmod("/mnt/system_a/system/etc/sailfish_ensure_user0.sh", 0755);
     set_selinux_label("/mnt/system_a/system/etc/sailfish_ensure_user0.sh", "u:object_r:system_file:s0");
+    if (access("/mnt/system_a/system/etc/sailfish_ensure_user0.sh", F_OK) == 0) {
+        bind_mount_clean("/tmp/sailfish_ensure_user0.sh", "/mnt/system_a/system/etc/sailfish_ensure_user0.sh");
+    }
 
     const char *user0_rc =
         "on post-fs-data\n"
@@ -2132,8 +2321,54 @@ static bool prepare_android_rootfs(bool for_shell) {
         if (access("/mnt/system_a/dev/dri/card0", F_OK) != 0) symlink("/dev/dri/card1", "/mnt/system_a/dev/dri/card0");
     }
 
-    /* Automated: Inject graphics VINTF manifest fragment (composer@2.1 & allocator@2.0) */
-    if (access("/tools/android.hardware.graphics.xml", F_OK) == 0) {
+    /* Automated: Install AIDL Power HAL stub binary for HintManagerService (IPower/default) */
+    if (access("/tools/power_hal", F_OK) == 0) {
+        const char *pwr_dst = "/mnt/system_a/system/bin/android.hardware.power-service.sailfish";
+        umount_all(pwr_dst);
+        unlink(pwr_dst);
+        if (copy_file("/tools/power_hal", pwr_dst)) {
+            chmod(pwr_dst, 0755);
+            set_selinux_label(pwr_dst, "u:object_r:hal_power_default_exec:s0");
+            usb_write("[+] Automated: Installed /system/bin/android.hardware.power-service.sailfish\n");
+        } else if (copy_file("/tools/power_hal", "/tmp/power_hal")) {
+            chmod("/tmp/power_hal", 0755);
+            set_selinux_label("/tmp/power_hal", "u:object_r:hal_power_default_exec:s0");
+            int pfd = open(pwr_dst, O_WRONLY | O_CREAT | O_EXCL, 0755);
+            if (pfd >= 0) close(pfd);
+            if (bind_mount_clean("/tmp/power_hal", pwr_dst) == 0) {
+                set_selinux_label(pwr_dst, "u:object_r:hal_power_default_exec:s0");
+                usb_write("[+] Automated: Bind-mounted /system/bin/android.hardware.power-service.sailfish\n");
+            }
+        }
+    }
+
+    /* Automated: Install AIDL Sensors HAL stub (ISensors/default, 0 sensors) so
+     * SensorService/SystemSensorManager don't block on the absent HIDL nanohub HAL */
+    if (access("/tools/sensors_hal", F_OK) == 0) {
+        const char *sns_dst = "/mnt/system_a/system/bin/android.hardware.sensors-service.sailfish";
+        const char *sns_label = "u:object_r:hal_sensors_default_exec:s0";
+        umount_all(sns_dst);
+        unlink(sns_dst);
+        if (copy_file("/tools/sensors_hal", sns_dst)) {
+            chmod(sns_dst, 0755);
+            set_selinux_label(sns_dst, sns_label);
+            usb_write("[+] Automated: Installed /system/bin/android.hardware.sensors-service.sailfish\n");
+        } else if (copy_file("/tools/sensors_hal", "/tmp/sensors_hal")) {
+            chmod("/tmp/sensors_hal", 0755);
+            set_selinux_label("/tmp/sensors_hal", sns_label);
+            int sfd = open(sns_dst, O_WRONLY | O_CREAT | O_EXCL, 0755);
+            if (sfd >= 0) close(sfd);
+            if (bind_mount_clean("/tmp/sensors_hal", sns_dst) == 0) {
+                set_selinux_label(sns_dst, sns_label);
+                usb_write("[+] Automated: Bind-mounted /system/bin/android.hardware.sensors-service.sailfish\n");
+            }
+        }
+    }
+
+    /* Automated: Inject VINTF manifest fragments (graphics HALs + AIDL Power/Sensors HALs) */
+    if (access("/tools/android.hardware.graphics.xml", F_OK) == 0 ||
+        access("/tools/android.hardware.power.xml", F_OK) == 0 ||
+        access("/tools/android.hardware.sensors.xml", F_OK) == 0) {
         const char *vintf_dir = "/mnt/system_a/system/etc/vintf/manifest";
         mkdir("/tmp/vintf_manifest", 0755);
         umount2("/tmp/vintf_manifest", MNT_DETACH);
@@ -2151,10 +2386,113 @@ static bool prepare_android_rootfs(bool for_shell) {
                 }
                 closedir(vd);
             }
-            copy_file("/tools/android.hardware.graphics.xml", "/tmp/vintf_manifest/android.hardware.graphics.xml");
-            set_selinux_label("/tmp/vintf_manifest/android.hardware.graphics.xml", "u:object_r:system_file:s0");
+            if (access("/tools/android.hardware.graphics.xml", F_OK) == 0) {
+                copy_file("/tools/android.hardware.graphics.xml", "/tmp/vintf_manifest/android.hardware.graphics.xml");
+                set_selinux_label("/tmp/vintf_manifest/android.hardware.graphics.xml", "u:object_r:system_file:s0");
+            }
+            if (access("/tools/android.hardware.power.xml", F_OK) == 0) {
+                copy_file("/tools/android.hardware.power.xml", "/tmp/vintf_manifest/android.hardware.power.xml");
+                set_selinux_label("/tmp/vintf_manifest/android.hardware.power.xml", "u:object_r:system_file:s0");
+            }
+            if (access("/tools/android.hardware.sensors.xml", F_OK) == 0) {
+                copy_file("/tools/android.hardware.sensors.xml", "/tmp/vintf_manifest/android.hardware.sensors.xml");
+                set_selinux_label("/tmp/vintf_manifest/android.hardware.sensors.xml", "u:object_r:system_file:s0");
+            }
             if (mount("/tmp/vintf_manifest", vintf_dir, NULL, MS_BIND, NULL) == 0) {
-                usb_write("[+] Automated: Overlaid /system/etc/vintf/manifest with android.hardware.graphics.xml\n");
+                usb_write("[+] Automated: Overlaid /system/etc/vintf/manifest with graphics, power & sensors HAL fragments\n");
+            }
+        }
+    }
+
+    /* Automated: Overlay /vendor/etc/vintf/manifest.xml with only active HIDL HALs
+     * so hwservicemanager never advertises stubbed HALs (wifi, soundtrigger, etc.)
+     * that would crash system_server threads via NoSuchElementException. */
+    if (access("/mnt/system_a/vendor/etc/vintf/manifest.xml", F_OK) == 0) {
+        const char *vendor_manifest_xml =
+            "<manifest version=\"1.0\" type=\"device\" target-level=\"2\">\n"
+            "    <hal format=\"hidl\">\n"
+            "        <name>android.hardware.graphics.allocator</name>\n"
+            "        <transport>hwbinder</transport>\n"
+            "        <version>2.0</version>\n"
+            "        <interface>\n"
+            "            <name>IAllocator</name>\n"
+            "            <instance>default</instance>\n"
+            "        </interface>\n"
+            "        <fqname>@2.0::IAllocator/default</fqname>\n"
+            "    </hal>\n"
+            "    <hal format=\"hidl\">\n"
+            "        <name>android.hardware.graphics.composer</name>\n"
+            "        <transport>hwbinder</transport>\n"
+            "        <version>2.0</version>\n"
+            "        <version>2.1</version>\n"
+            "        <interface>\n"
+            "            <name>IComposer</name>\n"
+            "            <instance>default</instance>\n"
+            "        </interface>\n"
+            "        <fqname>@2.1::IComposer/default</fqname>\n"
+            "    </hal>\n"
+            "    <hal format=\"hidl\">\n"
+            "        <name>android.hardware.graphics.mapper</name>\n"
+            "        <transport arch=\"32+64\">passthrough</transport>\n"
+            "        <version>2.0</version>\n"
+            "        <version>2.1</version>\n"
+            "        <interface>\n"
+            "            <name>IMapper</name>\n"
+            "            <instance>default</instance>\n"
+            "        </interface>\n"
+            "        <fqname>@2.0::IMapper/default</fqname>\n"
+            "        <fqname>@2.1::IMapper/default</fqname>\n"
+            "    </hal>\n"
+            "    <hal format=\"hidl\">\n"
+            "        <name>android.hardware.health</name>\n"
+            "        <transport>hwbinder</transport>\n"
+            "        <version>2.0</version>\n"
+            "        <interface>\n"
+            "            <name>IHealth</name>\n"
+            "            <instance>default</instance>\n"
+            "        </interface>\n"
+            "        <fqname>@2.0::IHealth/default</fqname>\n"
+            "    </hal>\n"
+            "    <hal format=\"hidl\">\n"
+            "        <name>android.hardware.power</name>\n"
+            "        <transport>hwbinder</transport>\n"
+            "        <version>1.1</version>\n"
+            "        <interface>\n"
+            "            <name>IPower</name>\n"
+            "            <instance>default</instance>\n"
+            "        </interface>\n"
+            "        <fqname>@1.1::IPower/default</fqname>\n"
+            "    </hal>\n"
+            "    <hal format=\"hidl\">\n"
+            "        <name>android.renderscript</name>\n"
+            "        <transport arch=\"32+64\">passthrough</transport>\n"
+            "        <version>1.0</version>\n"
+            "        <interface>\n"
+            "            <name>IDevice</name>\n"
+            "            <instance>default</instance>\n"
+            "        </interface>\n"
+            "        <fqname>@1.0::IDevice/default</fqname>\n"
+            "    </hal>\n"
+            "    <sepolicy>\n"
+            "        <version>29.0</version>\n"
+            "    </sepolicy>\n"
+            "</manifest>\n";
+        mkdir("/tmp", 0755);
+        write_file_str("/tmp/vendor_manifest.xml", vendor_manifest_xml);
+        chmod("/tmp/vendor_manifest.xml", 0644);
+        set_selinux_label("/tmp/vendor_manifest.xml", "u:object_r:vendor_configs_file:s0");
+        if (bind_mount_clean("/tmp/vendor_manifest.xml", "/mnt/system_a/vendor/etc/vintf/manifest.xml") == 0) {
+            usb_write("[+] Automated: Overlaid /vendor/etc/vintf/manifest.xml (active HIDL HALs only)\n");
+        }
+    }
+    if (access("/mnt/system_a/vendor/etc/vintf/manifest", F_OK) == 0) {
+        mkdir("/tmp", 0755);
+        mkdir("/tmp/empty_vendor_vintf", 0755);
+        umount_all("/tmp/empty_vendor_vintf");
+        if (mount("tmpfs", "/tmp/empty_vendor_vintf", "tmpfs", 0, "mode=0755,uid=0,gid=0") == 0) {
+            set_selinux_label("/tmp/empty_vendor_vintf", "u:object_r:vendor_configs_file:s0");
+            if (bind_mount_clean("/tmp/empty_vendor_vintf", "/mnt/system_a/vendor/etc/vintf/manifest") == 0) {
+                usb_write("[+] Automated: Overlaid empty /vendor/etc/vintf/manifest\n");
             }
         }
     }
@@ -2331,6 +2669,9 @@ static bool prepare_android_rootfs(bool for_shell) {
     write_proc_sysctl("/proc/sys/kernel/unprivileged_bpf_disabled", "0\n");
     write_proc_sysctl("/proc/sys/net/core/bpf_jit_enable", "1\n");
     write_proc_sysctl("/proc/sys/net/core/bpf_jit_kallsyms", "1\n");
+    /* Silence synchronous UART printk bottleneck once early init diagnostics finish */
+    write_proc_sysctl("/sys/module/printk/parameters/ignore_loglevel", "N\n");
+    write_proc_sysctl("/proc/sys/kernel/printk", "1 1 1 1\n");
 
     umount_all("/mnt/system_a/sys/fs/selinux");
     umount_all("/mnt/system_a/sys");
@@ -2385,6 +2726,11 @@ static bool prepare_android_rootfs(bool for_shell) {
     mkdir("/mnt/system_a/data", 0771);
     mount("tmpfs", "/mnt/system_a/data", "tmpfs", 0, "mode=0771,uid=1000,gid=1000");
     set_selinux_label("/mnt/system_a/data", "u:object_r:system_data_root_file:s0");
+
+    /* Write User 0 & FRP ensure script into writable tmpfs /data */
+    write_file_str("/mnt/system_a/data/sailfish_ensure_user0.sh", ensure_user0_sh);
+    chmod("/mnt/system_a/data/sailfish_ensure_user0.sh", 0755);
+    set_selinux_label("/mnt/system_a/data/sailfish_ensure_user0.sh", "u:object_r:system_file:s0");
 
     /* Automated: Install qservice_daemon into /data */
     if (access("/tools/qservice_daemon", F_OK) == 0) {
@@ -2453,6 +2799,55 @@ static bool prepare_android_rootfs(bool for_shell) {
             usb_write("[+] Automated: Successfully bind-mounted Gralloc2-enabled libui.so over /system/lib64/libui.so\n");
         }
     }
+
+    /* Automated: Short-circuit AudioSystem/mediautils service wait stubs so StartAudioService
+     * returns in 0ms instead of starving system_server for 75s+ Watchdog timeouts. */
+    static const unsigned char audiobase_ret_null[12] = {
+        0x5f, 0x24, 0x03, 0xd5, /* bti c */
+        0x1f, 0x01, 0x00, 0xf9, /* str xzr, [x8] */
+        0xc0, 0x03, 0x5f, 0xd6  /* ret */
+    };
+    const struct bin_patch audiobase_patches[] = {
+        { 0x3c7a0, audiobase_ret_null, sizeof(audiobase_ret_null) },
+        { 0x3c7ac, audiobase_ret_null, sizeof(audiobase_ret_null) },
+        { 0x42da0, audiobase_ret_null, sizeof(audiobase_ret_null) },
+        { 0x42dac, audiobase_ret_null, sizeof(audiobase_ret_null) },
+        { 0x63f04, audiobase_ret_null, sizeof(audiobase_ret_null) },
+        { 0x6afa0, audiobase_ret_null, sizeof(audiobase_ret_null) },
+    };
+    patch_and_bind_lib(
+        "/mnt/system_a/system/lib64/libaudiobase.so", "/tmp/libaudiobase.so",
+        "u:object_r:system_lib_file:s0",
+        audiobase_patches, sizeof(audiobase_patches) / sizeof(audiobase_patches[0]),
+        "[+] Automated: Patched & bind-mounted /system/lib64/libaudiobase.so\n");
+
+    /* Automated: Force retry=false in libhidlbase getRawServiceInternal so absent HALs
+     * never hang gatekeeperd or SoundTriggerMiddlewareService forever. */
+    static const unsigned char hidlbase_no_retry[4] = { 0xf9, 0x03, 0x1f, 0x2a }; /* mov w25, wzr */
+    const struct bin_patch hidlbase_patches[] = {
+        { 0x48b14, hidlbase_no_retry, sizeof(hidlbase_no_retry) },
+    };
+    patch_and_bind_lib(
+        "/mnt/system_a/system/lib64/libhidlbase.so", "/tmp/libhidlbase.so",
+        "u:object_r:system_lib_file:s0",
+        hidlbase_patches, sizeof(hidlbase_patches) / sizeof(hidlbase_patches[0]),
+        "[+] Automated: Patched & bind-mounted /system/lib64/libhidlbase.so\n");
+
+    /* Automated: Make libselinux selinux_check_access() return 0 so keystore2 does not fail
+     * with EINVAL when Android 10 precompiled_sepolicy lacks keystore2_key/locksettings_key. */
+    static const unsigned char selinux_allow_all[12] = {
+        0x5f, 0x24, 0x03, 0xd5, /* bti c */
+        0x00, 0x00, 0x80, 0x52, /* mov w0, #0 */
+        0xc0, 0x03, 0x5f, 0xd6  /* ret */
+    };
+    const struct bin_patch selinux_patches[] = {
+        { 0x35e28, selinux_allow_all, sizeof(selinux_allow_all) },
+    };
+    patch_and_bind_lib(
+        "/mnt/system_a/system/lib64/libselinux.so", "/tmp/libselinux.so",
+        "u:object_r:system_lib_file:s0",
+        selinux_patches, sizeof(selinux_patches) / sizeof(selinux_patches[0]),
+        "[+] Automated: Patched & bind-mounted /system/lib64/libselinux.so\n");
     if (access("/tools/libEGL_adreno_shim.so", F_OK) == 0) {
         copy_file("/tools/libEGL_adreno_shim.so", "/mnt/system_a/data/libEGL_adreno_shim.so");
         chmod("/mnt/system_a/data/libEGL_adreno_shim.so", 0755);
@@ -2475,6 +2870,7 @@ static bool prepare_android_rootfs(bool for_shell) {
     FILE *gf = fopen("/mnt/system_a/data/start_graphics.sh", "w");
     if (gf) {
         fprintf(gf, "#!/system/bin/sh\n"
+                    "unset LD_LIBRARY_PATH\n"
                     "setenforce 0 2>/dev/null\n"
                     "chmod 666 /dev/ion 2>/dev/null\n"
                     "chmod 666 /dev/dma_heap/* 2>/dev/null\n"
@@ -2487,18 +2883,96 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "chmod 666 /sys/devices/virtual/graphics/fb0/vsync_event 2>/dev/null\n"
                     "echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/null || true\n"
                     "echo 200 > /sys/class/backlight/994000.dsi.0/brightness 2>/dev/null || true\n"
+                    "echo 401800000 > /sys/class/devfreq/b00000.gpu/min_freq 2>/dev/null || true\n"
+                    "if [ -d /apex/com.android.nfcservices/priv-app ]; then\n"
+                    "    mount -t tmpfs tmpfs /apex/com.android.nfcservices/priv-app 2>/dev/null || true\n"
+                    "fi\n"
                     "if [ -f /data/libadreno_utils.so ]; then\n"
                     "    mount -o bind /data/libadreno_utils.so /vendor/lib64/libadreno_utils.so 2>/dev/null || true\n"
                     "fi\n"
+                    "for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do\n"
+                    "    echo performance > \"$g\" 2>/dev/null || true\n"
+                    "done\n"
+                    "if ! losetup /dev/block/loop95 >/dev/null 2>&1; then\n"
+                    "    dd if=/dev/zero of=/data/frp.img bs=1024 count=512 2>/dev/null || true\n"
+                    "    losetup /dev/block/loop95 /data/frp.img 2>/dev/null || true\n"
+                    "fi\n"
+                    "chown system:system /dev/block/loop95 2>/dev/null || true\n"
+                    "chmod 0660 /dev/block/loop95 2>/dev/null || true\n"
+                    "chcon u:object_r:frp_block_device:s0 /dev/block/loop95 2>/dev/null || true\n"
+                    "ln -sf /dev/block/loop95 /dev/block/platform/soc/624000.ufshc/by-name/frp 2>/dev/null || true\n"
+                    "ln -sf /dev/block/loop95 /dev/block/bootdevice/by-name/frp 2>/dev/null || true\n"
+                    "ln -sf /dev/block/loop95 /dev/block/by-name/frp 2>/dev/null || true\n"
                     "(\n"
-                    "    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do\n"
-                    "        if pgrep -x vndservicemanager >/dev/null 2>&1; then\n"
-                    "            if ! pgrep -x qservice_daemon >/dev/null 2>&1; then\n"
-                    "                /data/qservice_daemon >/dev/null 2>&1 &\n"
+                    "    hwc_restarted=0\n"
+                    "    bootanim_stopped=0\n"
+                    "    qservice_up=0\n"
+                    "    nfc_hidden=0\n"
+                    "    while true; do\n"
+                    "        if [ \"$nfc_hidden\" = \"0\" ] && [ -d /apex/com.android.nfcservices/priv-app ]; then\n"
+                    "            if mount -t tmpfs tmpfs /apex/com.android.nfcservices/priv-app 2>/dev/null; then\n"
+                    "                nfc_hidden=1\n"
                     "            fi\n"
+                    "        fi\n"
+                    "        boot_done=\"$(getprop sys.boot_completed)\"\n"
+                    "        if [ \"$boot_done\" != \"1\" ]; then\n"
+                    "            chown system:system /dev/block/loop95 2>/dev/null || true\n"
+                    "            chmod 0660 /dev/block/loop95 2>/dev/null || true\n"
+                    "            chcon u:object_r:frp_block_device:s0 /dev/block/loop95 2>/dev/null || true\n"
+                    "            ln -sf /dev/block/loop95 /dev/block/platform/soc/624000.ufshc/by-name/frp 2>/dev/null || true\n"
+                    "            ln -sf /dev/block/loop95 /dev/block/bootdevice/by-name/frp 2>/dev/null || true\n"
+                    "            ln -sf /dev/block/loop95 /dev/block/by-name/frp 2>/dev/null || true\n"
+                    "        elif [ ! -f /data/.sailfish_provisioned ]; then\n"
+                    "            if /system/bin/cmd settings put global device_provisioned 1 2>/dev/null && \\\n"
+                    "               /system/bin/cmd settings put secure user_setup_complete 1 2>/dev/null; then\n"
+                    "                /system/bin/cmd settings put global stay_on_while_plugged_in 7 2>/dev/null || true\n"
+                    "                /system/bin/cmd settings put system screen_off_timeout 2147483647 2>/dev/null || true\n"
+                    "                /system/bin/cmd settings put global window_animation_scale 0.0 2>/dev/null || true\n"
+                    "                /system/bin/cmd settings put global transition_animation_scale 0.0 2>/dev/null || true\n"
+                    "                /system/bin/cmd settings put global animator_duration_scale 0.0 2>/dev/null || true\n"
+                    "                /system/bin/cmd locksettings set-disabled true 2>/dev/null || true\n"
+                    "                /system/bin/cmd package disable-user --user 0 com.android.nfc 2>/dev/null || true\n"
+                    "                touch /data/.sailfish_provisioned 2>/dev/null || true\n"
+                    "            fi\n"
+                    "        fi\n"
+                    "        if [ \"$boot_done\" = \"1\" ] && [ \"$bootanim_stopped\" = \"0\" ]; then\n"
+                    "            echo 0 > /sys/class/graphics/fb0/blank 2>/dev/null || true\n"
+                    "            echo 0 > /sys/class/backlight/994000.dsi.0/bl_power 2>/dev/null || true\n"
+                    "            echo 200 > /sys/class/backlight/994000.dsi.0/brightness 2>/dev/null || true\n"
+                    "            /system/bin/cmd input keyevent 224 2>/dev/null || true\n"
+                    "            /system/bin/cmd window dismiss-keyguard 2>/dev/null || true\n"
+                    "            /system/bin/cmd input keyevent 82 2>/dev/null || true\n"
+                    "            setprop service.bootanim.exit 1 2>/dev/null || true\n"
+                    "            stop bootanim 2>/dev/null || true\n"
+                    "            sleep 2\n"
+                    "            /system/bin/cmd input keyevent 66 2>/dev/null || true\n"
+                    "            bootanim_stopped=1\n"
+                    "        fi\n"
+                    "        if [ \"$qservice_up\" = \"0\" ]; then\n"
+                    "            if pgrep -f vndservicemanager >/dev/null 2>&1 || [ \"$(getprop init.svc.vndservicemanager)\" = \"running\" ]; then\n"
+                    "                if ! pgrep -x qservice_daemon >/dev/null 2>&1; then\n"
+                    "                    hwc_was_up=0\n"
+                    "                    if pgrep -f graphics.composer@2.1-service >/dev/null 2>&1 || [ \"$(getprop init.svc.vendor.hwcomposer-2-1)\" = \"running\" ]; then\n"
+                    "                        hwc_was_up=1\n"
+                    "                    fi\n"
+                    "                    /data/qservice_daemon >/dev/null 2>&1 &\n"
+                    "                    if [ \"$hwc_was_up\" = \"1\" ] && [ \"$hwc_restarted\" = \"0\" ]; then\n"
+                    "                        sleep 1\n"
+                    "                        setprop ctl.restart vendor.hwcomposer-2-1 2>/dev/null || true\n"
+                    "                        hwc_restarted=1\n"
+                    "                    fi\n"
+                    "                fi\n"
+                    "                qservice_up=1\n"
+                    "            fi\n"
+                    "        fi\n"
+                    "        if [ \"$bootanim_stopped\" = \"1\" ] && [ -f /data/.sailfish_provisioned ] && [ \"$qservice_up\" = \"1\" ]; then\n"
                     "            break\n"
                     "        fi\n"
-                    "        sleep 0.5\n"
+                    "        if [ \"$boot_done\" = \"1\" ]; then\n"
+                    "            sleep 5\n"
+                    "        else\n"
+                    "            sleep 1\n"
+                    "        fi\n"
                     "    done\n"
                     ") >/dev/null 2>&1 &\n"
                     "echo '[+] Graphics environment & permissions ready!'\n");
@@ -2515,8 +2989,12 @@ static bool prepare_android_rootfs(bool for_shell) {
     mount("tmpfs", "/mnt/system_a/cache", "tmpfs", 0, "mode=0770,uid=1000,gid=2001");
     set_selinux_label("/mnt/system_a/cache", "u:object_r:cache_file:s0");
 
-    mkdir("/mnt/system_a/metadata", 0700);
-    mount("tmpfs", "/mnt/system_a/metadata", "tmpfs", 0, "mode=0700");
+    /* 0755 like a real ext4 /metadata root: aconfigd-system platform-init runs as
+     * user system and must traverse /metadata to populate /metadata/aconfig
+     * (with 0700 the storage stayed empty -> AconfigFlags returned null ->
+     * AdvancedProtectionService "Invalid feature flag" crash). */
+    mkdir("/mnt/system_a/metadata", 0755);
+    mount("tmpfs", "/mnt/system_a/metadata", "tmpfs", 0, "mode=0755");
     set_selinux_label("/mnt/system_a/metadata", "u:object_r:metadata_file:s0");
 
     /* Mount persist (sda3) and modem firmware (sda2) */
@@ -2558,6 +3036,30 @@ static bool prepare_android_rootfs(bool for_shell) {
     }
     if (lcfd >= 0)
         close(lcfd);
+
+    /* Automated: Pre-configure zeroed 512 KB FRP loop block device on /dev/block/loop95
+     * so PersistentDataBlockService initializes with Android 17 FRP_SECRET_MAGIC. */
+    mkdir("/tmp", 0755);
+    int frp_ffd = open("/tmp/frp.img", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (frp_ffd >= 0) {
+        if (ftruncate(frp_ffd, 512 * 1024) == 0) {
+            int frp_lfd = open("/dev/block/loop95", O_RDWR);
+            if (frp_lfd >= 0) {
+                ioctl(frp_lfd, 0x4C01, 0); /* LOOP_CLR_FD */
+                if (ioctl(frp_lfd, 0x4C00, frp_ffd) == 0) { /* LOOP_SET_FD */
+                    usb_write("[+] Automated: Attached zeroed 512 KB /tmp/frp.img -> /dev/block/loop95\n");
+                }
+                close(frp_lfd);
+            }
+        }
+        close(frp_ffd);
+    }
+    chown("/dev/block/loop95", 1000, 1000);
+    chmod("/dev/block/loop95", 0660);
+    set_selinux_label("/dev/block/loop95", "u:object_r:frp_block_device:s0");
+    chown("/mnt/system_a/dev/block/loop95", 1000, 1000);
+    chmod("/mnt/system_a/dev/block/loop95", 0660);
+    set_selinux_label("/mnt/system_a/dev/block/loop95", "u:object_r:frp_block_device:s0");
 
     /* Ensure /dev/ion device permissions and SELinux label */
     chmod("/dev/ion", 0666);
@@ -2660,6 +3162,10 @@ static bool prepare_android_rootfs(bool for_shell) {
         symlink("/dev/sda2", linkpath);
         snprintf(linkpath, sizeof(linkpath), "%s/modem_a", prefixes[p]);
         symlink("/dev/sda2", linkpath);
+
+        snprintf(linkpath, sizeof(linkpath), "%s/frp", prefixes[p]);
+        unlink(linkpath);
+        symlink("/dev/block/loop95", linkpath);
     }
 
     return true;
@@ -2854,7 +3360,6 @@ static void launch_android_shell(void) {
 
         char *envp[] = {
             "PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/apex/com.android.runtime/bin:/apex/com.android.art/bin",
-            "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/system/lib64/bootstrap:/apex/com.android.runtime/lib64/bionic:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/apex/com.android.i18n/lib64",
             "ANDROID_ROOT=/system",
             "ANDROID_DATA=/data",
             "ANDROID_STORAGE=/storage",
@@ -3046,10 +3551,15 @@ static void spawn_android_supervisor(void) {
         { "ctl.stop", "vendor.keymaster-3-0" },
         { "ctl.stop", "vendor.configstore-hal" },
         { "ro.crypto.state", "unencrypted" },
+        { "ro.hw_timeout_multiplier", "10" },
         { "sys.use_memfd", "true" },
         { "debug.gralloc.gfx_ubwc_disable", "1" },
         { "debug.gralloc.enable_fb_ubwc", "0" },
         { "service.sf.prime_shader_cache", "0" },
+        { "dalvik.vm.dexopt-flags", "v=n" },
+        { "dalvik.vm.extra-opts", "-Xverify:none" },
+        { "pm.dexopt.first-boot", "skip" },
+        { "pm.dexopt.boot-after-ota", "skip" },
         { "sys.listeners.registered", "true" },
         { "sys.time.set", "true" },
         { "keystore.module_hash.sent", "true" },
@@ -3092,7 +3602,6 @@ static void spawn_android_supervisor(void) {
             char *gargv[] = { (char *)"/system/bin/sh", (char *)"/data/start_graphics.sh", NULL };
             char *genvp[] = {
                 "PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/apex/com.android.runtime/bin",
-                "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/system/lib64/bootstrap:/apex/com.android.runtime/lib64/bionic:/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/apex/com.android.i18n/lib64",
                 "ANDROID_ROOT=/system",
                 "ANDROID_DATA=/data",
                 NULL

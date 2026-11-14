@@ -240,6 +240,19 @@ static int mdp5_plane_atomic_check_with_state(struct drm_crtc_state *crtc_state,
 		if (plane->type == DRM_PLANE_TYPE_CURSOR)
 			caps |= MDP_PIPE_CAP_CURSOR;
 
+		{
+			struct mdp5_global_state *exist =
+				mdp5_get_existing_global_state(mdp5_kms);
+
+			if (mdp5_state->hwpipe && exist &&
+			    exist->hwpipe.hwpipe_to_plane[mdp5_state->hwpipe->idx] != plane)
+				mdp5_state->hwpipe = NULL;
+
+			if (mdp5_state->r_hwpipe && exist &&
+			    exist->hwpipe.hwpipe_to_plane[mdp5_state->r_hwpipe->idx] != plane)
+				mdp5_state->r_hwpipe = NULL;
+		}
+
 		/* (re)allocate hw pipe if we don't have one or caps-mismatch: */
 		if (!mdp5_state->hwpipe || (caps & ~mdp5_state->hwpipe->caps))
 			new_hwpipe = true;
@@ -298,13 +311,19 @@ static int mdp5_plane_atomic_check_with_state(struct drm_crtc_state *crtc_state,
 				mdp5_state->r_hwpipe = NULL;
 
 
-			ret = mdp5_pipe_release(state->state, old_hwpipe);
-			if (ret)
-				return ret;
+			if (old_hwpipe && old_hwpipe != new_hwpipe &&
+			    old_hwpipe != new_right_hwpipe) {
+				ret = mdp5_pipe_release(state->state, old_hwpipe);
+				if (ret)
+					return ret;
+			}
 
-			ret = mdp5_pipe_release(state->state, old_right_hwpipe);
-			if (ret)
-				return ret;
+			if (old_right_hwpipe && old_right_hwpipe != new_hwpipe &&
+			    old_right_hwpipe != new_right_hwpipe) {
+				ret = mdp5_pipe_release(state->state, old_right_hwpipe);
+				if (ret)
+					return ret;
+			}
 
 		}
 	} else {

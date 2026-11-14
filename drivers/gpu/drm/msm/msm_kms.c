@@ -341,13 +341,7 @@ err_msm_uninit:
 
 int msm_kms_pm_prepare(struct device *dev)
 {
-	struct msm_drm_private *priv = dev_get_drvdata(dev);
-	struct drm_device *ddev = priv ? priv->dev : NULL;
-
-	if (!priv || !priv->kms)
-		return 0;
-
-	return drm_mode_config_helper_suspend(ddev);
+	return -EBUSY;
 }
 
 void msm_kms_pm_complete(struct device *dev)

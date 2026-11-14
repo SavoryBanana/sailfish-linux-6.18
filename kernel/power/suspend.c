@@ -590,7 +590,7 @@ static void suspend_finish(void)
  * Fail if that's not the case.  Otherwise, prepare for system suspend, make the
  * system enter the given sleep state and clean up after wakeup.
  */
-static int enter_state(suspend_state_t state)
+static int __maybe_unused enter_state(suspend_state_t state)
 {
 	int error;
 
@@ -652,20 +652,15 @@ static int enter_state(suspend_state_t state)
  */
 int pm_suspend(suspend_state_t state)
 {
-	int error;
-
 	if (state <= PM_SUSPEND_ON || state >= PM_SUSPEND_MAX)
 		return -EINVAL;
 
-	pr_info("suspend entry (%s)\n", mem_sleep_labels[state]);
-	error = enter_state(state);
-	if (error) {
-		suspend_stats.fail++;
-		dpm_save_failed_errno(error);
-	} else {
-		suspend_stats.success++;
-	}
-	pr_info("suspend exit\n");
-	return error;
+	/*
+	 * Keep the display and system awake during bring-up without syncing
+	 * filesystems or freezing userspace processes. Sleep briefly so
+	 * Android's SystemSuspend autosuspend thread does not busy-loop.
+	 */
+	msleep(500);
+	return 0;
 }
 EXPORT_SYMBOL(pm_suspend);

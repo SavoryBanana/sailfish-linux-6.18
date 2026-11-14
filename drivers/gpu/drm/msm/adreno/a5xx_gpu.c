@@ -660,12 +660,13 @@ static int a5xx_zap_shader_resume(struct msm_gpu *gpu)
 	/*
 	 * On Sailfish (MSM8996), GPU_GDSC, GPU_GX_GDSC, and vdd_gfx are
 	 * permanently uncollapsed, so the GPU and TrustZone PAS 13 never
-	 * power-collapse. Calling qcom_scm_set_remote_state(0, 13) triggers
-	 * a fatal TrustZone CNOC_ERROR.
+	 * power-collapse and RBBM_SECVID_TRUST_CNTL remains 0 (non-secure).
+	 * Return 1 so a5xx_hw_init() skips re-sending CP_SET_SECURE_MODE(0)
+	 * while PAS 13 is halted after initial boot.
 	 */
 	pr_info("%s: skipping zap-shader SCM resume on always-on GDSC\n",
 		gpu->name);
-	return 0;
+	return 1;
 }
 
 static int a5xx_zap_shader_init(struct msm_gpu *gpu)
@@ -744,7 +745,7 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
 
 	/* Enable fault detection */
 	gpu_write(gpu, REG_A5XX_RBBM_INTERFACE_HANG_INT_CNTL,
-		(1 << 30) | 0xFFFF);
+		(1 << 30) | 0x3FFFFF);
 
 	/* Turn on performance counters */
 	gpu_write(gpu, REG_A5XX_RBBM_PERFCTR_CNTL, 0x01);
@@ -939,6 +940,7 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
 
 	/* Set the ringbuffer address */
 	gpu_write64(gpu, REG_A5XX_CP_RB_BASE, gpu->rb[0]->iova);
+	gpu_write(gpu, REG_A5XX_CP_RB_WPTR, 0);
 
 	/*
 	 * If the microcode supports the WHERE_AM_I opcode then we can use that
@@ -999,6 +1001,8 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
 		a5xx_flush(gpu, gpu->rb[0], true);
 		if (!a5xx_idle(gpu, gpu->rb[0]))
 			return -EINVAL;
+	} else if (ret > 0) {
+		/* Already in non-secure mode on always-on GDSC */
 	} else if (ret == -ENODEV) {
 		/*
 		 * This device does not use zap shader (but print a warning
@@ -1437,6 +1441,10 @@ static int a5xx_pm_suspend(struct msm_gpu *gpu)
 		gpu_write(gpu, REG_A5XX_RBBM_BLOCK_SW_RESET_CMD, 0x003C0000);
 		gpu_write(gpu, REG_A5XX_RBBM_BLOCK_SW_RESET_CMD, 0x00000000);
 	}
+
+	gpu_write(gpu, REG_A5XX_RBBM_SW_RESET_CMD, 1);
+	gpu_read(gpu, REG_A5XX_RBBM_SW_RESET_CMD);
+	gpu_write(gpu, REG_A5XX_RBBM_SW_RESET_CMD, 0);
 
 	ret = msm_gpu_pm_suspend(gpu);
 	if (ret)

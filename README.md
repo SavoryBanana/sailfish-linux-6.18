@@ -20,11 +20,14 @@ This repository contains the complete board support package, device tree source,
 | **Crash Logging** | `pstore` / ramoops (`0x83500000`, 1 MB) | **Working** | `earlyramoops` console & `/sys/fs/pstore` accessible live |
 | **Battery & Charging** | PMI8994 Switch-Mode Charger & Fuel Gauge | **Working** | 1.5A fast charging, USB status, monotonic SoC & voltage reporting |
 | **GPU (3D)** | Freedreno Adreno 530 (`&gpu`, `&adreno_smmu`) | **Working** | Authentic OEM signed zap shader authenticated via TrustZone PAS; single-ring (`ring=0`) submission at 401.8 MHz; `/dev/dri/card1` & `/dev/dri/renderD128` active |
-| **Android 17 Userspace** | Android 17 AOSP GSI (`CP2A.260605.012`) | **Working** | `init`, `apexd`, `SurfaceFlinger`, and `bootanimation` running with hardware 3D acceleration |
-| **Mesa 25.2.8 Freedreno** | `libEGL_adreno.so`, `libGLESv2_adreno.so`, `libgallium_dri.so` | **Working** | Mainline Mesa 25.2.8 `gallium/freedreno` (`msm` KMD) powering Skia Ganesh GLES in `SurfaceFlinger` and `BootAnimation` |
+| **Android 17 Userspace** | Android 17 AOSP GSI (`DP11.261016.003`) | **Working** | `sys.boot_completed=1`; `init`, `apexd`, `zygote64`, `system_server`, `SurfaceFlinger`, `SystemUI`, and `QuickstepLauncher` homescreen running with hardware 3D acceleration |
+| **Mesa 25.2.8 Freedreno** | `libEGL_adreno.so`, `libGLESv2_adreno.so`, `libgallium_dri.so` | **Working** | Mainline Mesa 25.2.8 `gallium/freedreno` (`msm` KMD) powering Skia Ganesh GLES in `SurfaceFlinger`, `BootAnimation`, `SystemUI`, and `Launcher3` |
 | **Gralloc & Adreno Utils** | Open-source `libadreno_utils.so` + `ion_compat` DMA-BUF heap | **Working** | 64-pixel width (`1088` stride) & 32-pixel height alignment for Adreno 530 GMEM; `/dev/ion` compatibility bridge over `system-uncached` DMA-BUF heap |
-| **VINTF Compatibility** | Custom HIDL Manifest Fragment (`android.hardware.graphics.xml`) | **Working** | Declares `composer@2.1` & `allocator@2.0` with `hwbinder` transport, satisfying Android 17 `hwservicemanager` |
-| **Display HAL & Scanout** | `hwcomposer.msm8996` + `libsdm_shim` + DRM/KMS `msm_submit_retire` | **Working** | Live hardware-rendered `BootAnimation` scanning out to the physical 1080x1920 AMOLED panel and `screencap` capturing valid PNGs |
+| **VINTF Compatibility** | Custom HIDL & AIDL Manifests (`graphics`, `power`, `sensors`) | **Working** | Declares `composer@2.1`, `allocator@2.0`, AIDL `IPower` V7, and `ISensors` V3, satisfying Android 17 `hwservicemanager` & `servicemanager` |
+| **Display HAL & Scanout** | `hwcomposer.msm8996` + `libsdm_shim` + DRM/KMS `msm_submit_retire` | **Working** | Live hardware-rendered `BootAnimation`, `SystemUI`, and `QuickstepLauncher` homescreen scanning out to the physical 1080x1920 AMOLED panel and `screencap` capturing valid PNGs |
+| **Power & Sensors AIDL HALs** | `android.hardware.power.IPower/default` (V7) & `ISensors/default` (V3) (`libbinder_ndk`) | **Working** | Custom NDK AIDL daemons satisfying Android 17 `HintManagerService` and `SensorService` on startup |
+| **SELinux & BPF (`bpffs`)** | Dynamic `fs_bpf_*` subdirectory labeling + permissive `libselinux` check bypass | **Working** | Unblocks Android 17 `netbpfload`, `netd`, `keystore2`, and `aconfigd` |
+| **Audio / HIDL / FRP Shims** | In-memory patched `libaudiobase.so` & `libhidlbase.so` + `/dev/block/loop95` FRP block device | **Working** | Eliminates 60s `AudioService` watchdog, infinite `gatekeeperd`/`SoundTrigger` HIDL waits, and `PersistentDataBlockService` cold-boot errors |
 
 ---
 
@@ -121,7 +124,7 @@ This repository contains the complete board support package, device tree source,
      - Userspace DRI nodes `/dev/dri/card1` and `/dev/dri/renderD128` query cleanly through DRM UAPI (`msm` v1.13.0) without hardware access faults (`NOC_ERROR`).
 
 9. **Android 17 Userspace Architecture & APEX Loop Subsystem:**
-   - **Booting Official AOSP GSI:** Booting Google's official Android 17 Generic System Image (`CP2A.260605.012-15430684`) on physical Pixel 1 hardware using Linux Kernel 6.18.
+   - **Booting Official AOSP GSI:** Booting Google's official Android 17 Generic System Image (`DP11.261016.003-16708287`) on physical Pixel 1 hardware using Linux Kernel 6.18.
    - **Initramfs Setup ([`tools/sailfish/init.c`](file:///home/patrick-donghil/Desktop/Kernel%20Project/tools/sailfish/init.c)):**
      - Pre-allocates 96 loop block devices (`/dev/loop0`..`/dev/loop95`).
      - Activates BinderFS (`/dev/binderfs` with nodes `binder`, `hwbinder`, `vndbinder`) mounted at `/dev/binderfs` and symlinked into `/dev/`.
@@ -175,6 +178,14 @@ This repository contains the complete board support package, device tree source,
     - **Namespace Mount Propagation (`fs/namespace.c`):** Fixed root mount propagation so child namespaces properly inherit root mounts during Android `pivot_root`.
     - **Reboot Interception (`kernel/pid_namespace.c`):** Intercepted child PID namespace reboot requests from crashing processes during userspace bringup, preventing unintended device reboots.
     - **SELinux Permissive State Management (`security/selinux/`):** Added a fake enforcing state handler and context transition fallbacks for `vendor_init` to maintain stability during boot debugging.
+
+15. **Android 17 Full Framework, SystemUI & Launcher3 Bring-Up (`sys.boot_completed=1`):**
+    - **Adreno A530 Resume & Devfreq Locking (`drivers/gpu/drm/msm/adreno/a5xx_gpu.c`, `drivers/gpu/drm/msm/msm_gpu_devfreq.c`):** Returned `1` in `a5xx_zap_shader_resume()` to skip redundant `CP_SET_SECURE_MODE(0)` packets while TrustZone PAS 13 is halted on always-on GDSC, widened `REG_A5XX_RBBM_INTERFACE_HANG_INT_CNTL` (`0x3FFFFF`) to prevent false-positive hangcheck interrupts, reset `REG_A5XX_CP_RB_WPTR`, and locked Adreno A530 devfreq to `401.8 MHz` (`gpu_clamp_to_idle = false`) so rapid `SurfaceFlinger`, `SystemUI`, and `QuickstepLauncher` GLES passes never stall at `133 MHz`.
+    - **MDP5 Atomic Plane Pipe Tracking (`drivers/gpu/drm/msm/disp/mdp5/mdp5_pipe.c`, `drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c`, `drivers/gpu/drm/msm/msm_kms.c`):** Cleared stale `hwpipe`/`r_hwpipe` pointers via `mdp5_get_existing_global_state()`, skipped already-assigned right-hand pipes in `mdp5_pipe_assign()`, avoided releasing pipes reused on the same plane, returned `0` cleanly when `mdp5_pipe_release()` sees an unowned pipe, and returned `-EBUSY` from `msm_kms_pm_prepare()` to prevent system suspend from tearing down live display scanout.
+    - **Non-Freezing Kernel Suspend Stub (`kernel/power/suspend.c`):** Short-circuited `pm_suspend()` with an `msleep(500)` and clean `0` return instead of calling `enter_state()`, so Android's `SystemSuspend` loop never triggers `ksys_sync_helper()` or freezes userspace tasks while the display is active.
+    - **Custom NDK AIDL Power V7 & Sensors V3 HALs (`tools/sailfish/power_hal/`, `tools/sailfish/sensors_hal/`):** Implemented standalone `libbinder_ndk` daemons and VINTF framework manifest fragments (`tools/sailfish/android.hardware.power.xml`, `tools/sailfish/android.hardware.sensors.xml`) for `android.hardware.power.IPower/default` (V7, handling `getHintSessionPreferredRate`, `getSupportInfo`, and `createHintSessionWithConfig`) and `android.hardware.sensors.ISensors/default` (V3, reporting an empty sensor list in `getSensorsList`), unblocking `HintManagerService` and `SensorService`.
+    - **SELinux `bpffs` Subdirectory Contexts & `aconfigd` `/metadata` Storage (`security/selinux/hooks.c`, `security/selinux/ss/services.c`):** Synthesized `u:object_r:fs_bpf_<subdir>:s0` labels in `selinux_inode_getsecurity()` for `bpf` filesystem subdirectories and prioritized `genfscon` lookups for `SE_SBGENFS` filesystems in `security_fs_use()`, unblocking `netbpfload` and `netd`; mounted a writable `0755` tmpfs on `/metadata` so `aconfigd-system` populates feature flag storage for `AdvancedProtectionService`.
+    - **Zero-Wait `libaudiobase.so`, `libhidlbase.so`, `libselinux.so` & Filtered Vendor VINTF/Permissions (`tools/sailfish/init.c`):** Applied in-memory binary patches and bind-mounts for `libaudiobase.so` (skipping 60s `AudioSystem`/`mediautils` service waits), `libhidlbase.so` (forcing `retry=false` in `getRawServiceInternal` so `gatekeeperd` and `SoundTriggerMiddlewareService` never hang), and `libselinux.so` (`selinux_check_access() -> 0` for `keystore2`); replaced `/vendor/etc/vintf/manifest.xml` with an active-only manifest (`allocator@2.0`, `composer@2.1`, `mapper@2.0`/`2.1`, `health@2.0`, `power@1.1`, `renderscript@1.0`); filtered `*nfc*`/`*mifare*` feature XMLs and masked `/apex/com.android.nfcservices/priv-app` to eliminate `com.android.nfc` (`NfcNciApex`) crash-loops; provisioned a zeroed 512 KB `/dev/block/loop95` FRP block device; and set `ro.hw_timeout_multiplier=10`.
 
 ---
 
@@ -242,52 +253,17 @@ Boot directly from host RAM without overwriting your device's flash:
    ```bash
    fastboot boot out/boot.img
    ```
+   All graphics shims (Mesa 25.2.8 Freedreno, `libadreno_utils.so`, `libsdm_shim.so`), custom AIDL `power_hal` / `sensors_hal` daemons, VINTF manifests, framework library patches (`libaudiobase.so`, `libhidlbase.so`, `libselinux.so`), MDSS sysfs mock nodes, `/dev/block/loop95` FRP backing, and `qservice_daemon` are **100% automated** by `/init` in `out/boot.img` on boot. The device boots directly into `BootAnimation`, completes `sys.boot_completed=1`, and brings up `SystemUI` and the Android 17 Launcher (`QuickstepLauncher`).
 
 3. **Access the Android Root Shell:**
    Connect over USB CDC-ACM serial console:
    ```bash
    sudo picocom -b 115200 /dev/ttyACM0
    ```
-   The initramfs automatically mounts loop APEX packages, starts Android `init` (`/system/bin/init`), and provides a root shell inside Android's PID/mount namespaces:
+   The initramfs automatically mounts APEX packages, configures the automated compatibility overlays, starts Android `init` (`/system/bin/init`), and opens an interactive root shell inside Android's PID/mount namespaces:
    ```text
    sailfish:/ #
    ```
-
-4. **Deploy Graphics & Display HAL Shims:**
-   - **Install EGL Shim:**
-     ```bash
-     base64 -d tools/sailfish/egl_shim/shim.b64 > /data/libEGL_adreno.so
-     mount -o bind /data/libEGL_adreno.so /vendor/lib64/egl/libEGL_adreno.so
-     mount -o bind /data/libEGL_adreno.so /vendor/lib64/egl/libGLESv2_adreno.so
-     ```
-   - **Deploy VINTF Manifest:**
-     ```bash
-     cat tools/sailfish/android.hardware.graphics.xml > /system/etc/vintf/manifest/android.hardware.graphics.xml
-     killall -9 hwservicemanager
-     ```
-   - **Start Vendor Binder & Display QService:**
-     ```bash
-     /vendor/bin/vndservicemanager /dev/vndbinder &
-     base64 -d tools/sailfish/qservice_daemon/qservice.b64 > /data/qservice_daemon
-     chmod +x /data/qservice_daemon
-     /data/qservice_daemon &
-     ```
-   - **Setup Qualcomm MDP Sysfs Simulation (Caps & Panel Info):**
-     ```bash
-     mkdir -p /sys/devices/virtual/graphics/fb0/mdp
-     printf "hw_rev=268894210\nmax_upscale_ratio=20\nmax_downscale_ratio=4\nmax_bandwidth_low=9600000000\nmax_bandwidth_high=9600000000\nmax_pipe_bandwidth=2500000000\nmax_sde_clk=412500000\nclk_fudge_factor=105 100\nscale_factor=1\nxtra_ff_factor=1\nblending_stages=4\nfeatures=qseed3,ubwc,src_split\npipe_count=10\npipe_type=vig pipe_ndx=1 rects=1\npipe_type=vig pipe_ndx=2 rects=1\npipe_type=vig pipe_ndx=3 rects=1\npipe_type=vig pipe_ndx=4 rects=1\npipe_type=dma pipe_ndx=5 rects=1\npipe_type=dma pipe_ndx=6 rects=1\npipe_type=dma pipe_ndx=7 rects=1\npipe_type=dma pipe_ndx=8 rects=1\npipe_type=cursor pipe_ndx=9 rects=1\npipe_type=cursor pipe_ndx=10 rects=1\n" > /sys/devices/virtual/graphics/fb0/mdp/caps
-     printf "panel_name=s6e3fa5_cmd\nxres=1080\nyres=1920\nbpp=24\ntype=mipi dsi cmd panel\nfps=60\n" > /sys/devices/virtual/graphics/fb0/msm_fb_panel_info
-     printf "mipi dsi cmd panel\n" > /sys/devices/virtual/graphics/fb0/msm_fb_type
-     printf "1\n" > /sys/devices/virtual/graphics/fb0/connected
-     printf "0\n" > /sys/devices/virtual/graphics/fb0/msm_fb_split
-     chmod 666 /dev/fb* /dev/graphics/* /dev/dri/* 2>/dev/null
-     ```
-   - **Launch Graphics HAL & SurfaceFlinger:**
-     ```bash
-     /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service &
-     /vendor/bin/hw/android.hardware.graphics.composer@2.1-service &
-     /system/bin/surfaceflinger &
-     ```
 
 ---
 
@@ -296,7 +272,7 @@ Boot directly from host RAM without overwriting your device's flash:
 When restoring the phone back to stock Android 10 and returning later to resume kernel bringup:
 1. **Stock Android 10:** Flash stock factory image if needed.
 2. **Resuming Android 17 / Kernel 6.18:**
-   - Boot modern Kernel 6.18:
+   - Boot modern Kernel 6.18 (from host RAM or flashed to `boot`):
      ```bash
      fastboot boot out/boot.img
      ```
@@ -304,6 +280,5 @@ When restoring the phone back to stock Android 10 and returning later to resume 
      ```bash
      sudo picocom -b 115200 /dev/ttyACM0
      ```
-   - Compatibility shims in `tools/sailfish/init.c` automatically bind Mesa 25.2.8 Freedreno (`libEGL_adreno.so`, `libGLESv2_adreno.so`, `libgallium_dri.so`) and `libadreno_utils.so`, modernize `vndservicemanager`, sync SELinux sha256 checksums, mount APEXes, and populate the MDSS sysfs mock architecture on early boot.
-   - Running `boot_android` from the `sailfish#` console automatically starts Android `init` and launches `/data/start_graphics.sh` (`vndservicemanager`, `qservice_daemon`, `allocator@2.0`, `composer@2.1`, `surfaceflinger`, and `bootanimation`) in the background once `property_service` comes online.
+   - Early setup in `tools/sailfish/init.c` automatically binds Mesa 25.2.8 Freedreno (`libEGL_adreno.so`, `libGLESv2_adreno.so`, `libgallium_dri.so`), `libadreno_utils.so`, and `libsdm_shim.so`, installs custom AIDL `power_hal` V7 and `sensors_hal` V3 services, deploys filtered VINTF manifests and runtime library patches, syncs SELinux sha256 checksums, mounts writable `/metadata` for `aconfigd`, populates MDSS sysfs mock nodes, and launches Android `init` with the background supervisor and `/data/start_graphics.sh` helper until `SystemUI` and `QuickstepLauncher` reach the homescreen.
 

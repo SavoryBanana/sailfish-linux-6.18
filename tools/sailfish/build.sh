@@ -103,7 +103,19 @@ chmod +x "$OUT_DIR/initramfs_root/tools/wrap_preload"
 
 cp "$SCRIPT_DIR/qservice_daemon/qservice_daemon" "$OUT_DIR/initramfs_root/tools/qservice_daemon"
 chmod +x "$OUT_DIR/initramfs_root/tools/qservice_daemon"
+
+"$SCRIPT_DIR/power_hal/build.sh"
+cp "$SCRIPT_DIR/power_hal/power_hal" "$OUT_DIR/initramfs_root/tools/power_hal"
+chmod +x "$OUT_DIR/initramfs_root/tools/power_hal"
+
+chmod +x "$SCRIPT_DIR/sensors_hal/build.sh"
+"$SCRIPT_DIR/sensors_hal/build.sh"
+cp "$SCRIPT_DIR/sensors_hal/sensors_hal" "$OUT_DIR/initramfs_root/tools/sensors_hal"
+chmod +x "$OUT_DIR/initramfs_root/tools/sensors_hal"
+
 cp "$SCRIPT_DIR/android.hardware.graphics.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.graphics.xml"
+cp "$SCRIPT_DIR/android.hardware.power.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.power.xml"
+cp "$SCRIPT_DIR/android.hardware.sensors.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.sensors.xml"
 if [ -f "$SCRIPT_DIR/setup_composer_sysfs.sh" ]; then
     cp "$SCRIPT_DIR/setup_composer_sysfs.sh" "$OUT_DIR/initramfs_root/tools/setup_composer_sysfs.sh"
     chmod +x "$OUT_DIR/initramfs_root/tools/setup_composer_sysfs.sh"

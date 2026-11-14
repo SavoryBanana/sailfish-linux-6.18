@@ -24,6 +24,13 @@ static int msm_devfreq_target(struct device *dev, unsigned long *freq,
 	struct dev_pm_opp *opp;
 
 	/*
+	 * Keep Adreno 530 at its nominal fast_rate (401.8 MHz) during bring-up
+	 * so RenderEngine and SurfaceFlinger do not stall at 133 MHz.
+	 */
+	if (gpu->fast_rate)
+		*freq = gpu->fast_rate;
+
+	/*
 	 * Note that devfreq_recommended_opp() can modify the freq
 	 * to something that actually is in the opp table:
 	 */
@@ -154,6 +161,7 @@ void msm_devfreq_init(struct msm_gpu *gpu)
 	 */
 	priv->gpu_devfreq_config.upthreshold = 50;
 	priv->gpu_devfreq_config.downdifferential = 10;
+	priv->gpu_clamp_to_idle = false;
 
 	mutex_init(&df->lock);
 	df->suspended = true;
