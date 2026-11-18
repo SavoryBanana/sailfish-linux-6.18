@@ -4,11 +4,20 @@
  * Author: Rob Clark <robdclark@gmail.com>
  */
 
+#include <linux/atomic.h>
 #include <linux/dma-fence-unwrap.h>
 #include <linux/file.h>
+#include <linux/jiffies.h>
+#include <linux/mutex.h>
+#include <linux/prefetch.h>
+#include <linux/sched.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/sync_file.h>
 #include <linux/uaccess.h>
+#include <linux/workqueue.h>
 #include <linux/fb.h>
+#include <asm/cacheflush.h>
 
 #include <drm/drm_drv.h>
 #include <drm/drm_fb_helper.h>
@@ -20,6 +29,10 @@
 #include "msm_gem.h"
 #include "msm_gpu_trace.h"
 #include "msm_syncobj.h"
+#undef ROP_COPY
+#undef ROP_XOR
+#include "adreno/adreno_gpu.h"
+#include "a5xx.xml.h"
 
 /* For userspace errors, use DRM_UT_DRIVER.. so that userspace can enable
  * error msgs for debugging, but we don't spam dmesg by default
@@ -533,65 +546,439 @@ static void submit_cleanup(struct msm_gem_submit *submit, bool error)
 		msm_submit_retire(submit);
 }
 
-void msm_submit_retire(struct msm_gem_submit *submit)
+static DEFINE_MUTEX(retire_fb_lock);
+static DEFINE_SPINLOCK(retire_scanout_lock);
+static unsigned long last_sf_retire_jiffies;
+static atomic_t sf_has_retired = ATOMIC_INIT(0);
+static struct drm_gem_object *pending_scanout_obj;
+static struct drm_device *pending_scanout_dev;
+static u32 pending_scanout_seqno;
+
+static inline u64 retire_swap_xrgb64(u64 p)
 {
-	bool scanned_out = false;
-	int i;
+	return (p & 0xff00ff00ff00ff00ULL) |
+	       ((p & 0x00ff000000ff0000ULL) >> 16) |
+	       ((p & 0x000000ff000000ffULL) << 16);
+}
 
-	for (i = submit->nr_bos - 1; i >= 0; i--) {
-		struct drm_gem_object *obj = submit->bos[i].obj;
-		struct drm_gpuvm_bo *vm_bo = submit->bos[i].vm_bo;
+static void retire_copy_xrgb_to_fb(void *src, void *dst,
+				   u32 src_stride, u32 dst_stride)
+{
+	u32 *s = (u32 *)src;
+	u32 *d = (u32 *)dst;
+	u32 y, x;
 
-		/* When Mesa Freedreno finishes rendering a full-screen 1080x1920
-		 * Android RGBA_8888 DMA-BUF, scan it out to the active DRM/KMS
-		 * framebuffer (XRGB8888) on the physical panel and trigger
-		 * drm_fb_helper_damage_area() so MDP5 flushes the DSI command-mode
-		 * panel on every frame.
-		 */
-		if (!scanned_out &&
-		    drm_gem_is_imported(obj) &&
-		    (submit->bos[i].flags & MSM_SUBMIT_BO_WRITE) &&
-		    obj->size >= 1080 * 1920 * 4 &&
-		    obj->size <= 9000000 &&
-		    submit->dev && submit->dev->fb_helper) {
-			struct drm_fb_helper *fbh = submit->dev->fb_helper;
-			if (fbh->info && fbh->info->screen_buffer) {
-				void *src = msm_gem_get_vaddr(obj);
-				if (!IS_ERR_OR_NULL(src)) {
-					u32 *s = (u32 *)src;
-					u32 *d = (u32 *)fbh->info->screen_buffer;
-					u32 dst_stride = fbh->info->fix.line_length ?
-							 (fbh->info->fix.line_length / 4) : 1080;
-					u32 src_stride = 1088;
-					uintptr_t cl, cl_end = (uintptr_t)src + (1088 * 1920 * 4);
-					u32 y, x;
-					for (cl = (uintptr_t)src & ~63UL; cl < cl_end; cl += 64)
-						asm volatile("dc civac, %0" :: "r"(cl) : "memory");
-					asm volatile("dsb ish" ::: "memory");
-					for (y = 0; y < 1920; y++) {
-						u64 *srow64 = (u64 *)(s + y * src_stride);
-						u64 *drow64 = (u64 *)(d + y * dst_stride);
-						for (x = 0; x < 1080 / 2; x++) {
-							u64 p = srow64[x];
-							drow64[x] = (p & 0xff00ff00ff00ff00ULL) |
-								    ((p & 0x00ff000000ff0000ULL) >> 16) |
-								    ((p & 0x000000ff000000ffULL) << 16);
-						}
-					}
-					msm_gem_put_vaddr(obj);
-					drm_fb_helper_damage_area(fbh->info, 0, 0, 1080, 1920);
-					scanned_out = true;
-					{
-						static int retire_scanout_cnt;
+#ifdef CONFIG_ARM64
+	/* Invalidate cached CPU lines for the imported DMA-BUF before reading GPU output. */
+	dcache_inval_poc((unsigned long)src,
+			 (unsigned long)src + (size_t)src_stride * 1920 * 4);
+#endif
+	for (y = 0; y < 1920; y++) {
+		const u64 *srow64 = (const u64 *)(s + (size_t)y * src_stride);
+		u64 *drow64 = (u64 *)(d + (size_t)y * dst_stride);
+
+		for (x = 0; x < 1080 / 2; x += 4) {
+			u64 p0, p1, p2, p3;
+
+			if (likely(x < 508)) {
+#ifdef CONFIG_ARM64
+				asm volatile("prfm pldl1strm, [%0]"
+					     :: "r"(&srow64[x + 32]));
+#else
+				prefetch(&srow64[x + 32]);
+#endif
+			}
+			p0 = srow64[x];
+			p1 = srow64[x + 1];
+			p2 = srow64[x + 2];
+			p3 = srow64[x + 3];
+			drow64[x] = retire_swap_xrgb64(p0);
+			drow64[x + 1] = retire_swap_xrgb64(p1);
+			drow64[x + 2] = retire_swap_xrgb64(p2);
+			drow64[x + 3] = retire_swap_xrgb64(p3);
+		}
+	}
+}
+
+/**
+ * retire_scanout_work_fn - Copy the latest retired display frame to fbdev.
+ * @work: Scheduled work item running on system_highpri_wq.
+ *
+ * Runs outside gpu->worker so RT fence retirement is not blocked by D-cache
+ * invalidation and CPU framebuffer copy. Only the newest pending frame is kept.
+ */
+static void retire_scanout_work_fn(struct work_struct *work)
+{
+	static int retire_scanout_cnt;
+
+	for (;;) {
+		struct drm_gem_object *obj;
+		struct drm_device *dev;
+		struct drm_fb_helper *fbh;
+		unsigned long flags;
+		u32 seqno;
+
+		spin_lock_irqsave(&retire_scanout_lock, flags);
+		obj = pending_scanout_obj;
+		dev = pending_scanout_dev;
+		seqno = pending_scanout_seqno;
+		pending_scanout_obj = NULL;
+		pending_scanout_dev = NULL;
+		spin_unlock_irqrestore(&retire_scanout_lock, flags);
+
+		if (!obj)
+			break;
+
+		fbh = dev ? dev->fb_helper : NULL;
+		if (fbh) {
+			mutex_lock(&retire_fb_lock);
+			if (fbh->info && fbh->info->screen_buffer &&
+			    fbh->info->state == FBINFO_STATE_RUNNING &&
+			    !msm_fbdev_is_blanked()) {
+				u32 dst_stride = fbh->info->fix.line_length ?
+						 (fbh->info->fix.line_length / 4) : 1080;
+				u32 src_stride = 1088;
+				size_t needed_dst = ((size_t)1919 * dst_stride + 1080) * 4;
+
+				if (dst_stride >= 1080 &&
+				    fbh->info->screen_size >= needed_dst) {
+					void *src = msm_gem_get_vaddr(obj);
+
+					if (!IS_ERR_OR_NULL(src)) {
+						retire_copy_xrgb_to_fb(src,
+								       fbh->info->screen_buffer,
+								       src_stride, dst_stride);
+						msm_gem_put_vaddr(obj);
+						drm_fb_helper_damage_area(fbh->info,
+									  0, 0, 1080, 1920);
 						if (retire_scanout_cnt < 5) {
-							pr_info("msm_submit_retire: scanned out frame %d (seqno=%u size=%zu)\n",
-								retire_scanout_cnt + 1, submit->seqno, obj->size);
+							pr_debug("msm_submit_retire: scanned out frame %d (seqno=%u size=%zu)\n",
+								 retire_scanout_cnt + 1, seqno,
+								 obj->size);
 							retire_scanout_cnt++;
 						}
 					}
 				}
 			}
+			mutex_unlock(&retire_fb_lock);
 		}
+
+		/* Drop GEM ref outside spinlock; final put may acquire sleeping locks. */
+		drm_gem_object_put(obj);
+	}
+}
+
+static DECLARE_WORK(retire_scanout_work, retire_scanout_work_fn);
+
+static void retire_queue_scanout(struct msm_gem_submit *submit,
+				 struct drm_gem_object *scanout_obj)
+{
+	struct drm_gem_object *old_obj;
+	unsigned long flags;
+
+	if (!submit->is_bootanim) {
+		WRITE_ONCE(last_sf_retire_jiffies, jiffies);
+		smp_wmb();
+		atomic_set(&sf_has_retired, 1);
+	}
+
+	drm_gem_object_get(scanout_obj);
+	spin_lock_irqsave(&retire_scanout_lock, flags);
+	old_obj = pending_scanout_obj;
+	pending_scanout_obj = scanout_obj;
+	pending_scanout_dev = submit->dev;
+	pending_scanout_seqno = submit->seqno;
+	spin_unlock_irqrestore(&retire_scanout_lock, flags);
+
+	if (old_obj)
+		drm_gem_object_put(old_obj);
+
+	/* Run at normal priority on unbound pool so display/compositor RT/UI threads aren't preempted. */
+	queue_work(system_unbound_wq, &retire_scanout_work);
+}
+
+static inline bool sf_recently_retired(void)
+{
+	unsigned long ts;
+
+	if (!atomic_read(&sf_has_retired))
+		return false;
+	smp_rmb();
+	ts = READ_ONCE(last_sf_retire_jiffies);
+	return time_before(jiffies, ts + 2 * HZ);
+}
+
+static bool is_scanout_candidate_bo(struct drm_gem_object *obj, uint32_t flags)
+{
+	return obj &&
+	       drm_gem_is_imported(obj) &&
+	       (flags & MSM_SUBMIT_BO_WRITE) &&
+	       obj->size >= (size_t)1088 * 1920 * 4 &&
+	       obj->size <= 9000000;
+}
+
+static struct drm_gem_object *find_scanout_bo_by_iova(struct msm_gem_submit *submit,
+						      u64 iova)
+{
+	unsigned int i;
+
+	if (!iova)
+		return NULL;
+
+	for (i = 0; i < submit->nr_bos; i++) {
+		struct drm_gem_object *cand = submit->bos[i].obj;
+		u64 bo_iova = submit->bos[i].iova;
+
+		if (!bo_iova || !is_scanout_candidate_bo(cand, submit->bos[i].flags))
+			continue;
+		if (iova >= bo_iova && iova < bo_iova + cand->size)
+			return cand;
+	}
+
+	return NULL;
+}
+
+static struct drm_gem_object *find_cmd_bo_by_iova(struct msm_gem_submit *submit,
+						  u64 iova, u32 size_dw,
+						  u32 *offset_dw)
+{
+	unsigned int i;
+	u64 byte_len = (u64)size_dw * 4;
+
+	if (!iova || !size_dw)
+		return NULL;
+
+	for (i = 0; i < submit->nr_bos; i++) {
+		struct drm_gem_object *obj = submit->bos[i].obj;
+		u64 bo_iova = submit->bos[i].iova;
+
+		if (!obj || !bo_iova || drm_gem_is_imported(obj))
+			continue;
+		if (iova >= bo_iova && byte_len <= obj->size &&
+		    iova - bo_iova <= obj->size - byte_len &&
+		    ((iova - bo_iova) & 3) == 0) {
+			*offset_dw = (u32)((iova - bo_iova) >> 2);
+			return obj;
+		}
+	}
+
+	return NULL;
+}
+
+struct pm4_scan_dbg {
+	u32 bad_pos;
+	u32 bad_hdr;
+	u32 reg_hit;
+	int vaddr_err;
+	bool aborted;
+};
+
+static struct drm_gem_object *scan_pm4_dwords(struct msm_gem_submit *submit,
+						struct drm_gem_object *host_obj,
+						const u32 *host_vaddr,
+						u32 offset_dw, u32 size_dw,
+						int depth,
+						struct pm4_scan_dbg *dbg);
+
+static struct drm_gem_object *scan_pm4_bo(struct msm_gem_submit *submit,
+					    struct drm_gem_object *cmd_obj,
+					    u32 offset_dw, u32 size_dw,
+					    int depth,
+					    struct pm4_scan_dbg *dbg)
+{
+	struct drm_gem_object *found;
+	void *vaddr;
+
+	if (!cmd_obj || !size_dw ||
+	    (u64)offset_dw + size_dw > cmd_obj->size / 4)
+		return NULL;
+
+	msm_gem_lock(cmd_obj);
+	vaddr = msm_gem_get_vaddr_active(cmd_obj);
+	msm_gem_unlock(cmd_obj);
+	if (IS_ERR_OR_NULL(vaddr)) {
+		if (dbg && !dbg->vaddr_err)
+			dbg->vaddr_err = vaddr ? PTR_ERR(vaddr) : -ENOMEM;
+		return NULL;
+	}
+
+	found = scan_pm4_dwords(submit, cmd_obj, vaddr, offset_dw, size_dw,
+				depth, dbg);
+	msm_gem_put_vaddr(cmd_obj);
+	return found;
+}
+
+static struct drm_gem_object *scan_pm4_dwords(struct msm_gem_submit *submit,
+						struct drm_gem_object *host_obj,
+						const u32 *host_vaddr,
+						u32 offset_dw, u32 size_dw,
+						int depth,
+						struct pm4_scan_dbg *dbg)
+{
+	const u32 dst_regs[] = {
+		REG_A5XX_RB_BLIT_DST_LO,
+		REG_A5XX_RB_MRT_BASE_LO(0),
+		REG_A5XX_RB_2D_DST_LO,
+	};
+	const u32 *pkt = host_vaddr + offset_dw;
+	struct drm_gem_object *found = NULL;
+	u32 pos = 0;
+
+	/*
+	 * Mesa Freedreno sets FD_RELOC_WRITE on all BOs in submit->bos[], so
+	 * walking bos[] picks sampled app layers (e.g. Launcher3) instead of
+	 * SurfaceFlinger's ClientTarget. Identify the true render target from
+	 * A5xx PM4 destination register writes instead.
+	 */
+	while (pos < size_dw) {
+		u32 hdr = pkt[pos];
+
+		if ((hdr & 0xf0000000U) == CP_TYPE4_PKT) {
+			u32 cnt = hdr & 0x7fU;
+			u32 reg = (hdr >> 8) & 0x3ffffU;
+			int r;
+
+			if (((hdr >> 7) & 1U) != PM4_PARITY(cnt) ||
+			    ((hdr >> 27) & 1U) != PM4_PARITY(reg) ||
+			    (u64)pos + 1 + cnt > size_dw) {
+				if (dbg && !dbg->aborted) {
+					dbg->aborted = true;
+					dbg->bad_pos = pos;
+					dbg->bad_hdr = hdr;
+				}
+				break;
+			}
+
+			for (r = 0; r < ARRAY_SIZE(dst_regs); r++) {
+				u32 lo_reg = dst_regs[r];
+
+				if (reg <= lo_reg && (u64)lo_reg + 1 < (u64)reg + cnt) {
+					u32 w = 1 + (lo_reg - reg);
+					u64 dst_iova = (u64)pkt[pos + w] |
+						       ((u64)pkt[pos + w + 1] << 32);
+					struct drm_gem_object *hit =
+						find_scanout_bo_by_iova(submit, dst_iova);
+
+					if (hit) {
+						found = hit;
+						if (dbg)
+							dbg->reg_hit = lo_reg;
+					}
+				}
+			}
+			pos += 1 + cnt;
+		} else if ((hdr & 0xf0000000U) == CP_TYPE7_PKT) {
+			u32 cnt = hdr & 0x7fffU;
+			u32 op = (hdr >> 16) & 0x7fU;
+
+			if ((hdr & 0x0f000000U) ||
+			    ((hdr >> 15) & 1U) != PM4_PARITY(cnt) ||
+			    ((hdr >> 23) & 1U) != PM4_PARITY(op) ||
+			    (u64)pos + 1 + cnt > size_dw) {
+				if (dbg && !dbg->aborted) {
+					dbg->aborted = true;
+					dbg->bad_pos = pos;
+					dbg->bad_hdr = hdr;
+				}
+				break;
+			}
+
+			if (depth == 0 && op == CP_INDIRECT_BUFFER_PFE && cnt == 3) {
+				u64 ib_iova = (u64)pkt[pos + 1] |
+					      ((u64)pkt[pos + 2] << 32);
+				u32 ib_sz = pkt[pos + 3] & 0x000fffffU;
+				u32 ib_off = 0;
+				struct drm_gem_object *ib_obj =
+					find_cmd_bo_by_iova(submit, ib_iova, ib_sz, &ib_off);
+				struct drm_gem_object *hit = NULL;
+
+				if (ib_obj == host_obj)
+					hit = scan_pm4_dwords(submit, host_obj, host_vaddr,
+							      ib_off, ib_sz, 1, dbg);
+				else if (ib_obj)
+					hit = scan_pm4_bo(submit, ib_obj, ib_off, ib_sz,
+							  1, dbg);
+
+				if (hit)
+					found = hit;
+			}
+			pos += 1 + cnt;
+		} else if (hdr == 0x80000000U) {
+			pos += 1;
+		} else {
+			if (dbg && !dbg->aborted) {
+				dbg->aborted = true;
+				dbg->bad_pos = pos;
+				dbg->bad_hdr = hdr;
+			}
+			break;
+		}
+	}
+
+	return found;
+}
+
+void msm_submit_retire(struct msm_gem_submit *submit)
+{
+	struct drm_gem_object *scanout_obj = NULL;
+	struct pm4_scan_dbg dbg = {};
+	int i;
+
+	if (submit->is_display_client &&
+	    submit->hw_fence && kref_read(&submit->hw_fence->refcount) > 0 &&
+	    submit->nr_cmds > 0 && submit->dev && submit->dev->fb_helper &&
+	    !msm_fbdev_is_blanked() &&
+	    !(submit->is_bootanim && sf_recently_retired())) {
+		unsigned int c, nr_cands = 0;
+
+		for (c = 0; c < submit->nr_cmds; c++) {
+			if ((submit->cmd[c].type == MSM_SUBMIT_CMD_BUF ||
+			     submit->cmd[c].type == MSM_SUBMIT_CMD_IB_TARGET_BUF) &&
+			    submit->cmd[c].idx < submit->nr_bos) {
+				struct drm_gem_object *cmd_obj =
+					submit->bos[submit->cmd[c].idx].obj;
+				struct drm_gem_object *hit =
+					scan_pm4_bo(submit, cmd_obj,
+						    submit->cmd[c].offset,
+						    submit->cmd[c].size, 0,
+						    &dbg);
+
+				if (hit)
+					scanout_obj = hit;
+			}
+		}
+
+		for (i = 0; i < submit->nr_bos; i++) {
+			if (is_scanout_candidate_bo(submit->bos[i].obj,
+						    submit->bos[i].flags))
+				nr_cands++;
+		}
+		if (nr_cands > 0) {
+			static int pm4_hit_cnt, pm4_miss_cnt;
+
+			if (scanout_obj && pm4_hit_cnt < 6) {
+				pm4_hit_cnt++;
+				pr_debug("msm_submit_retire: pm4 hit #%d seqno=%u bootanim=%d reg=0x%x cands=%u size=%zu\n",
+					 pm4_hit_cnt, submit->seqno,
+					 submit->is_bootanim, dbg.reg_hit,
+					 nr_cands, scanout_obj->size);
+			} else if (!scanout_obj && pm4_miss_cnt < 8) {
+				pm4_miss_cnt++;
+				pr_debug("msm_submit_retire: pm4 miss #%d seqno=%u bootanim=%d cmds=%u cands=%u verr=%d abort=%d pos=%u hdr=0x%08x\n",
+					 pm4_miss_cnt, submit->seqno,
+					 submit->is_bootanim, submit->nr_cmds,
+					 nr_cands, dbg.vaddr_err, dbg.aborted,
+					 dbg.bad_pos, dbg.bad_hdr);
+			}
+		}
+	}
+
+	if (scanout_obj)
+		retire_queue_scanout(submit, scanout_obj);
+
+	for (i = 0; i < submit->nr_bos; i++) {
+		struct drm_gem_object *obj = submit->bos[i].obj;
+		struct drm_gpuvm_bo *vm_bo = submit->bos[i].vm_bo;
 
 		msm_gem_lock(obj);
 		drm_gpuvm_bo_put(vm_bo);
@@ -667,6 +1054,14 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
 		ret = PTR_ERR(submit);
 		goto out_post_unlock;
 	}
+
+	submit->is_bootanim =
+		strstr(current->group_leader->comm, "bootanim") != NULL ||
+		strstr(current->group_leader->comm, "BootAnim") != NULL;
+	submit->is_display_client =
+		submit->is_bootanim ||
+		strcmp(current->comm, "RenderEngine") == 0 ||
+		strstr(current->group_leader->comm, "surfaceflinger") != NULL;
 
 	trace_msm_gpu_submit(pid_nr(submit->pid), ring->id, submit->ident,
 		args->nr_bos, args->nr_cmds);

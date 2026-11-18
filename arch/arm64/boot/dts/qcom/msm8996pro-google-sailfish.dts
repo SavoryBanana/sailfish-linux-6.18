@@ -13,6 +13,7 @@
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
+#include <dt-bindings/thermal/thermal.h>
 
 / {
 	model = "Google Pixel (Sailfish)";
@@ -114,6 +115,42 @@
 			debounce-interval = <15>;
 		};
 	};
+
+	vph_pwr: vph-pwr-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "vph_pwr";
+		regulator-min-microvolt = <3600000>;
+		regulator-max-microvolt = <3600000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	rome_vreg: rome-vreg {
+		compatible = "regulator-fixed";
+		regulator-name = "rome_vreg";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		startup-delay-us = <4000>;
+		gpio = <&pm8994_gpios 9 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		vin-supply = <&vph_pwr>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&rome_enable_default>;
+		regulator-always-on;
+	};
+
+	wlan_en: wlan-en-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan_en";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		startup-delay-us = <70000>;
+		gpio = <&pm8994_gpios 8 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		vin-supply = <&rome_vreg>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&wlan_en_default>;
+	};
 };
 
 &soc {
@@ -165,6 +202,14 @@
 		drive-strength = <2>;
 		bias-disable;
 		output-high;
+	};
+
+	cnss_bootstrap_default: cnss-bootstrap-default-state {
+		pins = "gpio46";
+		function = "gpio";
+		drive-strength = <16>;
+		bias-pull-down;
+		output-low;
 	};
 
 	/*
@@ -290,13 +335,13 @@
 	status = "disabled";
 };
 
-/* Keep CPU/CBF clocks at bootloader nominal rate until Kryo voltage regulators are configured */
+/* Enable Kryo CPU and CBF clocks alongside PM8994 S11 SAW regulator and CPU cooling maps */
 &kryocc {
-	status = "disabled";
+	status = "okay";
 };
 
 &cbf {
-	status = "disabled";
+	status = "okay";
 };
 
 &rng {
@@ -342,14 +387,30 @@
 
 &gpu {
 	/delete-property/ power-domains;
-	/delete-property/ interconnects;
-	/delete-property/ interconnect-names;
 	vdd-supply = <&vdd_gfx>;
 	status = "okay";
 
 	zap-shader {
 		firmware-name = "qcom/a530_zap_signed.mdt";
 	};
+};
+
+/*
+ * Keep CPU clocks within Pixel Sailfish's nominal CPR operating window
+ * (0.96V-1.015V, <= 1.59 GHz cluster0 / <= 1.90 GHz cluster1) since dynamic
+ * CPRh rail scaling is not active on mainline MSM8996.
+ */
+&cluster0_opp {
+	/delete-node/ opp-1996800000;
+	/delete-node/ opp-2188800000;
+};
+
+&cluster1_opp {
+	/delete-node/ opp-1977600000;
+	/delete-node/ opp-2054400000;
+	/delete-node/ opp-2150400000;
+	/delete-node/ opp-2246400000;
+	/delete-node/ opp-2342400000;
 };
 
 /*
@@ -361,6 +422,19 @@
 	/delete-node/ opp-624000000;
 	/delete-node/ opp-560000000;
 	/delete-node/ opp-510000000;
+
+	opp-401800000 {
+		opp-peak-kBps = <14432000>;
+	};
+	opp-315000000 {
+		opp-peak-kBps = <10368000>;
+	};
+	opp-214000000 {
+		opp-peak-kBps = <8136000>;
+	};
+	opp-133000000 {
+		opp-peak-kBps = <6400000>;
+	};
 };
 
 &mdss_dsi0 {
@@ -478,6 +552,13 @@
 	regulators-0 {
 		compatible = "qcom,rpm-pm8994-regulators";
 
+		vreg_s3a_1p3: s3 {
+			regulator-name = "vreg_s3a_1p3";
+			regulator-min-microvolt = <1300000>;
+			regulator-max-microvolt = <1300000>;
+			regulator-always-on;
+		};
+
 		vreg_s4a_1p8: s4 {
 			regulator-min-microvolt = <1800000>;
 			regulator-max-microvolt = <1800000>;
@@ -592,7 +673,34 @@
 	qcom,fast-charge-safe-current = <1500000>;
 	qcom,fast-charge-high-threshold-voltage = <4350000>;
 	qcom,fast-charge-safe-voltage = <4350000>;
+	usb-charge-current-limit = <1500000>;
+	qcom,disable-dc;
 	status = "okay";
+};
+
+&pm8994_spmi_regulators {
+	qcom,saw-reg = <&saw3>;
+
+	s8 {
+		qcom,saw-slave;
+	};
+
+	s9 {
+		qcom,saw-slave;
+	};
+
+	s10 {
+		qcom,saw-slave;
+	};
+
+	pm8994_s11: s11 {
+		qcom,saw-leader;
+		regulator-name = "pm8994_s11";
+		regulator-min-microvolt = <960000>;
+		regulator-max-microvolt = <1015000>;
+		regulator-max-step-microvolt = <150000>;
+		regulator-always-on;
+	};
 };
 
 &pmi8994_spmi_regulators {
@@ -608,5 +716,160 @@
 
 &mmcc {
 	vdd-gfx-supply = <&vdd_gfx>;
+};
+
+/ {
+	thermal-zones {
+		cpu0-thermal {
+			polling-delay = <1000>;
+			polling-delay-passive = <1000>;
+
+			trips {
+				cpu0_alert0: trip-point0 {
+					temperature = <82000>;
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu0_alert0>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu1-thermal {
+			polling-delay = <1000>;
+			polling-delay-passive = <1000>;
+
+			trips {
+				cpu1_alert0: trip-point0 {
+					temperature = <82000>;
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu1_alert0>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu2-thermal {
+			polling-delay = <1000>;
+			polling-delay-passive = <1000>;
+
+			trips {
+				cpu2_alert0: trip-point0 {
+					temperature = <82000>;
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu2_alert0>;
+					cooling-device = <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu3-thermal {
+			polling-delay = <1000>;
+			polling-delay-passive = <1000>;
+
+			trips {
+				cpu3_alert0: trip-point0 {
+					temperature = <82000>;
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu3_alert0>;
+					cooling-device = <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		gpu-top-thermal {
+			polling-delay = <1000>;
+			polling-delay-passive = <500>;
+
+			trips {
+				gpu1_alert0: trip-point0 {
+					temperature = <88000>;
+				};
+			};
+		};
+
+		gpu-bottom-thermal {
+			polling-delay = <1000>;
+			polling-delay-passive = <500>;
+
+			trips {
+				gpu2_alert0: trip-point0 {
+					temperature = <88000>;
+				};
+			};
+		};
+	};
+};
+
+&pm8994_gpios {
+	wlan_en_default: wlan-en-state {
+		pins = "gpio8";
+		function = PMIC_GPIO_FUNC_NORMAL;
+		output-low;
+		drive-push-pull;
+		bias-disable;
+		qcom,drive-strength = <PMIC_GPIO_STRENGTH_LOW>;
+		power-source = <PM8994_GPIO_S4>;
+	};
+
+	rome_enable_default: rome-enable-state {
+		pins = "gpio9";
+		function = PMIC_GPIO_FUNC_NORMAL;
+		output-high;
+		drive-push-pull;
+		bias-disable;
+		qcom,drive-strength = <PMIC_GPIO_STRENGTH_LOW>;
+		power-source = <PM8994_GPIO_VPH>;
+	};
+
+	rome_sleep_default: rome-sleep-state {
+		pins = "gpio18";
+		function = PMIC_GPIO_FUNC_FUNC2;
+		output-low;
+		drive-push-pull;
+		bias-disable;
+		qcom,drive-strength = <PMIC_GPIO_STRENGTH_MED>;
+		power-source = <PM8994_GPIO_S4>;
+	};
+
+	bt_en_default: bt-en-state {
+		pins = "gpio19";
+		function = PMIC_GPIO_FUNC_NORMAL;
+		output-low;
+		drive-push-pull;
+		bias-pull-down;
+		qcom,drive-strength = <PMIC_GPIO_STRENGTH_LOW>;
+		power-source = <PM8994_GPIO_S4>;
+	};
+};
+
+&pcie_phy {
+	vdda-phy-supply = <&vreg_l28a_0p925>;
+	vdda-pll-supply = <&vreg_l12a_1p8>;
+	status = "okay";
+};
+
+&pcie0 {
+	perst-gpios = <&tlmm 35 GPIO_ACTIVE_LOW>;
+	wake-gpios = <&tlmm 37 GPIO_ACTIVE_HIGH>;
+	vdda-supply = <&vreg_l28a_0p925>;
+	vddpe-3v3-supply = <&wlan_en>;
+	pinctrl-0 = <&pcie0_state_on &cnss_bootstrap_default &rome_sleep_default &bt_en_default>;
+	status = "okay";
 };
 

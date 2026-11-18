@@ -55,7 +55,7 @@ static int ion_compat_open(struct inode *inode, struct file *file)
 	idr_init(&client->idr);
 	spin_lock_init(&client->lock);
 	file->private_data = client;
-	pr_info("ion_compat: /dev/ion opened by pid %d (%s)\n", current->pid, current->comm);
+	pr_debug("ion_compat: /dev/ion opened by pid %d (%s)\n", current->pid, current->comm);
 	return 0;
 }
 
@@ -65,7 +65,7 @@ static int ion_compat_release(struct inode *inode, struct file *file)
 	struct dma_buf *dmabuf;
 	int id;
 
-	pr_info("ion_compat: /dev/ion closed by pid %d (%s)\n", current->pid, current->comm);
+	pr_debug("ion_compat: /dev/ion closed by pid %d (%s)\n", current->pid, current->comm);
 	if (client) {
 		idr_for_each_entry(&client->idr, dmabuf, id) {
 			dma_buf_put(dmabuf);
@@ -97,7 +97,7 @@ static long ion_compat_ioctl(struct file *file, unsigned int cmd, unsigned long 
 		return -ENOTTY;
 	}
 
-	pr_info("ion_compat: ioctl cmd=0x%08x (nr=%u dir=%u size=%u) from pid %d (%s)\n",
+	pr_debug("ion_compat: ioctl cmd=0x%08x (nr=%u dir=%u size=%u) from pid %d (%s)\n",
 		cmd, nr, dir, size, current->pid, current->comm);
 
 	switch (nr) {
@@ -130,7 +130,7 @@ static long ion_compat_ioctl(struct file *file, unsigned int cmd, unsigned long 
 			flags = d1.flags;
 		}
 
-		pr_info("ion_compat: ALLOC request: len=%zu align=%zu heap_mask=0x%x flags=0x%x (v2=%d)\n",
+		pr_debug("ion_compat: ALLOC request: len=%zu align=%zu heap_mask=0x%x flags=0x%x (v2=%d)\n",
 			len, align, heap_id_mask, flags, is_v2);
 
 		if (!len)
@@ -167,7 +167,7 @@ static long ion_compat_ioctl(struct file *file, unsigned int cmd, unsigned long 
 				dma_buf_put(dmabuf);
 				return -EFAULT;
 			}
-			pr_info("ion_compat: ALLOC success: len=%zu -> fd=%d\n", len, fd);
+			pr_debug("ion_compat: ALLOC success: len=%zu -> fd=%d\n", len, fd);
 			return 0;
 		} else {
 			int handle;
@@ -193,7 +193,7 @@ static long ion_compat_ioctl(struct file *file, unsigned int cmd, unsigned long 
 					return -EFAULT;
 				}
 			}
-			pr_info("ion_compat: ALLOC success: len=%zu -> handle=%d\n", len, handle);
+			pr_debug("ion_compat: ALLOC success: len=%zu -> handle=%d\n", len, handle);
 			return 0;
 		}
 	}
@@ -221,7 +221,7 @@ static long ion_compat_ioctl(struct file *file, unsigned int cmd, unsigned long 
 		}
 
 		dma_buf_put(dmabuf);
-		pr_info("ion_compat: FREE: handle %d freed\n", handle);
+		pr_debug("ion_compat: FREE: handle %d freed\n", handle);
 		return 0;
 	}
 	case 2:   /* ION_IOC_MAP */
@@ -262,7 +262,7 @@ static long ion_compat_ioctl(struct file *file, unsigned int cmd, unsigned long 
 		if (copy_to_user((char __user *)uarg + fd_offset, &fd, sizeof(fd)))
 			return -EFAULT;
 
-		pr_info("ion_compat: MAP/SHARE: handle %d -> fd %d\n", handle, fd);
+		pr_debug("ion_compat: MAP/SHARE: handle %d -> fd %d\n", handle, fd);
 		return 0;
 	}
 	case 5: { /* ION_IOC_IMPORT */
@@ -307,12 +307,12 @@ static long ion_compat_ioctl(struct file *file, unsigned int cmd, unsigned long 
 				return -EFAULT;
 		}
 
-		pr_info("ion_compat: IMPORT: fd %d -> handle %d\n", fd, handle);
+		pr_debug("ion_compat: IMPORT: fd %d -> handle %d\n", fd, handle);
 		return 0;
 	}
 	case 6:   /* ION_IOC_CUSTOM */
 	case 7: { /* ION_IOC_SYNC */
-		pr_info("ion_compat: SYNC/CUSTOM (nr=%u) no-op\n", nr);
+		pr_debug("ion_compat: SYNC/CUSTOM (nr=%u) no-op\n", nr);
 		return 0;
 	}
 	default:

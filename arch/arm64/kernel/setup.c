@@ -172,8 +172,12 @@ static void __init early_fb_bar(int start_line, int num_lines, u32 color)
 {
 	phys_addr_t fb_phys = 0xC0000000 + (phys_addr_t)start_line * 1080 * 3;
 	size_t size = (size_t)num_lines * 1080 * 3;
+#ifdef CONFIG_ARCH_USE_MEMREMAP_PROT
 	u8 *fb = early_memremap_prot(fb_phys, size,
 				     pgprot_val(pgprot_writecombine(PAGE_KERNEL)));
+#else
+	u8 *fb = early_memremap(fb_phys, size);
+#endif
 	void __iomem *ctl0;
 
 	if (fb) {

@@ -1976,6 +1976,42 @@ static int qcom_pcie_probe(struct platform_device *pdev)
 		goto err_phy_exit;
 	}
 
+	if (!dw_pcie_link_up(pci)) {
+		u16 exp_cap = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
+		u16 lnkctl = exp_cap ? dw_pcie_readw_dbi(pci, exp_cap + PCI_EXP_LNKCTL) : 0;
+		u16 lnksta = exp_cap ? dw_pcie_readw_dbi(pci, exp_cap + PCI_EXP_LNKSTA) : 0;
+		u32 lnkcap = exp_cap ? dw_pcie_readl_dbi(pci, exp_cap + PCI_EXP_LNKCAP) : 0;
+		u32 dbg0 = dw_pcie_readl_dbi(pci, PCIE_PORT_DEBUG0);
+		struct qcom_pcie_port *dbg_port;
+
+		dev_info(dev,
+			 "PCIe debug: ltssm=0x%02x PARF_LTSSM=0x%08x SYS_CTRL=0x%08x PM_CTRL=0x%08x PHY_CTRL=0x%08x DBG0=0x%08x DBG1=0x%08x LNKCAP=0x%08x LNKCTL=0x%04x LNKSTA=0x%04x\n",
+			 dbg0 & 0x3f,
+			 readl(pcie->parf + PARF_LTSSM),
+			 readl(pcie->parf + PARF_SYS_CTRL),
+			 readl(pcie->parf + PARF_PM_CTRL),
+			 readl(pcie->parf + PARF_PHY_CTRL),
+			 dbg0,
+			 dw_pcie_readl_dbi(pci, PCIE_PORT_DEBUG1),
+			 lnkcap, lnkctl, lnksta);
+
+		list_for_each_entry(dbg_port, &pcie->ports, list) {
+			dev_info(dev, "PCIe debug: perst_gpio_logical=%d\n",
+				 dbg_port->reset ? gpiod_get_value_cansleep(dbg_port->reset) : -1);
+		}
+
+		if (pcie->cfg == &cfg_2_3_2) {
+			struct qcom_pcie_resources_2_3_2 *res232 = &pcie->res.v2_3_2;
+			int i;
+
+			for (i = 0; i < res232->num_clks; i++) {
+				dev_info(dev, "PCIe debug: clk[%d] %s rate=%lu\n",
+					 i, res232->clks[i].id,
+					 clk_get_rate(res232->clks[i].clk));
+			}
+		}
+	}
+
 	qcom_pcie_icc_opp_update(pcie);
 
 	if (pcie->mhi)

@@ -113,6 +113,26 @@ chmod +x "$SCRIPT_DIR/sensors_hal/build.sh"
 cp "$SCRIPT_DIR/sensors_hal/sensors_hal" "$OUT_DIR/initramfs_root/tools/sensors_hal"
 chmod +x "$OUT_DIR/initramfs_root/tools/sensors_hal"
 
+# Stage QCA6174 ath10k firmware & regulatory database in both /tools/firmware (survives vendor mount)
+# and /lib/firmware (early pre-mount fallback).
+mkdir -p "$OUT_DIR/initramfs_root/tools/firmware/ath10k/QCA6174/hw3.0" \
+         "$OUT_DIR/initramfs_root/lib/firmware/ath10k/QCA6174/hw3.0"
+for fw in firmware-6.bin board-2.bin board.bin; do
+    zstd -d -f -c "/lib/firmware/ath10k/QCA6174/hw3.0/$fw.zst" \
+        > "$OUT_DIR/initramfs_root/tools/firmware/ath10k/QCA6174/hw3.0/$fw"
+    cp "$OUT_DIR/initramfs_root/tools/firmware/ath10k/QCA6174/hw3.0/$fw" \
+       "$OUT_DIR/initramfs_root/lib/firmware/ath10k/QCA6174/hw3.0/$fw"
+done
+for reg in regulatory.db regulatory.db.p7s; do
+    if [ -f "/lib/firmware/$reg" ]; then
+        cp "/lib/firmware/$reg" "$OUT_DIR/initramfs_root/tools/firmware/$reg"
+        cp "/lib/firmware/$reg" "$OUT_DIR/initramfs_root/lib/firmware/$reg"
+    fi
+done
+
+# Generate static RRO APK enabling Android 17 mainline wpa_supplicant in com.android.wifi.resources
+python3 "$SCRIPT_DIR/wifi_overlay/build_wifi_overlay.py" "$OUT_DIR/initramfs_root/tools/SailfishWifiOverlay.apk"
+
 cp "$SCRIPT_DIR/android.hardware.graphics.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.graphics.xml"
 cp "$SCRIPT_DIR/android.hardware.power.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.power.xml"
 cp "$SCRIPT_DIR/android.hardware.sensors.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.sensors.xml"
@@ -172,7 +192,7 @@ python3 "$SCRIPT_DIR/mkbootimg.py" \
   --ramdisk_offset 0x02800000 \
   --tags_offset 0x02600000 \
   --pagesize 4096 \
-  --cmdline "console=ramoops0 console=tty0 keep_bootcon androidboot.hardware=sailfish androidboot.debuggable=1 androidboot.selinux=permissive androidboot.veritymode=disabled root=/dev/ram0 rw rdinit=/init init=/init clk_ignore_unused pd_ignore_unused firmware_class.path=/vendor/firmware initcall_debug iommu.passthrough=1 audit=0" \
+  --cmdline "console=ramoops0 console=tty0 keep_bootcon androidboot.hardware=sailfish androidboot.debuggable=1 androidboot.selinux=permissive androidboot.veritymode=disabled root=/dev/ram0 rw rdinit=/init init=/init clk_ignore_unused pd_ignore_unused firmware_class.path=/vendor/firmware,/tools/firmware initcall_debug iommu.passthrough=1 pcie_aspm=off audit=0" \
   -o "$OUT_DIR/boot.img"
 
 echo "=== Build Complete: out/boot.img ($(ls -lh "$OUT_DIR/boot.img" | awk '{print $5}')) ==="

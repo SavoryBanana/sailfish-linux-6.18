@@ -85,8 +85,8 @@ static int ea8064tg_on(struct ea8064tg_panel *ctx)
 	/* 0x53: Write control display (0x20 = brightness via DCS) */
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY, 0x20);
 
-	/* 0x51: Write initial display brightness (180/255) */
-	mipi_dsi_dcs_set_display_brightness_multi(&dsi_ctx, 180);
+	/* 0x51: Write initial display brightness (96/255) */
+	mipi_dsi_dcs_set_display_brightness_multi(&dsi_ctx, 96);
 
 	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
 
@@ -209,7 +209,7 @@ static struct backlight_device *ea8064tg_create_backlight(struct mipi_dsi_device
 	struct device *dev = &dsi->dev;
 	const struct backlight_properties props = {
 		.type = BACKLIGHT_PLATFORM,
-		.brightness = 180,
+		.brightness = 96,
 		.max_brightness = 255,
 	};
 

@@ -268,9 +268,11 @@ struct drm_framebuffer * msm_alloc_stolen_fb(struct drm_device *dev,
 #ifdef CONFIG_DRM_MSM_KMS_FBDEV
 int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
 				 struct drm_fb_helper_surface_size *sizes);
+bool msm_fbdev_is_blanked(void);
 #define MSM_FBDEV_DRIVER_OPS \
 	.fbdev_probe = msm_fbdev_driver_fbdev_probe
 #else
+static inline bool msm_fbdev_is_blanked(void) { return false; }
 #define MSM_FBDEV_DRIVER_OPS \
 	.fbdev_probe = NULL
 #endif

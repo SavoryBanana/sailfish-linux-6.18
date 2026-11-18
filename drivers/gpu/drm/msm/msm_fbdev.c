@@ -4,6 +4,7 @@
  * Author: Rob Clark <robdclark@gmail.com>
  */
 
+#include <linux/atomic.h>
 #include <linux/fb.h>
 
 #include <drm/drm_drv.h>
@@ -82,13 +83,30 @@ static int msm_fbdev_ioctl(struct fb_info *info, unsigned int cmd, unsigned long
 	return drm_fb_helper_ioctl(info, cmd, arg);
 }
 
+static atomic_t msm_fbdev_blanked = ATOMIC_INIT(0);
+
+bool msm_fbdev_is_blanked(void)
+{
+	return atomic_read(&msm_fbdev_blanked) != 0;
+}
+
+static int msm_fbdev_blank(int blank, struct fb_info *info)
+{
+	int ret;
+
+	ret = drm_fb_helper_blank(blank, info);
+	if (!ret)
+		atomic_set(&msm_fbdev_blanked, blank != FB_BLANK_UNBLANK);
+	return ret;
+}
+
 static const struct fb_ops msm_fb_ops = {
 	.owner = THIS_MODULE,
 	__FB_DEFAULT_DEFERRED_OPS_RDWR(msm_fbdev),
 	.fb_check_var	= drm_fb_helper_check_var,
 	.fb_set_par	= drm_fb_helper_set_par,
 	.fb_setcmap	= drm_fb_helper_setcmap,
-	.fb_blank	= drm_fb_helper_blank,
+	.fb_blank	= msm_fbdev_blank,
 	.fb_pan_display	= drm_fb_helper_pan_display,
 	.fb_debug_enter = drm_fb_helper_debug_enter,
 	.fb_debug_leave = drm_fb_helper_debug_leave,

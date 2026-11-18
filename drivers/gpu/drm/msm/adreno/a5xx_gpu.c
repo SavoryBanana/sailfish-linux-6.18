@@ -257,7 +257,7 @@ static void a5xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 	{
 		static int submit_log_cnt;
 		if (submit_log_cnt < 25) {
-			pr_info("a5xx_submit: seqno=%u ring=%d nr_cmds=%u ibs=%u\n",
+			pr_debug("a5xx_submit: seqno=%u ring=%d nr_cmds=%u ibs=%u\n",
 				submit->seqno, ring->id, submit->nr_cmds, ibs);
 			submit_log_cnt++;
 		}
@@ -1315,7 +1315,7 @@ static irqreturn_t a5xx_irq(struct msm_gpu *gpu)
 	if (status & A5XX_RBBM_INT_0_MASK_CP_CACHE_FLUSH_TS) {
 		static int irq_log_cnt;
 		if (irq_log_cnt < 15) {
-			pr_info("a5xx_irq: CACHE_FLUSH_TS fence=%u scratch2=%u\n",
+			pr_debug("a5xx_irq: CACHE_FLUSH_TS fence=%u scratch2=%u\n",
 				gpu->rb[0]->memptrs->fence,
 				gpu_read(gpu, REG_A5XX_CP_SCRATCH_REG(2)));
 			irq_log_cnt++;

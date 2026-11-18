@@ -26,9 +26,11 @@
 #include <sys/sysmacros.h>
 #include <sys/xattr.h>
 #include <sched.h>
+#include <linux/fscrypt.h>
 
 static int g_ttygs_fd = -1;
 static bool g_usb_bound = false;
+static bool g_data_persistent = false;
 
 static void write_str(const char *path, const char *val) {
     int fd = open(path, O_WRONLY);
@@ -118,9 +120,14 @@ static void open_ttygs_if_ready(void) {
             "\r\n======================================================\r\n"
             "  Google Pixel (sailfish) - Linux 6.18 USB Shell\r\n"
             "  Type 'help' for commands, 'bootloader' for fastboot\r\n"
-            "======================================================\r\n"
-            "sailfish# ";
+            "======================================================\r\n";
         write(g_ttygs_fd, banner, strlen(banner));
+        if (access("/sys/fs/pstore/console-ramoops-0", F_OK) == 0 ||
+            access("/sys/fs/pstore/dmesg-ramoops-0", F_OK) == 0) {
+            const char *pmsg = "[!] Previous crash log found in /sys/fs/pstore (run 'ramoops')\r\n";
+            write(g_ttygs_fd, pmsg, strlen(pmsg));
+        }
+        write(g_ttygs_fd, "sailfish# ", 10);
     }
 }
 
@@ -319,7 +326,7 @@ static void dump_file_lines(const char *path, int max_lines, const char *filter,
     fclose(fp);
 }
 
-static void dump_dmesg_filtered(int max_lines, const char *filter) {
+static void dump_dmesg_any(int max_lines, const char *const *filters, int nfilters) {
     int fd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
     if (fd < 0) {
         usb_write("[-] Cannot open /dev/kmsg\n");
@@ -340,8 +347,17 @@ static void dump_dmesg_filtered(int max_lines, const char *filter) {
         buf[n] = '\0';
         char *semi = strchr(buf, ';');
         const char *msg = semi ? semi + 1 : buf;
-        if (filter && *filter && !strcasestr(msg, filter))
-            continue;
+        if (filters && nfilters > 0) {
+            bool matched = false;
+            for (int i = 0; i < nfilters; i++) {
+                if (filters[i] && filters[i][0] && strcasestr(msg, filters[i])) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched)
+                continue;
+        }
 
         unsigned long long usec = 0;
         unsigned int prio = 0;
@@ -356,6 +372,13 @@ static void dump_dmesg_filtered(int max_lines, const char *filter) {
         count++;
     }
     close(fd);
+}
+
+static void dump_dmesg_filtered(int max_lines, const char *filter) {
+    if (filter && *filter)
+        dump_dmesg_any(max_lines, &filter, 1);
+    else
+        dump_dmesg_any(max_lines, NULL, 0);
 }
 
 static bool setup_usb_gadget(void) {
@@ -974,6 +997,16 @@ static void dump_battery_info(void) {
         snprintf(out, sizeof(out), "  Battery Health: %s\n", val);
         usb_write(out);
     }
+    snprintf(path, sizeof(path), "%s/present", bat);
+    if (read_first_line(path, val, sizeof(val))) {
+        snprintf(out, sizeof(out), "  Battery Present: %s\n", val);
+        usb_write(out);
+    }
+    snprintf(path, sizeof(path), "%s/charge_type", bat);
+    if (read_first_line(path, val, sizeof(val))) {
+        snprintf(out, sizeof(out), "  Battery Charge Type: %s\n", val);
+        usb_write(out);
+    }
     snprintf(path, sizeof(path), "%s/online", usb);
     if (read_first_line(path, val, sizeof(val))) {
         snprintf(out, sizeof(out), "  USB Charger Online: %s\n", val);
@@ -983,6 +1016,11 @@ static void dump_battery_info(void) {
     if (read_first_line(path, val, sizeof(val))) {
         snprintf(out, sizeof(out), "  USB Input Current Limit: %s uA\n", val);
         usb_write(out);
+    }
+    snprintf(path, sizeof(path), "%s/device/smbchg_regs", usb);
+    if (access(path, F_OK) == 0) {
+        usb_write("  SMBCHG Regs: ");
+        dump_file_lines(path, 10, NULL, true);
     }
 }
 
@@ -1015,6 +1053,380 @@ static void dump_display_info(void) {
         }
         closedir(d);
     }
+}
+
+static void dump_thermal_perf(void) {
+    char out[512];
+
+    usb_write("[+] Thermal Zones (/sys/class/thermal):\n");
+    DIR *td = opendir("/sys/class/thermal");
+    if (td) {
+        struct dirent *de;
+        while ((de = readdir(td)) != NULL) {
+            if (strncmp(de->d_name, "thermal_zone", 12) != 0)
+                continue;
+            char tp[300], vp[300], type[64] = {0}, temp[32] = {0};
+            snprintf(tp, sizeof(tp), "/sys/class/thermal/%s/type", de->d_name);
+            snprintf(vp, sizeof(vp), "/sys/class/thermal/%s/temp", de->d_name);
+            read_first_line(tp, type, sizeof(type));
+            read_first_line(vp, temp, sizeof(temp));
+            snprintf(out, sizeof(out), "  %-15s %-22s %s mC\n",
+                     de->d_name, type[0] ? type : "?", temp[0] ? temp : "?");
+            usb_write(out);
+        }
+        closedir(td);
+    }
+
+    usb_write("[+] CPUfreq, Cooling & CPUidle:\n");
+    for (int pol = 0; pol <= 3; pol += 2) {
+        char gp[160], cp[160], minp[160], maxp[160];
+        char gov[48] = {0}, cur[32] = {0}, mn[32] = {0}, mx[32] = {0};
+        snprintf(gp, sizeof(gp), "/sys/devices/system/cpu/cpufreq/policy%d/scaling_governor", pol);
+        snprintf(cp, sizeof(cp), "/sys/devices/system/cpu/cpufreq/policy%d/scaling_cur_freq", pol);
+        snprintf(minp, sizeof(minp), "/sys/devices/system/cpu/cpufreq/policy%d/scaling_min_freq", pol);
+        snprintf(maxp, sizeof(maxp), "/sys/devices/system/cpu/cpufreq/policy%d/scaling_max_freq", pol);
+        if (access(gp, F_OK) == 0) {
+            read_first_line(gp, gov, sizeof(gov));
+            read_first_line(cp, cur, sizeof(cur));
+            read_first_line(minp, mn, sizeof(mn));
+            read_first_line(maxp, mx, sizeof(mx));
+            snprintf(out, sizeof(out), "  policy%d: gov=%-12s cur=%s min=%s max=%s kHz\n",
+                     pol, gov[0] ? gov : "?", cur[0] ? cur : "?",
+                     mn[0] ? mn : "?", mx[0] ? mx : "?");
+            usb_write(out);
+        }
+    }
+    DIR *cd = opendir("/sys/class/thermal");
+    if (cd) {
+        struct dirent *de;
+        while ((de = readdir(cd)) != NULL) {
+            if (strncmp(de->d_name, "cooling_device", 14) != 0)
+                continue;
+            char tp[300], cp[300], mp[300], type[64] = {0}, cur[16] = {0}, maxs[16] = {0};
+            snprintf(tp, sizeof(tp), "/sys/class/thermal/%s/type", de->d_name);
+            snprintf(cp, sizeof(cp), "/sys/class/thermal/%s/cur_state", de->d_name);
+            snprintf(mp, sizeof(mp), "/sys/class/thermal/%s/max_state", de->d_name);
+            read_first_line(tp, type, sizeof(type));
+            read_first_line(cp, cur, sizeof(cur));
+            read_first_line(mp, maxs, sizeof(maxs));
+            snprintf(out, sizeof(out), "  %-16s %-22s state=%s/%s\n",
+                     de->d_name, type[0] ? type : "?", cur[0] ? cur : "?", maxs[0] ? maxs : "?");
+            usb_write(out);
+        }
+        closedir(cd);
+    }
+    for (int cpu = 0; cpu < 4; cpu++) {
+        char p0n[160], p1u[160], p1n[160], u0[32] = {0}, u1[32] = {0}, s1[48] = {0};
+        snprintf(p0n, sizeof(p0n), "/sys/devices/system/cpu/cpu%d/cpuidle/state0/usage", cpu);
+        snprintf(p1u, sizeof(p1u), "/sys/devices/system/cpu/cpu%d/cpuidle/state1/usage", cpu);
+        snprintf(p1n, sizeof(p1n), "/sys/devices/system/cpu/cpu%d/cpuidle/state1/name", cpu);
+        if (access(p0n, F_OK) == 0) {
+            read_first_line(p0n, u0, sizeof(u0));
+            if (access(p1u, F_OK) == 0) {
+                read_first_line(p1u, u1, sizeof(u1));
+                read_first_line(p1n, s1, sizeof(s1));
+                snprintf(out, sizeof(out), "  cpu%d idle: WFI=%s %s=%s\n", cpu, u0, s1[0] ? s1 : "state1", u1);
+            } else {
+                snprintf(out, sizeof(out), "  cpu%d idle: WFI=%s\n", cpu, u0);
+            }
+            usb_write(out);
+        }
+    }
+    DIR *rg = opendir("/sys/class/regulator");
+    if (rg) {
+        struct dirent *de;
+        while ((de = readdir(rg)) != NULL) {
+            if (strncmp(de->d_name, "regulator.", 10) != 0)
+                continue;
+            char np[300], vp[300], rname[64] = {0}, ruv[32] = {0};
+            snprintf(np, sizeof(np), "/sys/class/regulator/%s/name", de->d_name);
+            read_first_line(np, rname, sizeof(rname));
+            if (strcmp(rname, "pm8994_s11") == 0 || strcmp(rname, "vdd_gfx") == 0) {
+                snprintf(vp, sizeof(vp), "/sys/class/regulator/%s/microvolts", de->d_name);
+                read_first_line(vp, ruv, sizeof(ruv));
+                snprintf(out, sizeof(out), "  reg %-12s uV=%s\n", rname, ruv[0] ? ruv : "?");
+                usb_write(out);
+            }
+        }
+        closedir(rg);
+    }
+    if (access("/sys/class/devfreq/b00000.gpu/cur_freq", F_OK) == 0) {
+        char gcur[32] = {0}, gmin[32] = {0}, gmax[32] = {0}, ggov[48] = {0};
+        read_first_line("/sys/class/devfreq/b00000.gpu/cur_freq", gcur, sizeof(gcur));
+        read_first_line("/sys/class/devfreq/b00000.gpu/min_freq", gmin, sizeof(gmin));
+        read_first_line("/sys/class/devfreq/b00000.gpu/max_freq", gmax, sizeof(gmax));
+        read_first_line("/sys/class/devfreq/b00000.gpu/governor", ggov, sizeof(ggov));
+        snprintf(out, sizeof(out), "  gpu:     gov=%-12s cur=%s min=%s max=%s Hz\n",
+                 ggov, gcur, gmin, gmax);
+        usb_write(out);
+    }
+
+    usb_write("[+] Memory, ZRAM & Pstore:\n");
+    FILE *mf = fopen("/proc/meminfo", "r");
+    if (mf) {
+        char line[160];
+        int shown = 0;
+        while (fgets(line, sizeof(line), mf) && shown < 6) {
+            if (strncmp(line, "MemTotal:", 9) == 0 ||
+                strncmp(line, "MemAvailable:", 13) == 0 ||
+                strncmp(line, "SwapTotal:", 10) == 0 ||
+                strncmp(line, "SwapFree:", 9) == 0) {
+                usb_write("  ");
+                usb_write(line);
+                shown++;
+            }
+        }
+        fclose(mf);
+    }
+    dump_sysfs_dir("pstore", "/sys/fs/pstore", true);
+    dump_battery_info();
+}
+
+static void dump_wifi_info(void) {
+    char out[768];
+    usb_write("[+] PCIe / Wi-Fi Hardware & Driver State:\n");
+
+    usb_write("  [1] PCI devices (/sys/bus/pci/devices):\n");
+    DIR *pd = opendir("/sys/bus/pci/devices");
+    if (!pd) {
+        usb_write("      (no /sys/bus/pci/devices)\n");
+    } else {
+        struct dirent *de;
+        int count = 0;
+        while ((de = readdir(pd)) != NULL) {
+            if (de->d_name[0] == '.')
+                continue;
+            count++;
+            char path[384], ven[32], dev[32], drv[256];
+            snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/vendor", de->d_name);
+            read_first_line(path, ven, sizeof(ven));
+            snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/device", de->d_name);
+            read_first_line(path, dev, sizeof(dev));
+            snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/driver", de->d_name);
+            ssize_t dlen = readlink(path, drv, sizeof(drv) - 1);
+            if (dlen > 0) {
+                drv[dlen] = '\0';
+                const char *base = strrchr(drv, '/');
+                snprintf(out, sizeof(out), "      %s  vendor=%s device=%s driver=%s\n",
+                         de->d_name, ven, dev, base ? base + 1 : drv);
+            } else {
+                snprintf(out, sizeof(out), "      %s  vendor=%s device=%s driver=(none)\n",
+                         de->d_name, ven, dev);
+            }
+            usb_write(out);
+        }
+        closedir(pd);
+        if (count == 0)
+            usb_write("      (empty)\n");
+    }
+
+    usb_write("  [2] Network interface (/sys/class/net/wlan0):\n");
+    if (access("/sys/class/net/wlan0", F_OK) == 0) {
+        char state[64], addr[64];
+        read_first_line("/sys/class/net/wlan0/operstate", state, sizeof(state));
+        read_first_line("/sys/class/net/wlan0/address", addr, sizeof(addr));
+        snprintf(out, sizeof(out), "      wlan0: operstate=%s address=%s\n", state, addr);
+        usb_write(out);
+    } else {
+        usb_write("      (wlan0 not present)\n");
+    }
+    dump_sysfs_dir("net", "/sys/class/net", true);
+
+    usb_write("  [3] RFKill (/sys/class/rfkill):\n");
+    dump_sysfs_dir("rfkill", "/sys/class/rfkill", true);
+    DIR *rd = opendir("/sys/class/rfkill");
+    if (rd) {
+        struct dirent *de;
+        while ((de = readdir(rd)) != NULL) {
+            if (de->d_name[0] == '.')
+                continue;
+            char path[384], name[64], type[32], state[16], soft[16], hard[16];
+            snprintf(path, sizeof(path), "/sys/class/rfkill/%s/name", de->d_name);
+            read_first_line(path, name, sizeof(name));
+            snprintf(path, sizeof(path), "/sys/class/rfkill/%s/type", de->d_name);
+            read_first_line(path, type, sizeof(type));
+            snprintf(path, sizeof(path), "/sys/class/rfkill/%s/state", de->d_name);
+            read_first_line(path, state, sizeof(state));
+            snprintf(path, sizeof(path), "/sys/class/rfkill/%s/soft", de->d_name);
+            read_first_line(path, soft, sizeof(soft));
+            snprintf(path, sizeof(path), "/sys/class/rfkill/%s/hard", de->d_name);
+            read_first_line(path, hard, sizeof(hard));
+            snprintf(out, sizeof(out), "      %s (%s/%s): state=%s soft=%s hard=%s\n",
+                     de->d_name, name, type, state, soft, hard);
+            usb_write(out);
+        }
+        closedir(rd);
+    }
+
+    usb_write("  [4] Staged Wi-Fi Firmware & RRO:\n");
+    snprintf(out, sizeof(out),
+             "      firmware-6.bin(tools): %s  firmware-6.bin(lib): %s\n"
+             "      board-2.bin(tools):    %s  regulatory.db(tools): %s\n"
+             "      SailfishWifiOverlay:   %s\n",
+             access("/tools/firmware/ath10k/QCA6174/hw3.0/firmware-6.bin", F_OK) == 0 ? "yes" : "no",
+             access("/lib/firmware/ath10k/QCA6174/hw3.0/firmware-6.bin", F_OK) == 0 ? "yes" : "no",
+             access("/tools/firmware/ath10k/QCA6174/hw3.0/board-2.bin", F_OK) == 0 ? "yes" : "no",
+             access("/tools/firmware/regulatory.db", F_OK) == 0 ? "yes" : "no",
+             access("/tools/SailfishWifiOverlay.apk", F_OK) == 0 ? "yes" : "no");
+    usb_write(out);
+
+    usb_write("  [5] Regulators (WLAN/PCIe/PM8994 rails):\n");
+    DIR *rdir = opendir("/sys/class/regulator");
+    if (rdir) {
+        struct dirent *rde;
+        static const char *const reg_keys[] = {
+            "rome", "wlan", "l28", "l12", "l30", "s3", "s4", "s11"
+        };
+        while ((rde = readdir(rdir)) != NULL) {
+            if (rde->d_name[0] == '.')
+                continue;
+            char name[96] = {0}, state[32] = {0}, uv[32] = {0}, users[32] = {0}, path[320];
+            snprintf(path, sizeof(path), "/sys/class/regulator/%s/name", rde->d_name);
+            read_first_line(path, name, sizeof(name));
+            if (!name[0])
+                continue;
+            bool match = false;
+            for (int k = 0; k < (int)(sizeof(reg_keys) / sizeof(reg_keys[0])); k++) {
+                if (strcasestr(name, reg_keys[k])) {
+                    match = true;
+                    break;
+                }
+            }
+            if (!match)
+                continue;
+            snprintf(path, sizeof(path), "/sys/class/regulator/%s/state", rde->d_name);
+            read_first_line(path, state, sizeof(state));
+            snprintf(path, sizeof(path), "/sys/class/regulator/%s/microvolts", rde->d_name);
+            read_first_line(path, uv, sizeof(uv));
+            snprintf(path, sizeof(path), "/sys/class/regulator/%s/num_users", rde->d_name);
+            read_first_line(path, users, sizeof(users));
+            char rline[448];
+            snprintf(rline, sizeof(rline), "      %-16s name=%-18s state=%-10s uV=%-8s users=%s\n",
+                     rde->d_name, name, state[0] ? state : "?", uv[0] ? uv : "?",
+                     users[0] ? users : "?");
+            usb_write(rline);
+        }
+        closedir(rdir);
+    } else {
+        usb_write("      (/sys/class/regulator unavailable)\n");
+    }
+
+    usb_write("  [6] Pinmux & PMIC pinconf (RAM/SPMI safe):\n");
+    if (access("/sys/kernel/debug/pinctrl", F_OK) != 0) {
+        mkdir("/sys/kernel/debug", 0755);
+        mount("none", "/sys/kernel/debug", "debugfs", 0, NULL);
+    }
+    DIR *pdir = opendir("/sys/kernel/debug/pinctrl");
+    if (pdir) {
+        struct dirent *pde;
+        static const char *const pin_keys[] = {
+            "(gpio8)", "(gpio9)", "(gpio18)", "(gpio35)", "(gpio36)", "(gpio37)", "(gpio46)",
+            "pcie", "wlan", "rome", "cnss"
+        };
+        while ((pde = readdir(pdir)) != NULL) {
+            if (pde->d_name[0] == '.')
+                continue;
+            char pm_path[320];
+            snprintf(pm_path, sizeof(pm_path), "/sys/kernel/debug/pinctrl/%s/pinmux-pins", pde->d_name);
+            FILE *pf = fopen(pm_path, "r");
+            if (!pf)
+                continue;
+            char hdr[320];
+            snprintf(hdr, sizeof(hdr), "      [%s/pinmux-pins]\n", pde->d_name);
+            bool hdr_printed = false;
+            char pline[256];
+            while (fgets(pline, sizeof(pline), pf)) {
+                for (int k = 0; k < (int)(sizeof(pin_keys) / sizeof(pin_keys[0])); k++) {
+                    if (strcasestr(pline, pin_keys[k])) {
+                        if (!hdr_printed) {
+                            usb_write(hdr);
+                            hdr_printed = true;
+                        }
+                        usb_write("        ");
+                        usb_write(pline);
+                        break;
+                    }
+                }
+            }
+            fclose(pf);
+        }
+        closedir(pdir);
+    } else {
+        usb_write("      (/sys/kernel/debug/pinctrl unavailable)\n");
+    }
+
+    /* Safe to inspect PM8994 SPMI GPIOs via pinconf-groups (never read 1010000.pinctrl/pinconf-pins!) */
+    FILE *pcf = fopen("/sys/kernel/debug/pinctrl/400f000.spmi:pmic@0:gpio@c000/pinconf-groups", "r");
+    if (pcf) {
+        static const char *const pmic_keys[] = { "gpio8)", "gpio9)", "gpio18)", "gpio19)" };
+        bool pc_hdr = false;
+        char pcline[256];
+        while (fgets(pcline, sizeof(pcline), pcf)) {
+            for (int k = 0; k < (int)(sizeof(pmic_keys) / sizeof(pmic_keys[0])); k++) {
+                if (strstr(pcline, pmic_keys[k])) {
+                    if (!pc_hdr) {
+                        usb_write("      [400f000.spmi:pmic@0:gpio@c000/pinconf-groups]\n");
+                        pc_hdr = true;
+                    }
+                    usb_write("        ");
+                    usb_write(pcline);
+                    break;
+                }
+            }
+        }
+        fclose(pcf);
+    }
+
+    usb_write("  [7] Regulator summary (/sys/kernel/debug/regulator/regulator_summary):\n");
+    FILE *rsf = fopen("/sys/kernel/debug/regulator/regulator_summary", "r");
+    if (rsf) {
+        static const char *const rs_keys[] = {
+            "rome", "wlan", "l28", "l12", "l30", "s3", "s4", "vph", "pcie", "34000"
+        };
+        char rline[256];
+        while (fgets(rline, sizeof(rline), rsf)) {
+            for (int k = 0; k < (int)(sizeof(rs_keys) / sizeof(rs_keys[0])); k++) {
+                if (strcasestr(rline, rs_keys[k])) {
+                    usb_write("      ");
+                    usb_write(rline);
+                    break;
+                }
+            }
+        }
+        fclose(rsf);
+    } else {
+        usb_write("      (regulator_summary unavailable)\n");
+    }
+
+    usb_write("  [7b] Clocks (/sys/kernel/debug/clk/clk_summary):\n");
+    FILE *csf = fopen("/sys/kernel/debug/clk/clk_summary", "r");
+    if (csf) {
+        static const char *const clk_keys[] = {
+            "pcie", "clkref", "sleep_clk", "xo_board"
+        };
+        char cline[256];
+        while (fgets(cline, sizeof(cline), csf)) {
+            for (int k = 0; k < (int)(sizeof(clk_keys) / sizeof(clk_keys[0])); k++) {
+                if (strcasestr(cline, clk_keys[k])) {
+                    usb_write("      ");
+                    usb_write(cline);
+                    break;
+                }
+            }
+        }
+        fclose(csf);
+    } else {
+        usb_write("      (clk_summary unavailable)\n");
+    }
+
+    usb_write("  [8] Kernel dmesg (PCIe/QMP/PM8994/ath10k/USB/CPUfreq):\n");
+    static const char *const wifi_keys[] = {
+        "pcie", "qcom-pcie", "qcom_pcie", "qmp", "34000", "phy-wrapper",
+        "ath10k", "cfg80211", "wlan", "rome", "pm8994", "pinctrl",
+        "regulator", "spmi", "qcom-cpufreq", "s11", "cbf",
+        "dwc3", "f_fs", "ffs", "regulatory"
+    };
+    dump_dmesg_any(400, wifi_keys, (int)(sizeof(wifi_keys) / sizeof(wifi_keys[0])));
 }
 
 static void test_android_primitives(void) {
@@ -1078,6 +1490,50 @@ static bool copy_file(const char *src, const char *dst) {
     close(sfd);
     close(dfd);
     return true;
+}
+
+static void copy_dir_labeled(const char *src_dir, const char *dst_dir,
+                             const char *label, int depth) {
+    if (depth > 4)
+        return;
+    mkdir(dst_dir, 0755);
+    chmod(dst_dir, 0755);
+    set_selinux_label(dst_dir, label);
+
+    DIR *d = opendir(src_dir);
+    if (!d)
+        return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        char sp[512], dp[512];
+        int sn = snprintf(sp, sizeof(sp), "%s/%s", src_dir, de->d_name);
+        int dn = snprintf(dp, sizeof(dp), "%s/%s", dst_dir, de->d_name);
+        if (sn < 0 || (size_t)sn >= sizeof(sp) || dn < 0 || (size_t)dn >= sizeof(dp))
+            continue;
+        struct stat st;
+        if (lstat(sp, &st) != 0)
+            continue;
+        if (S_ISDIR(st.st_mode)) {
+            copy_dir_labeled(sp, dp, label, depth + 1);
+        } else if (S_ISLNK(st.st_mode)) {
+            char target[512];
+            ssize_t len = readlink(sp, target, sizeof(target) - 1);
+            if (len > 0) {
+                target[len] = '\0';
+                unlink(dp);
+                if (symlink(target, dp) == 0 && label)
+                    lsetxattr(dp, "security.selinux", label, strlen(label) + 1, 0);
+            }
+        } else if (S_ISREG(st.st_mode)) {
+            if (copy_file(sp, dp)) {
+                chmod(dp, 0644);
+                set_selinux_label(dp, label);
+            }
+        }
+    }
+    closedir(d);
 }
 
 static void write_file_str(const char *path, const char *val) {
@@ -1198,6 +1654,388 @@ static void umount_all(const char *path) {
 static int bind_mount_clean(const char *src, const char *dst) {
     umount_all(dst);
     return mount(src, dst, NULL, MS_BIND, NULL);
+}
+
+static bool is_path_fscrypt_encrypted(const char *path) {
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+
+    struct fscrypt_policy_v1 p1;
+    memset(&p1, 0, sizeof(p1));
+    if (ioctl(fd, FS_IOC_GET_ENCRYPTION_POLICY, &p1) == 0) {
+        close(fd);
+        return true;
+    }
+
+    struct fscrypt_get_policy_ex_arg ex;
+    memset(&ex, 0, sizeof(ex));
+    ex.policy_size = sizeof(ex.policy);
+    if (ioctl(fd, FS_IOC_GET_ENCRYPTION_POLICY_EX, &ex) == 0) {
+        close(fd);
+        return true;
+    }
+
+    close(fd);
+    return false;
+}
+
+/* Refuse stock FBE/non-Sailfish trees; accept only empty or marked unencrypted userdata. */
+static bool is_userdata_safe_unencrypted(const char *mnt) {
+    char check_path[256];
+    const char *fbe_paths[] = { "unencrypted", "misc/vold/user_keys", NULL };
+    for (int i = 0; fbe_paths[i]; i++) {
+        snprintf(check_path, sizeof(check_path), "%s/%s", mnt, fbe_paths[i]);
+        if (access(check_path, F_OK) == 0)
+            return false;
+    }
+
+    if (is_path_fscrypt_encrypted(mnt))
+        return false;
+
+    const char *subdirs[] = { "data", "system", "user", "user/0", "app", "media", "misc", NULL };
+    for (int i = 0; subdirs[i]; i++) {
+        snprintf(check_path, sizeof(check_path), "%s/%s", mnt, subdirs[i]);
+        if (is_path_fscrypt_encrypted(check_path))
+            return false;
+    }
+
+    snprintf(check_path, sizeof(check_path), "%s/.sailfish_unencrypted", mnt);
+    bool has_marker = (access(check_path, F_OK) == 0);
+
+    DIR *d = opendir(mnt);
+    if (!d)
+        return false;
+
+    bool has_other_entries = false;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0 ||
+            strcmp(de->d_name, "lost+found") == 0 || strcmp(de->d_name, ".sailfish_unencrypted") == 0) {
+            continue;
+        }
+        snprintf(check_path, sizeof(check_path), "%s/%s", mnt, de->d_name);
+        if (is_path_fscrypt_encrypted(check_path)) {
+            closedir(d);
+            return false;
+        }
+        has_other_entries = true;
+    }
+    closedir(d);
+
+    return has_marker || !has_other_entries;
+}
+
+static bool dev_in_proc_mounts(const char *target_dev) {
+    FILE *f = fopen("/proc/mounts", "r");
+    if (!f)
+        return false;
+    char line[1024], dev[256];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "%255s", dev) == 1 && strcmp(dev, target_dev) == 0) {
+            found = true;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static void mount_tmpfs_data(const char *target) {
+    umount_all(target);
+    mkdir(target, 0771);
+    mount("tmpfs", target, "tmpfs", 0, "mode=0771,uid=1000,gid=1000");
+    chown(target, 1000, 1000);
+    chmod(target, 0771);
+    set_selinux_label(target, "u:object_r:system_data_root_file:s0");
+    g_data_persistent = false;
+}
+
+static void mount_userdata_partition(const char *sys_dev) {
+    const char *target = "/mnt/system_a/data";
+    const char *probe = "/mnt/userdata_probe";
+    g_data_persistent = false;
+    umount_all(target);
+    umount_all(probe);
+    mkdir(target, 0771);
+    mkdir(probe, 0755);
+
+    if (strcmp(sys_dev, "/dev/sda35") == 0) {
+        usb_write("[!] /dev/sda35 is system root; using tmpfs /data\n");
+        mount_tmpfs_data(target);
+        return;
+    }
+
+    const char *fstypes[] = { "ext4", "f2fs", NULL };
+    const char *mounted_fs = NULL;
+    int last_err = ENOENT;
+    for (int i = 0; fstypes[i]; i++) {
+        if (mount("/dev/sda35", probe, fstypes[i], MS_NOATIME, NULL) == 0) {
+            mounted_fs = fstypes[i];
+            break;
+        }
+        last_err = errno;
+    }
+
+    if (!mounted_fs) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "[!] Could not mount /dev/sda35 as ext4/f2fs (%s); using tmpfs /data\n"
+                 "[!] Run 'format_userdata confirm' in sailfish# or 'fastboot format:ext4 userdata' for persistent /data\n",
+                 strerror(last_err));
+        usb_write(msg);
+        mount_tmpfs_data(target);
+        return;
+    }
+
+    bool safe = is_userdata_safe_unencrypted(probe);
+    if (umount2(probe, 0) != 0)
+        umount_all(probe);
+
+    if (!safe) {
+        usb_write("[!] /dev/sda35 has FBE-encrypted or unrecognized stock data; using tmpfs /data\n"
+                  "[!] To enable persistent /data safely, run 'format_userdata confirm' or 'fastboot format:ext4 userdata'\n");
+        mount_tmpfs_data(target);
+        return;
+    }
+
+    if (mount("/dev/sda35", target, mounted_fs, MS_NOATIME, NULL) != 0) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "[!] Re-mount /dev/sda35 (%s) -> /data failed (%s); using tmpfs /data\n",
+                 mounted_fs, strerror(errno));
+        usb_write(msg);
+        mount_tmpfs_data(target);
+        return;
+    }
+
+    int mfd = open("/mnt/system_a/data/.sailfish_unencrypted", O_WRONLY | O_CREAT, 0600);
+    if (mfd >= 0) {
+        write(mfd, "sailfish-unencrypted-data\n", 26);
+        close(mfd);
+    }
+    chown(target, 1000, 1000);
+    chmod(target, 0771);
+    set_selinux_label(target, "u:object_r:system_data_root_file:s0");
+    g_data_persistent = true;
+
+    char okmsg[192];
+    snprintf(okmsg, sizeof(okmsg),
+             "[+] Mounted persistent unencrypted /dev/sda35 (%s) -> /data (ART dexopt enabled)\n",
+             mounted_fs);
+    usb_write(okmsg);
+}
+
+static void install_data_file(const char *src, const char *dst, mode_t mode,
+                              const char *label, const char *usb_msg) {
+    if (access(src, F_OK) != 0)
+        return;
+    unlink(dst);
+    if (copy_file(src, dst)) {
+        chmod(dst, mode);
+        set_selinux_label(dst, label);
+        if (usb_msg)
+            usb_write(usb_msg);
+    }
+}
+
+static void copy_selinux_label_or(const char *src, char *buf, size_t len, const char *fallback) {
+    ssize_t llen = getxattr(src, "security.selinux", buf, len - 1);
+    if (llen <= 0) {
+        snprintf(buf, len, "%s", fallback);
+    } else {
+        buf[llen] = '\0';
+    }
+}
+
+/* Non-destructively overlay an Android build.prop so adbd runs passwordless alongside rescue shell. */
+static void overlay_prop_file(const char *src, const char *tmp, const char *fallback_lbl,
+                              bool append_defaults, const char *log_msg) {
+    umount_all(src);
+    if (access(src, F_OK) != 0)
+        return;
+
+    char label[128] = {0};
+    copy_selinux_label_or(src, label, sizeof(label), fallback_lbl);
+
+    mkdir("/tmp", 0755);
+    FILE *in = fopen(src, "r");
+    FILE *out = fopen(tmp, "w");
+    if (!in || !out) {
+        if (in) fclose(in);
+        if (out) fclose(out);
+        return;
+    }
+
+    char *line = NULL;
+    size_t cap = 0;
+    bool saw_adb_secure = false;
+    bool saw_debuggable = false;
+    bool saw_wifi_iface = false;
+    bool saw_sf_blur = false;
+    bool saw_disable_blurs = false;
+    while (getline(&line, &cap, in) >= 0) {
+        if (strncmp(line, "ro.adb.secure=", 14) == 0) {
+            fputs("ro.adb.secure=0\n", out);
+            saw_adb_secure = true;
+        } else if (strncmp(line, "ro.debuggable=", 14) == 0) {
+            fputs("ro.debuggable=1\n", out);
+            saw_debuggable = true;
+        } else if (append_defaults && strncmp(line, "wifi.interface=", 15) == 0) {
+            fputs("wifi.interface=wlan0\n", out);
+            saw_wifi_iface = true;
+        } else if (append_defaults &&
+                   strncmp(line, "ro.surface_flinger.supports_background_blur=",
+                           sizeof("ro.surface_flinger.supports_background_blur=") - 1) == 0) {
+            fputs("ro.surface_flinger.supports_background_blur=0\n", out);
+            saw_sf_blur = true;
+        } else if (append_defaults &&
+                   strncmp(line, "persist.sys.sf.disable_blurs=",
+                           sizeof("persist.sys.sf.disable_blurs=") - 1) == 0) {
+            fputs("persist.sys.sf.disable_blurs=1\n", out);
+            saw_disable_blurs = true;
+        } else {
+            fputs(line, out);
+        }
+    }
+    free(line);
+    if (append_defaults) {
+        if (!saw_adb_secure)
+            fputs("ro.adb.secure=0\n", out);
+        if (!saw_debuggable)
+            fputs("ro.debuggable=1\n", out);
+        if (!saw_wifi_iface)
+            fputs("wifi.interface=wlan0\n", out);
+        if (!saw_sf_blur)
+            fputs("ro.surface_flinger.supports_background_blur=0\n", out);
+        if (!saw_disable_blurs)
+            fputs("persist.sys.sf.disable_blurs=1\n", out);
+    }
+    fclose(in);
+    fclose(out);
+
+    chmod(tmp, 0644);
+    set_selinux_label(tmp, label);
+    if (bind_mount_clean(tmp, src) == 0)
+        usb_write(log_msg);
+}
+
+static void overlay_adb_build_prop(void) {
+    overlay_prop_file("/mnt/system_a/system/build.prop", "/tmp/system_build.prop",
+                      "u:object_r:system_file:s0", true,
+                      "[+] Automated: Overlaid /system/build.prop (ro.adb.secure=0, ro.debuggable=1, wifi.interface=wlan0)\n");
+    overlay_prop_file("/mnt/system_a/vendor/build.prop", "/tmp/vendor_build.prop",
+                      "u:object_r:vendor_configs_file:s0", false,
+                      "[+] Automated: Overlaid /vendor/build.prop (ro.adb.secure=0, ro.debuggable=1)\n");
+}
+
+/* Replace Android's stock init.usb.configfs.rc and silence vendor USB scripts so composite
+ * CDC-ACM (/dev/ttyACM0) stays intact while FunctionFS ADB is bound once adbd opens ep0. */
+static void overlay_usb_configfs_rc(void) {
+    char udc_name[96];
+    if (!find_udc(udc_name, sizeof(udc_name)))
+        snprintf(udc_name, sizeof(udc_name), "6a00000.usb");
+
+    mkdir("/tmp", 0755);
+    const char *empty_rc = "/tmp/empty_usb.rc";
+    write_file_str(empty_rc, "# Overridden by sailfish composite ACM+ADB USB configfs\n");
+    chmod(empty_rc, 0644);
+    set_selinux_label(empty_rc, "u:object_r:vendor_configs_file:s0");
+
+    const char *vendor_usb_rcs[] = {
+        "/mnt/system_a/vendor/etc/init/hw/init.sailfish.usb.rc",
+        "/mnt/system_a/vendor/etc/init/hw/init.marlin.usb.rc",
+        "/mnt/system_a/vendor/etc/init/init.sailfish.usb.rc",
+        NULL
+    };
+    for (int i = 0; vendor_usb_rcs[i]; i++) {
+        if (access(vendor_usb_rcs[i], F_OK) == 0) {
+            if (bind_mount_clean(empty_rc, vendor_usb_rcs[i]) == 0) {
+                char msg[192];
+                snprintf(msg, sizeof(msg), "[+] Automated: Overlaid %s (preserving ttyGS0)\n", vendor_usb_rcs[i]);
+                usb_write(msg);
+            }
+        }
+    }
+
+    char usb_rc[4096];
+    snprintf(usb_rc, sizeof(usb_rc),
+        "on early-init\n"
+        "    setprop sys.usb.configfs 1\n"
+        "    setprop sys.usb.controller %s\n"
+        "    setprop ro.adb.secure 0\n"
+        "\n"
+        "on post-fs-data\n"
+        "    mkdir /data/adb 0700 root root\n"
+        "    mkdir /data/misc/adb 02750 system shell\n"
+        "    mkdir /dev/usb-ffs 0770 shell shell\n"
+        "    mkdir /dev/usb-ffs/adb 0770 shell shell\n"
+        "    mkdir /config/usb_gadget/g1/functions/ffs.adb 0770 shell shell\n"
+        "    setprop sys.usb.ffs.ready 0\n"
+        "    setprop sys.usb.state none\n"
+        "\n"
+        "on boot\n"
+        "    setprop sys.sailfish.adb 0\n"
+        "    setprop sys.usb.config none\n"
+        "    stop adbd\n"
+        "    setprop sys.usb.ffs.ready 0\n"
+        "    setprop sys.usb.state none\n"
+        "\n"
+        "on property:sys.usb.config=none && property:sys.usb.configfs=1\n"
+        "    stop adbd\n"
+        "    setprop sys.usb.ffs.ready 0\n"
+        "    setprop sys.usb.state none\n"
+        "\n"
+        "on property:init.svc.adbd=stopped\n"
+        "    setprop sys.usb.ffs.ready 0\n"
+        "\n"
+        "# Keep adbd stopped unless opted in via sys.sailfish.adb=1 (prevents 1-Hz FUNCTIONFS_BIND spin)\n"
+        "on property:sys.usb.config=adb && property:sys.sailfish.adb=0 && property:sys.usb.configfs=1\n"
+        "    stop adbd\n"
+        "    setprop sys.usb.ffs.ready 0\n"
+        "    setprop sys.usb.config none\n"
+        "    setprop sys.usb.state none\n"
+        "\n"
+        "on property:init.svc.adbd=running && property:sys.sailfish.adb=0\n"
+        "    stop adbd\n"
+        "    setprop sys.usb.ffs.ready 0\n"
+        "    setprop sys.usb.config none\n"
+        "    setprop sys.usb.state none\n"
+        "\n"
+        "# Opt-in ADB only (never bounce UDC during boot so CDC-ACM /dev/ttyACM0 stays up):\n"
+        "on property:sys.sailfish.adb=1 && property:sys.usb.configfs=1\n"
+        "    setprop sys.usb.config adb\n"
+        "    start adbd\n"
+        "\n"
+        "on property:sys.sailfish.adb=0 && property:sys.usb.configfs=1\n"
+        "    stop adbd\n"
+        "    setprop sys.usb.ffs.ready 0\n"
+        "    exec - root root -- /system/bin/sh /data/setup_usb_adb.sh unbind ${sys.usb.controller}\n"
+        "    setprop sys.usb.config none\n"
+        "    setprop sys.usb.state none\n"
+        "\n"
+        "on property:sys.sailfish.adb=1 && property:sys.usb.config=adb && property:sys.usb.ffs.ready=1 && property:sys.usb.configfs=1\n"
+        "    exec - root root -- /system/bin/sh /data/setup_usb_adb.sh bind ${sys.usb.controller}\n"
+        "    setprop sys.usb.state adb\n",
+        udc_name);
+
+    const char *dst_rc = "/mnt/system_a/system/etc/init/hw/init.usb.configfs.rc";
+    const char *tmp_rc = "/tmp/init.usb.configfs.rc";
+    write_file_str(tmp_rc, usb_rc);
+    chmod(tmp_rc, 0644);
+    if (access(dst_rc, F_OK) == 0) {
+        char label[128] = {0};
+        copy_selinux_label_or(dst_rc, label, sizeof(label), "u:object_r:system_file:s0");
+        set_selinux_label(tmp_rc, label);
+        if (bind_mount_clean(tmp_rc, dst_rc) == 0)
+            usb_write("[+] Automated: Overlaid init.usb.configfs.rc (composite ACM + FunctionFS ADB)\n");
+    } else {
+        const char *fb_rc = "/mnt/system_a/system/etc/init/sailfish_usb_adb.rc";
+        write_file_str(fb_rc, usb_rc);
+        chmod(fb_rc, 0644);
+        set_selinux_label(fb_rc, "u:object_r:system_file:s0");
+    }
 }
 
 struct bin_patch {
@@ -1675,6 +2513,23 @@ static bool prepare_android_rootfs(bool for_shell) {
     mkdir("/mnt/system_a/vendor", 0755);
     mount("/mnt/vendor_a", "/mnt/system_a/vendor", NULL, MS_BIND | MS_REC, NULL);
 
+    /* Mount persistent unencrypted /dev/sda35 -> /data when safe, otherwise tmpfs */
+    mount_userdata_partition(sys_dev);
+
+    /* Clear volatile software-KeyMint keystore & synthetic-password state before Android
+     * init and keystore2 start so LockSettingsService.unlockUserKeyIfUnsecured(0) never
+     * fails with Error::Km(r#INVALID_KEY_BLOB) on subsequent boots. */
+    rm_rf("/mnt/system_a/data/system_de/0/spblob");
+    unlink("/mnt/system_a/data/system/locksettings.db");
+    unlink("/mnt/system_a/data/system/locksettings.db-wal");
+    unlink("/mnt/system_a/data/system/locksettings.db-shm");
+    rm_rf("/mnt/system_a/data/misc/keystore");
+    mkdir("/mnt/system_a/data/misc/keystore", 0700);
+    chown("/mnt/system_a/data/misc/keystore", 1017, 1017);
+    chmod("/mnt/system_a/data/misc/keystore", 0700);
+    set_selinux_label("/mnt/system_a/data/misc/keystore", "u:object_r:keystore_data_file:s0");
+    rm_rf("/mnt/system_a/data/misc/gatekeeper");
+
     /* Preferred: Mesa Freedreno (gallium/msm) real GLES driver.
      * Build a tmpfs copy of /vendor/lib64/egl, overlay the Mesa libs (named *_adreno.so so
      * ro.hardware.egl=adreno keeps working) plus libgallium_dri.so (found via RUNPATH=$ORIGIN),
@@ -1764,7 +2619,9 @@ static bool prepare_android_rootfs(bool for_shell) {
             chmod("/tmp/fstab.sailfish", 0644);
             set_selinux_label("/tmp/fstab.sailfish", "u:object_r:vendor_configs_file:s0");
             if (mount("/tmp/fstab.sailfish", "/mnt/system_a/vendor/etc/fstab.sailfish", NULL, MS_BIND, NULL) == 0) {
-                usb_write("[+] Automated: Overlaid /vendor/etc/fstab.sailfish (unencrypted tmpfs /data)\n");
+                usb_write(g_data_persistent ?
+                          "[+] Automated: Overlaid /vendor/etc/fstab.sailfish (persistent /dev/sda35 /data)\n" :
+                          "[+] Automated: Overlaid /vendor/etc/fstab.sailfish (unencrypted tmpfs /data)\n");
             }
         }
     }
@@ -1824,6 +2681,7 @@ static bool prepare_android_rootfs(bool for_shell) {
             "/mnt/system_a/vendor/bin/hw/android.hardware.vr@1.0-service",
             "/mnt/system_a/vendor/bin/hw/android.hardware.weaver@1.0-service",
             "/mnt/system_a/vendor/bin/hw/android.hardware.wifi@1.0-service",
+            "/mnt/system_a/vendor/bin/hw/wpa_supplicant",
             "/mnt/system_a/vendor/bin/pm-service",
             "/mnt/system_a/vendor/bin/pm-proxy",
             "/mnt/system_a/vendor/bin/nanohub_slpi",
@@ -1858,6 +2716,7 @@ static bool prepare_android_rootfs(bool for_shell) {
             { "/tools/pause_stub", "/mnt/system_a/system/bin/traced", "/tmp/traced_stub", "u:object_r:traced_exec:s0" },
             { "/tools/pause_stub", "/mnt/system_a/system/bin/traced_probes", "/tmp/traced_probes_stub", "u:object_r:traced_probes_exec:s0" },
             { "/tools/vdc_stub", "/mnt/system_a/system/bin/flags_health_check", "/tmp/flags_health_check_stub", "u:object_r:system_file:s0" },
+            { "/tools/vdc_stub", "/mnt/system_a/system/bin/usbd", "/tmp/usbd_stub", "u:object_r:usbd_exec:s0" },
             { NULL, NULL, NULL, NULL }
         };
         for (int s = 0; sys_stubs[s].bin_path; s++) {
@@ -1903,8 +2762,8 @@ static bool prepare_android_rootfs(bool for_shell) {
         }
     }
 
-    /* Automated: Filter NFC permissions out of /vendor/etc/permissions so PackageManagerService
-     * does not declare android.hardware.nfc or respawn com.android.nfc (NfcNciApex). */
+    /* Automated: Filter NFC and Bluetooth permissions out of /vendor/etc/permissions so
+     * PackageManagerService does not respawn NfcNciApex or crash-loop com.android.bluetooth. */
     const char *vperm_dir = "/mnt/system_a/vendor/etc/permissions";
     if (access(vperm_dir, F_OK) == 0) {
         mkdir("/tmp", 0755);
@@ -1918,7 +2777,8 @@ static bool prepare_android_rootfs(bool for_shell) {
                 while ((de = readdir(pd)) != NULL) {
                     if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
                         continue;
-                    if (strcasestr(de->d_name, "nfc") || strcasestr(de->d_name, "mifare"))
+                    if (strcasestr(de->d_name, "nfc") || strcasestr(de->d_name, "mifare") ||
+                        strcasestr(de->d_name, "bluetooth"))
                         continue;
                     char src_path[512], dst_path[512];
                     snprintf(src_path, sizeof(src_path), "%s/%s", vperm_dir, de->d_name);
@@ -1933,9 +2793,40 @@ static bool prepare_android_rootfs(bool for_shell) {
                 }
                 closedir(pd);
             }
+            const char *unavail_xml =
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                "<permissions>\n"
+                "    <unavailable-feature name=\"android.hardware.bluetooth\" />\n"
+                "    <unavailable-feature name=\"android.hardware.bluetooth_le\" />\n"
+                "    <unavailable-feature name=\"android.hardware.nfc\" />\n"
+                "    <unavailable-feature name=\"android.hardware.nfc.hce\" />\n"
+                "    <unavailable-feature name=\"android.hardware.nfc.hcef\" />\n"
+                "    <unavailable-feature name=\"android.hardware.nfc.uicc\" />\n"
+                "    <unavailable-feature name=\"android.hardware.nfc.ese\" />\n"
+                "    <unavailable-feature name=\"com.nxp.mifare\" />\n"
+                "</permissions>\n";
+            const char *unavail_path = "/tmp/vendor_permissions/sailfish_unavailable_features.xml";
+            write_file_str(unavail_path, unavail_xml);
+            chmod(unavail_path, 0644);
+            set_selinux_label(unavail_path, "u:object_r:vendor_configs_file:s0");
             if (bind_mount_clean("/tmp/vendor_permissions", vperm_dir) == 0) {
-                usb_write("[+] Automated: Filtered NFC/Mifare XMLs out of /vendor/etc/permissions\n");
+                usb_write("[+] Automated: Filtered NFC/Mifare/Bluetooth XMLs out of /vendor/etc/permissions\n");
             }
+        }
+    }
+
+    /* Automated: Silence vendor init.usb.rc so Android 10 vendor USB triggers never bounce
+     * g1/UDC or launch adbd independently of overlay_usb_configfs_rc(). */
+    const char *vusb_rc = "/mnt/system_a/vendor/etc/init/init.usb.rc";
+    if (access(vusb_rc, F_OK) == 0) {
+        const char *tmp_vusb_rc = "/tmp/vendor_init_usb.rc";
+        char lbl[128] = {0};
+        copy_selinux_label_or(vusb_rc, lbl, sizeof(lbl), "u:object_r:vendor_configs_file:s0");
+        write_file_str(tmp_vusb_rc, "# Silenced by sailfish-init to preserve CDC-ACM gadget\n");
+        chmod(tmp_vusb_rc, 0644);
+        set_selinux_label(tmp_vusb_rc, lbl);
+        if (bind_mount_clean(tmp_vusb_rc, vusb_rc) == 0) {
+            usb_write("[+] Automated: Silenced /vendor/etc/init/init.usb.rc (preserving CDC-ACM)\n");
         }
     }
 
@@ -1965,6 +2856,9 @@ static bool prepare_android_rootfs(bool for_shell) {
         "u:object_r:system_file:s0",
         drop_netd1shot_reboot,
         "[+] Automated: Overlaid system/etc/init/netd.rc (removed netd1shot reboot_on_failure)\n");
+
+    overlay_adb_build_prop();
+    overlay_usb_configfs_rc();
 
     /* Automated: Bind wrap_preload over graphics HALs & surfaceflinger so they ALWAYS load libsdm_shim.so
      * natively on startup, preventing SIGSEGV in libsdmcore and unlocking hwcomposer + surfaceflinger */
@@ -2052,7 +2946,16 @@ static bool prepare_android_rootfs(bool for_shell) {
 
     /* Automated: Create native .rc files in /system/etc/init and /vendor/etc/init so Android init
      * automatically executes essential properties and service stops on boot */
-    const char *rc_content =
+    const char *dexopt_props = g_data_persistent ?
+        "    setprop dalvik.vm.boot-dex2oat-threads 2\n"
+        "    setprop dalvik.vm.dex2oat-threads 2\n"
+        "    setprop dalvik.vm.background-dex2oat-threads 1\n" :
+        "    setprop dalvik.vm.dexopt-flags v=n\n"
+        "    setprop dalvik.vm.extra-opts -Xverify:none\n"
+        "    setprop pm.dexopt.first-boot skip\n"
+        "    setprop pm.dexopt.boot-after-ota skip\n";
+    char rc_content[8192];
+    snprintf(rc_content, sizeof(rc_content),
         "on early-init\n"
         "    setprop ro.crypto.state unencrypted\n"
         "    setprop ro.hw_timeout_multiplier 10\n"
@@ -2060,10 +2963,9 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    setprop debug.gralloc.gfx_ubwc_disable 1\n"
         "    setprop debug.gralloc.enable_fb_ubwc 0\n"
         "    setprop service.sf.prime_shader_cache 0\n"
-        "    setprop dalvik.vm.dexopt-flags v=n\n"
-        "    setprop dalvik.vm.extra-opts -Xverify:none\n"
-        "    setprop pm.dexopt.first-boot skip\n"
-        "    setprop pm.dexopt.boot-after-ota skip\n"
+        "    setprop ro.surface_flinger.supports_background_blur 0\n"
+        "    setprop persist.sys.sf.disable_blurs 1\n"
+        "%s"
         "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
         "    chmod 0644 /linkerconfig/ld.config.txt\n"
         "    chmod 0666 /dev/ion\n"
@@ -2089,10 +2991,7 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    setprop keystore.module_hash.sent true\n"
         "    setprop odsign.key.done 1\n"
         "    setprop odsign.verification.done 1\n"
-        "    setprop dalvik.vm.dexopt-flags v=n\n"
-        "    setprop dalvik.vm.extra-opts -Xverify:none\n"
-        "    setprop pm.dexopt.first-boot skip\n"
-        "    setprop pm.dexopt.boot-after-ota skip\n"
+        "%s"
         "    chmod 0664 /sys/fs/cgroup/cgroup.procs\n"
         "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
         "    chmod 0644 /linkerconfig/ld.config.txt\n"
@@ -2116,31 +3015,20 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    chmod 0644 /linkerconfig/ld.config.txt\n"
         "\n"
         "on zygote-start\n"
-        "    setprop dalvik.vm.dexopt-flags v=n\n"
-        "    setprop dalvik.vm.extra-opts -Xverify:none\n"
-        "    setprop pm.dexopt.first-boot skip\n"
-        "    setprop pm.dexopt.boot-after-ota skip\n"
+        "%s"
         "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
         "    chmod 0644 /linkerconfig/ld.config.txt\n"
-        "\n"
-        "service sailfish_power_aidl /system/bin/android.hardware.power-service.sailfish\n"
-        "    class hal\n"
-        "    user system\n"
-        "    group system\n"
-        "\n"
-        "service sailfish_sensors_aidl /system/bin/android.hardware.sensors-service.sailfish\n"
-        "    class hal\n"
-        "    user system\n"
-        "    group system\n"
         "\n"
         "on boot\n"
         "    chmod 0666 /dev/ion\n"
         "    chmod 0666 /dev/dma_heap/system\n"
         "    chmod 0666 /dev/dma_heap/system-uncached\n"
         "    chmod 0666 /dev/dri/card0\n"
+        "    exec - root root -- /system/bin/sh /data/start_qservice.sh\n"
         "    class_start hal\n"
         "    class_start core\n"
-        "    trigger nonencrypted\n";
+        "    trigger nonencrypted\n",
+        dexopt_props, dexopt_props, dexopt_props);
 
     /* Install sailfish_boot triggers only once before hw/init.rc actions so
      * duplicate `on zygote-start` copies never truncate /linkerconfig/ld.config.txt
@@ -2206,7 +3094,8 @@ static bool prepare_android_rootfs(bool for_shell) {
         "ensure_dir /data/media/0 media_rw:media_rw 0770\n"
         "ensure_dir /data/media/0/Android media_rw:media_rw 0770\n"
         "ensure_dir /data/media/obb media_rw:media_rw 0770\n"
-        "if ! grep -q \" /data/user/0 \" /proc/mounts; then\n"
+        "rm -rf /data/system_de/0/spblob /data/system/locksettings.db* 2>/dev/null || true\n"
+        "if [ ! -L /data/user/0 ] && ! grep -q \" /data/user/0 \" /proc/mounts; then\n"
         "    mount -o bind /data/data /data/user/0 2>/dev/null || true\n"
         "fi\n"
         "if [ ! -d /data/misc_de/0/vold ]; then\n"
@@ -2225,7 +3114,7 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    fi\n"
         "fi\n"
         "if ! losetup /dev/block/loop95 >/dev/null 2>&1; then\n"
-        "    dd if=/dev/zero of=/data/frp.img bs=1024 count=512 2>/dev/null || true\n"
+        "    [ ! -s /data/frp.img ] && dd if=/dev/zero of=/data/frp.img bs=1024 count=512 2>/dev/null || true\n"
         "    losetup /dev/block/loop95 /data/frp.img 2>/dev/null || true\n"
         "fi\n"
         "chown system:system /dev/block/loop95 2>/dev/null || true\n"
@@ -2234,9 +3123,7 @@ static bool prepare_android_rootfs(bool for_shell) {
         "ln -sf /dev/block/loop95 /dev/block/platform/soc/624000.ufshc/by-name/frp 2>/dev/null || true\n"
         "ln -sf /dev/block/loop95 /dev/block/bootdevice/by-name/frp 2>/dev/null || true\n"
         "ln -sf /dev/block/loop95 /dev/block/by-name/frp 2>/dev/null || true\n"
-        "for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do\n"
-        "    echo performance > \"$g\" 2>/dev/null || true\n"
-        "done\n"
+        "# Keep kernel schedutil CPUfreq governor active\n"
         "if [ -d /apex/com.android.nfcservices/priv-app ]; then\n"
         "    mount -t tmpfs tmpfs /apex/com.android.nfcservices/priv-app 2>/dev/null || true\n"
         "fi\n";
@@ -2252,25 +3139,120 @@ static bool prepare_android_rootfs(bool for_shell) {
 
     const char *user0_rc =
         "on post-fs-data\n"
-        "    exec - root root -- /system/bin/sh /system/etc/sailfish_ensure_user0.sh\n";
-    write_file_str("/mnt/system_a/system/etc/init/sailfish_user0_fallback.rc", user0_rc);
-    chmod("/mnt/system_a/system/etc/init/sailfish_user0_fallback.rc", 0644);
-    set_selinux_label("/mnt/system_a/system/etc/init/sailfish_user0_fallback.rc", "u:object_r:system_file:s0");
+        "    exec - root root -- /system/bin/sh /system/etc/sailfish_ensure_user0.sh\n"
+        "    start sailfish_power_aidl\n"
+        "    start sailfish_sensors_aidl\n"
+        "\n"
+        "on boot\n"
+        "    start sailfish_power_aidl\n"
+        "    start sailfish_sensors_aidl\n"
+        "\n"
+        "service sailfish_power_aidl /system/bin/android.hardware.power-service.sailfish\n"
+        "    interface aidl android.hardware.power.IPower/default\n"
+        "    class hal\n"
+        "    user system\n"
+        "    group system\n"
+        "\n"
+        "service sailfish_sensors_aidl /system/bin/android.hardware.sensors-service.sailfish\n"
+        "    interface aidl android.hardware.sensors.ISensors/default\n"
+        "    class hal\n"
+        "    user system\n"
+        "    group system\n";
+    const char *user0_rc_dst = "/mnt/system_a/system/etc/init/sailfish_user0_fallback.rc";
+    const char *user0_rc_tmp = "/tmp/sailfish_user0_fallback.rc";
+    write_file_str(user0_rc_tmp, user0_rc);
+    chmod(user0_rc_tmp, 0644);
+    set_selinux_label(user0_rc_tmp, "u:object_r:system_file:s0");
+    umount_all(user0_rc_dst);
+    int u0fd = open(user0_rc_dst, O_WRONLY | O_CREAT, 0644);
+    if (u0fd >= 0) close(u0fd);
+    if (bind_mount_clean(user0_rc_tmp, user0_rc_dst) == 0) {
+        set_selinux_label(user0_rc_dst, "u:object_r:system_file:s0");
+    } else {
+        write_file_str(user0_rc_dst, user0_rc);
+        chmod(user0_rc_dst, 0644);
+        set_selinux_label(user0_rc_dst, "u:object_r:system_file:s0");
+    }
 
 
-    /* Automated: Sync SELinux sha256 checksums to vendor so precompiled_sepolicy loads */
-    const char *sha_pairs[][2] = {
-        { "/mnt/system_a/system/etc/selinux/plat_sepolicy_and_mapping.sha256",
-          "/mnt/system_a/vendor/etc/selinux/precompiled_sepolicy.plat_sepolicy_and_mapping.sha256" },
-        { "/mnt/system_a/system_ext/etc/selinux/system_ext_sepolicy_and_mapping.sha256",
-          "/mnt/system_a/vendor/etc/selinux/precompiled_sepolicy.system_ext_sepolicy_and_mapping.sha256" },
-        { "/mnt/system_a/product/etc/selinux/product_sepolicy_and_mapping.sha256",
-          "/mnt/system_a/vendor/etc/selinux/precompiled_sepolicy.product_sepolicy_and_mapping.sha256" },
-        { NULL, NULL }
-    };
-    for (int i = 0; sha_pairs[i][0]; i++) {
-        if (access(sha_pairs[i][0], F_OK) == 0 && access(sha_pairs[i][1], F_OK) == 0) {
-            mount(sha_pairs[i][0], sha_pairs[i][1], NULL, MS_BIND, NULL);
+    /* Automated: Overlay /vendor/etc/selinux on tmpfs (vendor_a is MS_RDONLY) and sync
+     * GSI SELinux sha256 checksums so precompiled_sepolicy loads cleanly on stock vendor. */
+    const char *vsel_dir = "/mnt/system_a/vendor/etc/selinux";
+    const char *tmp_vsel = "/tmp/vendor_selinux";
+    umount_all(vsel_dir);
+    umount_all(tmp_vsel);
+    if (access("/mnt/system_a/vendor/etc/selinux/precompiled_sepolicy", F_OK) == 0) {
+        mkdir("/tmp", 0755);
+        mkdir(tmp_vsel, 0755);
+        if (mount("tmpfs", tmp_vsel, "tmpfs", 0, "mode=0755,uid=0,gid=0") == 0) {
+            char dir_lbl[128] = {0};
+            char sha_lbl[128] = {0};
+            copy_selinux_label_or(vsel_dir, dir_lbl, sizeof(dir_lbl), "u:object_r:vendor_configs_file:s0");
+            set_selinux_label(tmp_vsel, dir_lbl);
+            copy_selinux_label_or("/mnt/system_a/vendor/etc/selinux/precompiled_sepolicy.plat_sepolicy_and_mapping.sha256",
+                                  sha_lbl, sizeof(sha_lbl), "u:object_r:vendor_configs_file:s0");
+
+            DIR *sd = opendir(vsel_dir);
+            if (sd) {
+                struct dirent *de;
+                while ((de = readdir(sd)) != NULL) {
+                    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                        continue;
+                    char sp[512], dp[512], flbl[128];
+                    snprintf(sp, sizeof(sp), "%s/%s", vsel_dir, de->d_name);
+                    snprintf(dp, sizeof(dp), "%s/%s", tmp_vsel, de->d_name);
+                    struct stat st;
+                    if (lstat(sp, &st) != 0)
+                        continue;
+                    if (S_ISREG(st.st_mode)) {
+                        copy_selinux_label_or(sp, flbl, sizeof(flbl), "u:object_r:vendor_configs_file:s0");
+                        if (copy_file(sp, dp)) {
+                            chmod(dp, st.st_mode & 0777);
+                            set_selinux_label(dp, flbl);
+                        }
+                    } else if (S_ISLNK(st.st_mode)) {
+                        char target[512];
+                        ssize_t len = readlink(sp, target, sizeof(target) - 1);
+                        if (len > 0) {
+                            target[len] = '\0';
+                            copy_selinux_label_or(sp, flbl, sizeof(flbl), "u:object_r:vendor_configs_file:s0");
+                            if (symlink(target, dp) == 0)
+                                lsetxattr(dp, "security.selinux", flbl, strlen(flbl) + 1, 0);
+                        }
+                    }
+                }
+                closedir(sd);
+            }
+
+            const char *sha_sources[][3] = {
+                { "/mnt/system_a/system/etc/selinux/plat_sepolicy_and_mapping.sha256", NULL,
+                  "precompiled_sepolicy.plat_sepolicy_and_mapping.sha256" },
+                { "/mnt/system_a/system_ext/etc/selinux/system_ext_sepolicy_and_mapping.sha256",
+                  "/mnt/system_a/system/system_ext/etc/selinux/system_ext_sepolicy_and_mapping.sha256",
+                  "precompiled_sepolicy.system_ext_sepolicy_and_mapping.sha256" },
+                { "/mnt/system_a/product/etc/selinux/product_sepolicy_and_mapping.sha256",
+                  "/mnt/system_a/system/product/etc/selinux/product_sepolicy_and_mapping.sha256",
+                  "precompiled_sepolicy.product_sepolicy_and_mapping.sha256" },
+                { NULL, NULL, NULL }
+            };
+            int synced = 0;
+            for (int i = 0; sha_sources[i][2]; i++) {
+                const char *src_sha = (access(sha_sources[i][0], F_OK) == 0) ? sha_sources[i][0] :
+                                      (sha_sources[i][1] && access(sha_sources[i][1], F_OK) == 0) ? sha_sources[i][1] : NULL;
+                if (src_sha) {
+                    char dst_sha[512];
+                    snprintf(dst_sha, sizeof(dst_sha), "%s/%s", tmp_vsel, sha_sources[i][2]);
+                    if (copy_file(src_sha, dst_sha)) {
+                        chmod(dst_sha, 0644);
+                        set_selinux_label(dst_sha, sha_lbl);
+                        synced++;
+                    }
+                }
+            }
+
+            if (synced > 0 && bind_mount_clean(tmp_vsel, vsel_dir) == 0) {
+                usb_write("[+] Automated: Synced SELinux sha256 checksums via /vendor/etc/selinux tmpfs overlay\n");
+            }
         }
     }
 
@@ -2400,6 +3382,34 @@ static bool prepare_android_rootfs(bool for_shell) {
             }
             if (mount("/tmp/vintf_manifest", vintf_dir, NULL, MS_BIND, NULL) == 0) {
                 usb_write("[+] Automated: Overlaid /system/etc/vintf/manifest with graphics, power & sensors HAL fragments\n");
+            }
+        }
+    }
+
+    /* Overlay /system/product/overlay with static RRO enabling A17 mainline wpa_supplicant */
+    if (access("/tools/SailfishWifiOverlay.apk", F_OK) == 0) {
+        const char *ovl_dir = "/mnt/system_a/system/product/overlay";
+        umount_all(ovl_dir);
+        if (access(ovl_dir, F_OK) == 0) {
+            const char *tmp_ovl = "/tmp/product_overlay";
+            mkdir("/tmp", 0755);
+            mkdir(tmp_ovl, 0755);
+            umount_all(tmp_ovl);
+            if (mount("tmpfs", tmp_ovl, "tmpfs", 0, "mode=0755,uid=0,gid=0") == 0) {
+                copy_dir_labeled(ovl_dir, tmp_ovl, "u:object_r:system_file:s0", 0);
+                mkdir("/tmp/product_overlay/SailfishWifiOverlay", 0755);
+                chmod("/tmp/product_overlay/SailfishWifiOverlay", 0755);
+                set_selinux_label("/tmp/product_overlay/SailfishWifiOverlay",
+                                  "u:object_r:system_file:s0");
+                const char *dst_apk =
+                    "/tmp/product_overlay/SailfishWifiOverlay/SailfishWifiOverlay.apk";
+                if (copy_file("/tools/SailfishWifiOverlay.apk", dst_apk)) {
+                    chmod(dst_apk, 0644);
+                    set_selinux_label(dst_apk, "u:object_r:system_file:s0");
+                    if (mount(tmp_ovl, ovl_dir, NULL, MS_BIND, NULL) == 0) {
+                        usb_write("[+] Automated: Overlaid /system/product/overlay with SailfishWifiOverlay.apk\n");
+                    }
+                }
             }
         }
     }
@@ -2657,6 +3667,21 @@ static bool prepare_android_rootfs(bool for_shell) {
     /* Automated: Populate Qualcomm MDSS sysfs mock before binding /sys */
     setup_mdss_sysfs_mock();
 
+    /* Pre-create FunctionFS ADB mount & gadget function dir inside shared devtmpfs before
+     * MS_REC bind into /mnt/system_a/dev so adbd can always open /dev/usb-ffs/adb/ep0. */
+    mkdir("/sys/kernel/config/usb_gadget/g1/functions/ffs.adb", 0770);
+    chown("/sys/kernel/config/usb_gadget/g1/functions/ffs.adb", 2000, 2000);
+    umount_all("/dev/usb-ffs/adb");
+    mkdir("/dev/usb-ffs", 0770);
+    chown("/dev/usb-ffs", 2000, 2000);
+    set_selinux_label("/dev/usb-ffs", "u:object_r:functionfs:s0");
+    mkdir("/dev/usb-ffs/adb", 0770);
+    chown("/dev/usb-ffs/adb", 2000, 2000);
+    if (mount("adb", "/dev/usb-ffs/adb", "functionfs", 0, "rmode=0770,fmode=0660,uid=2000,gid=2000") == 0) {
+        set_selinux_label("/dev/usb-ffs/adb", "u:object_r:functionfs:s0");
+        usb_write("[+] Automated: Mounted FunctionFS /dev/usb-ffs/adb\n");
+    }
+
     /* Bind /dev, /proc, /sys into system_a */
     mkdir("/mnt/system_a/dev", 0755);
     mount("/dev", "/mnt/system_a/dev", NULL, MS_BIND | MS_REC, NULL);
@@ -2721,42 +3746,39 @@ static bool prepare_android_rootfs(bool for_shell) {
     set_selinux_label("/mnt/system_a/system/bin/init", "u:object_r:init_exec:s0");
     set_selinux_label("/mnt/system_a/init", "u:object_r:init_exec:s0");
 
-    /* Mount in-memory tmpfs for /data (bypasses Qualcomm ICE encryption dependency) */
-    umount_all("/mnt/system_a/data");
-    mkdir("/mnt/system_a/data", 0771);
-    mount("tmpfs", "/mnt/system_a/data", "tmpfs", 0, "mode=0771,uid=1000,gid=1000");
-    set_selinux_label("/mnt/system_a/data", "u:object_r:system_data_root_file:s0");
+    /* /data is already mounted (persistent /dev/sda35 or tmpfs) by mount_userdata_partition(). */
 
-    /* Write User 0 & FRP ensure script into writable tmpfs /data */
+    /* Write User 0 & FRP ensure script into writable /data */
+    unlink("/mnt/system_a/data/sailfish_ensure_user0.sh");
     write_file_str("/mnt/system_a/data/sailfish_ensure_user0.sh", ensure_user0_sh);
     chmod("/mnt/system_a/data/sailfish_ensure_user0.sh", 0755);
     set_selinux_label("/mnt/system_a/data/sailfish_ensure_user0.sh", "u:object_r:system_file:s0");
 
-    /* Automated: Install qservice_daemon into /data */
-    if (access("/tools/qservice_daemon", F_OK) == 0) {
-        copy_file("/tools/qservice_daemon", "/mnt/system_a/data/qservice_daemon");
-        chmod("/mnt/system_a/data/qservice_daemon", 0755);
-        set_selinux_label("/mnt/system_a/data/qservice_daemon", "u:object_r:system_file:s0");
-        usb_write("[+] Automated: Installed /data/qservice_daemon\n");
-    }
-
-    /* Automated: Install setup_composer_sysfs.sh into /data */
-    if (access("/tools/setup_composer_sysfs.sh", F_OK) == 0) {
-        copy_file("/tools/setup_composer_sysfs.sh", "/mnt/system_a/data/setup_composer_sysfs.sh");
-        chmod("/mnt/system_a/data/setup_composer_sysfs.sh", 0755);
-        set_selinux_label("/mnt/system_a/data/setup_composer_sysfs.sh", "u:object_r:system_file:s0");
-        usb_write("[+] Automated: Installed /data/setup_composer_sysfs.sh\n");
-    }
+    /* Automated: Install qservice_daemon and setup_composer_sysfs.sh into /data */
+    install_data_file("/tools/qservice_daemon", "/mnt/system_a/data/qservice_daemon",
+                      0755, "u:object_r:system_file:s0",
+                      "[+] Automated: Installed /data/qservice_daemon\n");
+    install_data_file("/tools/setup_composer_sysfs.sh", "/mnt/system_a/data/setup_composer_sysfs.sh",
+                      0755, "u:object_r:system_file:s0",
+                      "[+] Automated: Installed /data/setup_composer_sysfs.sh\n");
+    unlink("/mnt/system_a/data/start_qservice.sh");
+    write_file_str("/mnt/system_a/data/start_qservice.sh",
+                   "#!/system/bin/sh\n"
+                   "if ! pgrep -x qservice_daemon >/dev/null 2>&1 && [ -x /data/qservice_daemon ]; then\n"
+                   "    /data/qservice_daemon >/dev/null 2>&1 &\n"
+                   "    sleep 1\n"
+                   "fi\n");
+    chmod("/mnt/system_a/data/start_qservice.sh", 0755);
+    set_selinux_label("/mnt/system_a/data/start_qservice.sh", "u:object_r:system_file:s0");
 
     /* Automated: Install libsdm_shim.so into /system/lib64, /vendor/lib64, and /data */
     if (access("/tools/libsdm_shim.so", F_OK) == 0) {
         mkdir("/mnt/system_a/system/lib64", 0755);
         mkdir("/mnt/system_a/vendor/lib64", 0755);
 
-        copy_file("/tools/libsdm_shim.so", "/mnt/system_a/data/libsdm_shim.so");
-        chmod("/mnt/system_a/data/libsdm_shim.so", 0755);
-        set_selinux_label("/mnt/system_a/data/libsdm_shim.so", "u:object_r:system_file:s0");
-        usb_write("[+] Automated: Installed /data/libsdm_shim.so\n");
+        install_data_file("/tools/libsdm_shim.so", "/mnt/system_a/data/libsdm_shim.so",
+                          0755, "u:object_r:system_file:s0",
+                          "[+] Automated: Installed /data/libsdm_shim.so\n");
 
         const char *sys_shim = "/mnt/system_a/system/lib64/libsdm_shim.so";
         struct stat st_shim;
@@ -2801,17 +3823,23 @@ static bool prepare_android_rootfs(bool for_shell) {
     }
 
     /* Automated: Short-circuit AudioSystem/mediautils service wait stubs so StartAudioService
-     * returns in 0ms instead of starving system_server for 75s+ Watchdog timeouts. */
+     * returns in 0ms instead of starving system_server for 75s+ Watchdog timeouts, and skip
+     * synchronous binderDied() in registerSoundTriggerCaptureStateListener (0x5f2e0 -> 0x5f4d8)
+     * so ExternalCaptureStateTracker does not spin-loop at 85%+ CPU across system_server/logd. */
     static const unsigned char audiobase_ret_null[12] = {
         0x5f, 0x24, 0x03, 0xd5, /* bti c */
         0x1f, 0x01, 0x00, 0xf9, /* str xzr, [x8] */
         0xc0, 0x03, 0x5f, 0xd6  /* ret */
+    };
+    static const unsigned char audiobase_skip_capture_die[4] = {
+        0x7e, 0x00, 0x00, 0x14  /* b 0x5f4d8 (return 0 without binderDied) */
     };
     const struct bin_patch audiobase_patches[] = {
         { 0x3c7a0, audiobase_ret_null, sizeof(audiobase_ret_null) },
         { 0x3c7ac, audiobase_ret_null, sizeof(audiobase_ret_null) },
         { 0x42da0, audiobase_ret_null, sizeof(audiobase_ret_null) },
         { 0x42dac, audiobase_ret_null, sizeof(audiobase_ret_null) },
+        { 0x5f2e0, audiobase_skip_capture_die, sizeof(audiobase_skip_capture_die) },
         { 0x63f04, audiobase_ret_null, sizeof(audiobase_ret_null) },
         { 0x6afa0, audiobase_ret_null, sizeof(audiobase_ret_null) },
     };
@@ -2848,25 +3876,72 @@ static bool prepare_android_rootfs(bool for_shell) {
         "u:object_r:system_lib_file:s0",
         selinux_patches, sizeof(selinux_patches) / sizeof(selinux_patches[0]),
         "[+] Automated: Patched & bind-mounted /system/lib64/libselinux.so\n");
-    if (access("/tools/libEGL_adreno_shim.so", F_OK) == 0) {
-        copy_file("/tools/libEGL_adreno_shim.so", "/mnt/system_a/data/libEGL_adreno_shim.so");
-        chmod("/mnt/system_a/data/libEGL_adreno_shim.so", 0755);
-        set_selinux_label("/mnt/system_a/data/libEGL_adreno_shim.so", "u:object_r:system_file:s0");
-        usb_write("[+] Automated: Installed /data/libEGL_adreno_shim.so\n");
-    }
-    if (access("/tools/libadreno_utils.so", F_OK) == 0) {
-        copy_file("/tools/libadreno_utils.so", "/mnt/system_a/data/libadreno_utils.so");
-        chmod("/mnt/system_a/data/libadreno_utils.so", 0644);
-        set_selinux_label("/mnt/system_a/data/libadreno_utils.so", "u:object_r:same_process_hal_file:s0");
-        usb_write("[+] Automated: Installed /data/libadreno_utils.so\n");
-    }
+    install_data_file("/tools/libEGL_adreno_shim.so", "/mnt/system_a/data/libEGL_adreno_shim.so",
+                      0755, "u:object_r:system_file:s0",
+                      "[+] Automated: Installed /data/libEGL_adreno_shim.so\n");
+    install_data_file("/tools/libadreno_utils.so", "/mnt/system_a/data/libadreno_utils.so",
+                      0644, "u:object_r:same_process_hal_file:s0",
+                      "[+] Automated: Installed /data/libadreno_utils.so\n");
 
-    /* Automated: Save permissive ld.config.txt copy on /data tmpfs so init/supervisor can restore it */
+    /* Automated: Save permissive ld.config.txt copy on /data so init/supervisor can restore it */
+    unlink("/mnt/system_a/data/ld.config.sailfish.txt");
     if (write_permissive_ld_config("/mnt/system_a/data/ld.config.sailfish.txt", "u:object_r:system_file:s0")) {
         usb_write("[+] Automated: Installed /data/ld.config.sailfish.txt backup\n");
     }
 
+    /* Automated: Write safe composite USB ADB helper script (leaves acm.gs0 active if ffs fails) */
+    const char *setup_usb_adb_sh =
+        "#!/system/bin/sh\n"
+        "ACTION=\"$1\"\n"
+        "UDC=\"$2\"\n"
+        "[ -z \"$UDC\" ] && UDC=\"$(ls /sys/class/udc 2>/dev/null | head -n 1)\"\n"
+        "[ -z \"$UDC\" ] && exit 0\n"
+        "G1=/config/usb_gadget/g1\n"
+        "[ -d \"$G1\" ] || exit 0\n"
+        "CUR_UDC=\"$(cat $G1/UDC 2>/dev/null)\"\n"
+        "if [ \"$ACTION\" = \"unbind\" ]; then\n"
+        "    [ -e \"$G1/configs/c.1/ffs.adb\" ] || exit 0\n"
+        "    echo \"none\" > \"$G1/UDC\" 2>/dev/null || echo \"\" > \"$G1/UDC\" 2>/dev/null || true\n"
+        "    rm -f \"$G1/configs/c.1/ffs.adb\"\n"
+        "    echo 0x18d1 > \"$G1/idVendor\" 2>/dev/null || true\n"
+        "    echo 0xd001 > \"$G1/idProduct\" 2>/dev/null || true\n"
+        "    echo \"CDC-ACM\" > \"$G1/configs/c.1/strings/0x409/configuration\" 2>/dev/null || true\n"
+        "    [ -e \"$G1/configs/c.1/acm.gs0\" ] || ln -s \"$G1/functions/acm.gs0\" \"$G1/configs/c.1/acm.gs0\" 2>/dev/null || true\n"
+        "    echo \"$UDC\" > \"$G1/UDC\" 2>/dev/null || true\n"
+        "    exit 0\n"
+        "fi\n"
+        "if [ ! -e /dev/usb-ffs/adb/ep0 ]; then\n"
+        "    mkdir -p /dev/usb-ffs/adb 2>/dev/null || true\n"
+        "    mount -t functionfs adb /dev/usb-ffs/adb -o rmode=0770,fmode=0660,uid=2000,gid=2000 2>/dev/null || true\n"
+        "fi\n"
+        "mkdir -p \"$G1/functions/ffs.adb\" 2>/dev/null || true\n"
+        "if [ -e \"$G1/configs/c.1/ffs.adb\" ] && [ -e \"$G1/configs/c.1/acm.gs0\" ] && [ \"$CUR_UDC\" = \"$UDC\" ]; then\n"
+        "    exit 0\n"
+        "fi\n"
+        "echo \"none\" > \"$G1/UDC\" 2>/dev/null || echo \"\" > \"$G1/UDC\" 2>/dev/null || true\n"
+        "echo 0x18d1 > \"$G1/idVendor\" 2>/dev/null || true\n"
+        "echo 0x4ee2 > \"$G1/idProduct\" 2>/dev/null || true\n"
+        "echo 0x00 > \"$G1/bDeviceClass\" 2>/dev/null || true\n"
+        "echo 0x00 > \"$G1/bDeviceSubClass\" 2>/dev/null || true\n"
+        "echo 0x00 > \"$G1/bDeviceProtocol\" 2>/dev/null || true\n"
+        "echo \"ACM-ADB\" > \"$G1/configs/c.1/strings/0x409/configuration\" 2>/dev/null || true\n"
+        "[ -e \"$G1/configs/c.1/acm.gs0\" ] || ln -s \"$G1/functions/acm.gs0\" \"$G1/configs/c.1/acm.gs0\" 2>/dev/null || true\n"
+        "rm -f \"$G1/configs/c.1/ffs.adb\" 2>/dev/null || true\n"
+        "ln -s \"$G1/functions/ffs.adb\" \"$G1/configs/c.1/ffs.adb\" 2>/dev/null || true\n"
+        "if ! echo \"$UDC\" > \"$G1/UDC\" 2>/dev/null; then\n"
+        "    rm -f \"$G1/configs/c.1/ffs.adb\"\n"
+        "    echo 0xd001 > \"$G1/idProduct\" 2>/dev/null || true\n"
+        "    echo \"CDC-ACM\" > \"$G1/configs/c.1/strings/0x409/configuration\" 2>/dev/null || true\n"
+        "    echo \"$UDC\" > \"$G1/UDC\" 2>/dev/null || true\n"
+        "fi\n";
+    unlink("/mnt/system_a/data/setup_usb_adb.sh");
+    write_file_str("/mnt/system_a/data/setup_usb_adb.sh", setup_usb_adb_sh);
+    chmod("/mnt/system_a/data/setup_usb_adb.sh", 0755);
+    set_selinux_label("/mnt/system_a/data/setup_usb_adb.sh", "u:object_r:system_file:s0");
+    usb_write("[+] Automated: Installed /data/setup_usb_adb.sh\n");
+
     /* Automated: Generate /data/start_graphics.sh environment helper (init manages HAL/SF/bootanim via wrap_preload) */
+    unlink("/mnt/system_a/data/start_graphics.sh");
     FILE *gf = fopen("/mnt/system_a/data/start_graphics.sh", "w");
     if (gf) {
         fprintf(gf, "#!/system/bin/sh\n"
@@ -2882,17 +3957,22 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "touch /sys/devices/virtual/graphics/fb0/vsync_event 2>/dev/null\n"
                     "chmod 666 /sys/devices/virtual/graphics/fb0/vsync_event 2>/dev/null\n"
                     "echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/null || true\n"
-                    "echo 200 > /sys/class/backlight/994000.dsi.0/brightness 2>/dev/null || true\n"
-                    "echo 401800000 > /sys/class/devfreq/b00000.gpu/min_freq 2>/dev/null || true\n"
+                    "echo 96 > /sys/class/backlight/994000.dsi.0/brightness 2>/dev/null || true\n"
+                    "if [ -b /dev/block/zram0 ] && ! grep -q zram0 /proc/swaps 2>/dev/null; then\n"
+                    "    echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null || true\n"
+                    "    echo 2147483648 > /sys/block/zram0/disksize 2>/dev/null || true\n"
+                    "    /system/bin/mkswap /dev/block/zram0 2>/dev/null || true\n"
+                    "    /system/bin/swapon -p 32758 /dev/block/zram0 2>/dev/null || true\n"
+                    "    echo 0 > /proc/sys/vm/page-cluster 2>/dev/null || true\n"
+                    "    echo 100 > /proc/sys/vm/swappiness 2>/dev/null || true\n"
+                    "fi\n"
                     "if [ -d /apex/com.android.nfcservices/priv-app ]; then\n"
                     "    mount -t tmpfs tmpfs /apex/com.android.nfcservices/priv-app 2>/dev/null || true\n"
                     "fi\n"
                     "if [ -f /data/libadreno_utils.so ]; then\n"
                     "    mount -o bind /data/libadreno_utils.so /vendor/lib64/libadreno_utils.so 2>/dev/null || true\n"
                     "fi\n"
-                    "for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do\n"
-                    "    echo performance > \"$g\" 2>/dev/null || true\n"
-                    "done\n"
+                    "# Keep kernel schedutil CPUfreq governor active\n"
                     "if ! losetup /dev/block/loop95 >/dev/null 2>&1; then\n"
                     "    dd if=/dev/zero of=/data/frp.img bs=1024 count=512 2>/dev/null || true\n"
                     "    losetup /dev/block/loop95 /data/frp.img 2>/dev/null || true\n"
@@ -2908,7 +3988,21 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "    bootanim_stopped=0\n"
                     "    qservice_up=0\n"
                     "    nfc_hidden=0\n"
+                    "    fbcon_unbound=0\n"
+                    "    sf_pid_last=\"\"\n"
+                    "    if ! pgrep -f android.hardware.power-service.sailfish >/dev/null 2>&1; then\n"
+                    "        /system/bin/android.hardware.power-service.sailfish >/dev/null 2>&1 &\n"
+                    "    fi\n"
+                    "    if ! pgrep -f android.hardware.sensors-service.sailfish >/dev/null 2>&1; then\n"
+                    "        /system/bin/android.hardware.sensors-service.sailfish >/dev/null 2>&1 &\n"
+                    "    fi\n"
                     "    while true; do\n"
+                    "        if ! pgrep -f android.hardware.power-service.sailfish >/dev/null 2>&1; then\n"
+                    "            /system/bin/android.hardware.power-service.sailfish >/dev/null 2>&1 &\n"
+                    "        fi\n"
+                    "        if ! pgrep -f android.hardware.sensors-service.sailfish >/dev/null 2>&1; then\n"
+                    "            /system/bin/android.hardware.sensors-service.sailfish >/dev/null 2>&1 &\n"
+                    "        fi\n"
                     "        if [ \"$nfc_hidden\" = \"0\" ] && [ -d /apex/com.android.nfcservices/priv-app ]; then\n"
                     "            if mount -t tmpfs tmpfs /apex/com.android.nfcservices/priv-app 2>/dev/null; then\n"
                     "                nfc_hidden=1\n"
@@ -2925,51 +4019,107 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "        elif [ ! -f /data/.sailfish_provisioned ]; then\n"
                     "            if /system/bin/cmd settings put global device_provisioned 1 2>/dev/null && \\\n"
                     "               /system/bin/cmd settings put secure user_setup_complete 1 2>/dev/null; then\n"
-                    "                /system/bin/cmd settings put global stay_on_while_plugged_in 7 2>/dev/null || true\n"
-                    "                /system/bin/cmd settings put system screen_off_timeout 2147483647 2>/dev/null || true\n"
-                    "                /system/bin/cmd settings put global window_animation_scale 0.0 2>/dev/null || true\n"
-                    "                /system/bin/cmd settings put global transition_animation_scale 0.0 2>/dev/null || true\n"
-                    "                /system/bin/cmd settings put global animator_duration_scale 0.0 2>/dev/null || true\n"
-                    "                /system/bin/cmd locksettings set-disabled true 2>/dev/null || true\n"
+                    "                /system/bin/cmd settings put global stay_on_while_plugged_in 0 2>/dev/null || true\n"
+                    "                /system/bin/cmd settings put system screen_off_timeout 600000 2>/dev/null || true\n"
+                    "                /system/bin/cmd settings put global disable_window_blurs 1 2>/dev/null || true\n"
+                    "                /system/bin/cmd settings put global window_animation_scale 1.0 2>/dev/null || true\n"
+                    "                /system/bin/cmd settings put global transition_animation_scale 1.0 2>/dev/null || true\n"
+                    "                /system/bin/cmd settings put global animator_duration_scale 1.0 2>/dev/null || true\n"
+                    "                /system/bin/cmd lock_settings set-disabled true 2>/dev/null || /system/bin/locksettings set-disabled true 2>/dev/null || true\n"
                     "                /system/bin/cmd package disable-user --user 0 com.android.nfc 2>/dev/null || true\n"
+                    "                /system/bin/cmd settings put global adb_enabled 0 2>/dev/null || true\n"
                     "                touch /data/.sailfish_provisioned 2>/dev/null || true\n"
                     "            fi\n"
                     "        fi\n"
+                    "        if [ \"$boot_done\" = \"1\" ] && [ ! -f /data/.sailfish_adb_off_v1 ]; then\n"
+                    "            if [ \"$(getprop sys.sailfish.adb)\" != \"1\" ]; then\n"
+                    "                /system/bin/cmd settings put global adb_enabled 0 2>/dev/null || true\n"
+                    "                setprop persist.sys.usb.config none 2>/dev/null || true\n"
+                    "                setprop sys.usb.config none 2>/dev/null || true\n"
+                    "                stop adbd 2>/dev/null || true\n"
+                    "            fi\n"
+                    "            touch /data/.sailfish_adb_off_v1 2>/dev/null || true\n"
+                    "        fi\n"
+                    "        if [ \"$boot_done\" = \"1\" ] && [ ! -f /data/.sailfish_power_tuned_v3 ]; then\n"
+                    "            /system/bin/cmd settings put global stay_on_while_plugged_in 0 2>/dev/null || true\n"
+                    "            /system/bin/cmd settings put system screen_off_timeout 600000 2>/dev/null || true\n"
+                    "            /system/bin/cmd settings put global disable_window_blurs 1 2>/dev/null || true\n"
+                    "            /system/bin/cmd settings put global window_animation_scale 1.0 2>/dev/null || true\n"
+                    "            /system/bin/cmd settings put global transition_animation_scale 1.0 2>/dev/null || true\n"
+                    "            /system/bin/cmd settings put global animator_duration_scale 1.0 2>/dev/null || true\n"
+                    "            touch /data/.sailfish_power_tuned_v3 2>/dev/null || true\n"
+                    "        fi\n"
+                    "        sf_pid=\"$(pidof surfaceflinger.real 2>/dev/null || pidof surfaceflinger 2>/dev/null || pgrep -f '/system/bin/surfaceflinger' 2>/dev/null | head -n 1)\"\n"
+                    "        if [ -n \"$sf_pid\" ] && [ \"$fbcon_unbound\" = \"0\" ]; then\n"
+                    "            echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/null || true\n"
+                    "            for v in /sys/class/vtconsole/vtcon*; do\n"
+                    "                if [ -f \"$v/name\" ] && grep -qi \"frame buffer\" \"$v/name\" 2>/dev/null; then\n"
+                    "                    echo 0 > \"$v/bind\" 2>/dev/null || true\n"
+                    "                fi\n"
+                    "            done\n"
+                    "            fbcon_unbound=1\n"
+                    "        fi\n"
+                    "        if [ -n \"$sf_pid\" ] && [ \"$sf_pid\" != \"$sf_pid_last\" ]; then\n"
+                    "            if /system/bin/service check SurfaceFlinger 2>/dev/null | grep -q \": found\"; then\n"
+                    "                sleep 1\n"
+                    "                /system/bin/service call SurfaceFlinger 1008 i32 1 >/dev/null 2>&1 || true\n"
+                    "                sf_pid_last=\"$sf_pid\"\n"
+                    "            fi\n"
+                    "        fi\n"
+                    "        if [ \"$boot_done\" = \"1\" ]; then\n"
+                    "            if [ -n \"$(pidof bootanimation.real 2>/dev/null || pidof bootanimation 2>/dev/null || pgrep -f '/system/bin/bootanimation' 2>/dev/null)\" ]; then\n"
+                    "                setprop service.bootanim.exit 1 2>/dev/null || true\n"
+                    "                setprop ctl.stop bootanim 2>/dev/null || true\n"
+                    "                stop bootanim 2>/dev/null || true\n"
+                    "            fi\n"
+                    "        fi\n"
                     "        if [ \"$boot_done\" = \"1\" ] && [ \"$bootanim_stopped\" = \"0\" ]; then\n"
+                    "            /system/bin/service call SurfaceFlinger 1008 i32 1 >/dev/null 2>&1 || true\n"
                     "            echo 0 > /sys/class/graphics/fb0/blank 2>/dev/null || true\n"
                     "            echo 0 > /sys/class/backlight/994000.dsi.0/bl_power 2>/dev/null || true\n"
-                    "            echo 200 > /sys/class/backlight/994000.dsi.0/brightness 2>/dev/null || true\n"
+                    "            echo 96 > /sys/class/backlight/994000.dsi.0/brightness 2>/dev/null || true\n"
+                    "            /system/bin/cmd lock_settings set-disabled true 2>/dev/null || /system/bin/locksettings set-disabled true 2>/dev/null || true\n"
                     "            /system/bin/cmd input keyevent 224 2>/dev/null || true\n"
                     "            /system/bin/cmd window dismiss-keyguard 2>/dev/null || true\n"
-                    "            /system/bin/cmd input keyevent 82 2>/dev/null || true\n"
+                    "            /system/bin/cmd statusbar collapse 2>/dev/null || true\n"
                     "            setprop service.bootanim.exit 1 2>/dev/null || true\n"
+                    "            setprop ctl.stop bootanim 2>/dev/null || true\n"
                     "            stop bootanim 2>/dev/null || true\n"
                     "            sleep 2\n"
-                    "            /system/bin/cmd input keyevent 66 2>/dev/null || true\n"
+                    "            if /system/bin/dumpsys window 2>/dev/null | grep -q \"mCurrentFocus=.*Android System\"; then\n"
+                    "                /system/bin/cmd input keyevent 66 2>/dev/null || true\n"
+                    "            fi\n"
+                    "            /system/bin/cmd statusbar collapse 2>/dev/null || true\n"
                     "            bootanim_stopped=1\n"
                     "        fi\n"
                     "        if [ \"$qservice_up\" = \"0\" ]; then\n"
                     "            if pgrep -f vndservicemanager >/dev/null 2>&1 || [ \"$(getprop init.svc.vndservicemanager)\" = \"running\" ]; then\n"
-                    "                if ! pgrep -x qservice_daemon >/dev/null 2>&1; then\n"
+                    "                if pgrep -x qservice_daemon >/dev/null 2>&1; then\n"
+                    "                    qservice_up=1\n"
+                    "                else\n"
                     "                    hwc_was_up=0\n"
                     "                    if pgrep -f graphics.composer@2.1-service >/dev/null 2>&1 || [ \"$(getprop init.svc.vendor.hwcomposer-2-1)\" = \"running\" ]; then\n"
                     "                        hwc_was_up=1\n"
                     "                    fi\n"
                     "                    /data/qservice_daemon >/dev/null 2>&1 &\n"
-                    "                    if [ \"$hwc_was_up\" = \"1\" ] && [ \"$hwc_restarted\" = \"0\" ]; then\n"
+                    "                    if [ \"$boot_done\" != \"1\" ] && [ \"$hwc_was_up\" = \"1\" ] && [ \"$hwc_restarted\" = \"0\" ]; then\n"
                     "                        sleep 1\n"
                     "                        setprop ctl.restart vendor.hwcomposer-2-1 2>/dev/null || true\n"
+                    "                        if [ -n \"$sf_pid\" ]; then\n"
+                    "                            sleep 1\n"
+                    "                            setprop ctl.restart surfaceflinger 2>/dev/null || true\n"
+                    "                            sf_pid_last=\"\"\n"
+                    "                        fi\n"
                     "                        hwc_restarted=1\n"
                     "                    fi\n"
+                    "                    qservice_up=1\n"
                     "                fi\n"
-                    "                qservice_up=1\n"
                     "            fi\n"
                     "        fi\n"
-                    "        if [ \"$bootanim_stopped\" = \"1\" ] && [ -f /data/.sailfish_provisioned ] && [ \"$qservice_up\" = \"1\" ]; then\n"
-                    "            break\n"
-                    "        fi\n"
-                    "        if [ \"$boot_done\" = \"1\" ]; then\n"
-                    "            sleep 5\n"
+                    "        if [ \"$boot_done\" = \"1\" ] && [ \"$bootanim_stopped\" = \"1\" ]; then\n"
+                    "            sleep 10\n"
+                    "        elif [ \"$boot_done\" = \"1\" ]; then\n"
+                    "            sleep 3\n"
                     "        else\n"
                     "            sleep 1\n"
                     "        fi\n"
@@ -3039,15 +4189,22 @@ static bool prepare_android_rootfs(bool for_shell) {
 
     /* Automated: Pre-configure zeroed 512 KB FRP loop block device on /dev/block/loop95
      * so PersistentDataBlockService initializes with Android 17 FRP_SECRET_MAGIC. */
-    mkdir("/tmp", 0755);
-    int frp_ffd = open("/tmp/frp.img", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    const char *frp_backing = g_data_persistent ? "/mnt/system_a/data/frp.img" : "/tmp/frp.img";
+    if (!g_data_persistent)
+        mkdir("/tmp", 0755);
+    struct stat frp_st;
+    bool need_frp_init = !(g_data_persistent && stat(frp_backing, &frp_st) == 0 && frp_st.st_size == 512 * 1024);
+    int frp_flags = need_frp_init ? (O_RDWR | O_CREAT | O_TRUNC) : O_RDWR;
+    int frp_ffd = open(frp_backing, frp_flags, 0600);
     if (frp_ffd >= 0) {
-        if (ftruncate(frp_ffd, 512 * 1024) == 0) {
+        if (!need_frp_init || ftruncate(frp_ffd, 512 * 1024) == 0) {
             int frp_lfd = open("/dev/block/loop95", O_RDWR);
             if (frp_lfd >= 0) {
                 ioctl(frp_lfd, 0x4C01, 0); /* LOOP_CLR_FD */
                 if (ioctl(frp_lfd, 0x4C00, frp_ffd) == 0) { /* LOOP_SET_FD */
-                    usb_write("[+] Automated: Attached zeroed 512 KB /tmp/frp.img -> /dev/block/loop95\n");
+                    usb_write(g_data_persistent ?
+                              "[+] Automated: Attached 512 KB /data/frp.img -> /dev/block/loop95\n" :
+                              "[+] Automated: Attached zeroed 512 KB /tmp/frp.img -> /dev/block/loop95\n");
                 }
                 close(frp_lfd);
             }
@@ -3560,6 +4717,9 @@ static void spawn_android_supervisor(void) {
         { "dalvik.vm.extra-opts", "-Xverify:none" },
         { "pm.dexopt.first-boot", "skip" },
         { "pm.dexopt.boot-after-ota", "skip" },
+        { "dalvik.vm.boot-dex2oat-threads", "2" },
+        { "dalvik.vm.dex2oat-threads", "2" },
+        { "dalvik.vm.background-dex2oat-threads", "1" },
         { "sys.listeners.registered", "true" },
         { "sys.time.set", "true" },
         { "keystore.module_hash.sent", "true" },
@@ -3569,6 +4729,15 @@ static void spawn_android_supervisor(void) {
     };
 
     for (int p = 0; props[p][0]; p++) {
+        if (g_data_persistent &&
+            (strcmp(props[p][0], "dalvik.vm.dexopt-flags") == 0 ||
+             strcmp(props[p][0], "dalvik.vm.extra-opts") == 0 ||
+             strncmp(props[p][0], "pm.dexopt.", 10) == 0)) {
+            continue;
+        }
+        if (!g_data_persistent && strstr(props[p][0], "dex2oat-threads")) {
+            continue;
+        }
         supervisor_setprop(init_pid, props[p][0], props[p][1]);
         usleep(50000);
     }
@@ -3750,6 +4919,28 @@ static void boot_android_init(const char *stage) {
             umount2("/proc", MNT_DETACH);
             mkdir("/proc", 0555);
             mount("proc", "/proc", "proc", 0, NULL);
+
+            /* Prevent USB-plugged power-on resets from trapping Android init in charger mode */
+            int cmd_fd = open("/proc/cmdline", O_RDONLY);
+            if (cmd_fd >= 0) {
+                char cmdline[2048];
+                ssize_t clen = read(cmd_fd, cmdline, sizeof(cmdline) - 1);
+                close(cmd_fd);
+                if (clen > 0) {
+                    cmdline[clen] = '\0';
+                    const char *needle = "androidboot.mode=charger";
+                    char *hit = strstr(cmdline, needle);
+                    if (hit) {
+                        char patched[2048];
+                        size_t pre = (size_t)(hit - cmdline);
+                        snprintf(patched, sizeof(patched), "%.*sandroidboot.mode=normal%s",
+                                 (int)pre, cmdline, hit + strlen(needle));
+                        write_file_str("/dev/.sailfish_cmdline", patched);
+                        chmod("/dev/.sailfish_cmdline", 0444);
+                        mount("/dev/.sailfish_cmdline", "/proc/cmdline", NULL, MS_BIND, NULL);
+                    }
+                }
+            }
 
             /* Direct early init stdout/stderr to kmsg and ttyGS0 */
             int kfd_out = open("/dev/kmsg", O_WRONLY | O_NOCTTY);
@@ -3975,6 +5166,112 @@ static void test_gpu(void) {
     dump_dmesg_filtered(60, "msm");
 }
 
+static void cmd_format_userdata(bool confirmed) {
+    if (!confirmed) {
+        usb_write("[!] WARNING: This formats /dev/sda35 (userdata) as unencrypted ext4 for persistent /data.\n"
+                  "[!] Any stock or encrypted data currently on /dev/sda35 will be ERASED.\n"
+                  "[!] Run 'format_userdata confirm' if you want to proceed.\n");
+        return;
+    }
+
+    if (find_android_init_pid() > 1) {
+        usb_write("[-] Cannot format userdata while Android init is running. Reboot to sailfish# first.\n");
+        return;
+    }
+
+    if (access("/dev/sda35", F_OK) != 0) {
+        usb_write("[-] /dev/sda35 not found\n");
+        return;
+    }
+
+    umount_all("/mnt/system_a/data");
+    umount_all("/mnt/userdata_probe");
+
+    if (dev_in_proc_mounts("/dev/sda35")) {
+        usb_write("[-] /dev/sda35 is still mounted elsewhere (e.g. as system root); refusing format.\n");
+        return;
+    }
+
+    mkdir("/mnt", 0755);
+    mkdir("/mnt/system_a", 0755);
+    if (access("/mnt/system_a/system/bin/mke2fs", F_OK) != 0) {
+        mount("/dev/sda33", "/mnt/system_a", "ext4", MS_RDONLY, NULL);
+    }
+    if (access("/mnt/system_a/system/bin/mke2fs", F_OK) != 0) {
+        usb_write("[-] /mnt/system_a/system/bin/mke2fs not available on sda33; use 'fastboot format:ext4 userdata'\n");
+        return;
+    }
+
+    bool bound_dev = false, bound_proc = false;
+    if (access("/mnt/system_a/dev/sda35", F_OK) != 0) {
+        mkdir("/mnt/system_a/dev", 0755);
+        bound_dev = (mount("/dev", "/mnt/system_a/dev", NULL, MS_BIND | MS_REC, NULL) == 0);
+    }
+    if (access("/mnt/system_a/proc/mounts", F_OK) != 0) {
+        mkdir("/mnt/system_a/proc", 0755);
+        bound_proc = (mount("proc", "/mnt/system_a/proc", "proc", 0, NULL) == 0);
+    }
+
+    int prev_flags = -1;
+    if (g_ttygs_fd >= 0) {
+        prev_flags = fcntl(g_ttygs_fd, F_GETFL, 0);
+        if (prev_flags >= 0)
+            fcntl(g_ttygs_fd, F_SETFL, prev_flags & ~O_NONBLOCK);
+    }
+
+    usb_write("[+] Formatting /dev/sda35 as unencrypted ext4 (label=userdata)...\n");
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (g_ttygs_fd >= 0) {
+            dup2(g_ttygs_fd, 0);
+            dup2(g_ttygs_fd, 1);
+            dup2(g_ttygs_fd, 2);
+        }
+        if (chroot("/mnt/system_a") != 0 || chdir("/") != 0)
+            _exit(126);
+        char *const argv[] = { "mke2fs", "-F", "-t", "ext4", "-b", "4096", "-L", "userdata", "/dev/sda35", NULL };
+        char *const envp[] = { "PATH=/system/bin", NULL };
+        execve("/system/bin/mke2fs", argv, envp);
+        _exit(127);
+    }
+
+    int st = -1;
+    if (pid > 0)
+        waitpid(pid, &st, 0);
+
+    if (prev_flags >= 0 && g_ttygs_fd >= 0)
+        fcntl(g_ttygs_fd, F_SETFL, prev_flags);
+
+    if (bound_proc)
+        umount_all("/mnt/system_a/proc");
+    if (bound_dev)
+        umount_all("/mnt/system_a/dev");
+
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        char emsg[128];
+        snprintf(emsg, sizeof(emsg), "[-] mke2fs failed (status=%d)\n", WIFEXITED(st) ? WEXITSTATUS(st) : st);
+        usb_write(emsg);
+        return;
+    }
+
+    mkdir("/mnt/userdata_probe", 0755);
+    if (mount("/dev/sda35", "/mnt/userdata_probe", "ext4", MS_NOATIME, NULL) == 0) {
+        int mfd = open("/mnt/userdata_probe/.sailfish_unencrypted", O_WRONLY | O_CREAT, 0600);
+        if (mfd >= 0) {
+            write(mfd, "sailfish-unencrypted-data\n", 26);
+            close(mfd);
+        }
+        chown("/mnt/userdata_probe", 1000, 1000);
+        chmod("/mnt/userdata_probe", 0771);
+        sync();
+        if (umount2("/mnt/userdata_probe", 0) != 0)
+            umount_all("/mnt/userdata_probe");
+        usb_write("[+] /dev/sda35 formatted & marked unencrypted! Run 'boot_android' or 'reboot'.\n");
+    } else {
+        usb_write("[!] Formatted /dev/sda35, but probe-mount failed; reboot and check.\n");
+    }
+}
+
 static void handle_usb_cmd(char *cmd) {
     while (*cmd == ' ' || *cmd == '\t')
         cmd++;
@@ -3999,8 +5296,10 @@ static void handle_usb_cmd(char *cmd) {
                   "  boot_linux / pmos - Pivot root and hand off control to Linux /sbin/init\n"
                   "  input / touch     - List input devices & monitor events for 10s\n"
                   "  battery           - Show battery capacity, voltage, and charger state\n"
+                  "  thermal / diag    - Show thermal temps, CPU/GPU freqs, ZRAM, and ramoops\n"
                   "  display / drm     - Show DRM/KMS connectors, CRTCs, and backlight\n"
                   "  gpu / freedreno   - Test DRI nodes & trigger GPU firmware load\n"
+                  "  wifi              - Show PCIe/ath10k/wlan0/rfkill status & dmesg\n"
                   "  android / aosp    - Check Binder, DMA-BUF heaps, PSI, and SELinux\n"
                   "  touch_test        - Sweep switch & reset GPIOs and test I2C ACK\n"
                   "  i2c / i2c_scan    - Scan /dev/i2c-0 for responsive slave addresses\n"
@@ -4014,6 +5313,7 @@ static void handle_usb_cmd(char *cmd) {
                   "  ls [dir]          - List directory entries\n"
                   "  cat <file>        - Print file contents (up to 2000 lines)\n"
                   "  mount_sys         - Mount sda33 (/mnt/system_a) & sda31 (/mnt/vendor_a) ro\n"
+                  "  format_userdata   - Format /dev/sda35 as unencrypted ext4 /data (needs confirm)\n"
                   "  bootloader        - Reboot directly to fastboot\n"
                   "  recovery          - Reboot directly to recovery (TWRP)\n"
                   "  reboot            - Normal reboot\n");
@@ -4051,10 +5351,14 @@ static void handle_usb_cmd(char *cmd) {
         test_input_events(10);
     } else if (strcmp(cmd, "battery") == 0 || strcmp(cmd, "power") == 0) {
         dump_battery_info();
+    } else if (strcmp(cmd, "thermal") == 0 || strcmp(cmd, "diag") == 0) {
+        dump_thermal_perf();
     } else if (strcmp(cmd, "display") == 0 || strcmp(cmd, "drm") == 0) {
         dump_display_info();
     } else if (strcmp(cmd, "gpu") == 0 || strcmp(cmd, "freedreno") == 0) {
         test_gpu();
+    } else if (strcmp(cmd, "wifi") == 0) {
+        dump_wifi_info();
     } else if (strcmp(cmd, "android") == 0 || strcmp(cmd, "aosp") == 0) {
         test_android_primitives();
     } else if (strcmp(cmd, "android_sh") == 0 || strcmp(cmd, "sh") == 0) {
@@ -4099,12 +5403,21 @@ stream_done:
     } else if (strcmp(cmd, "boot_linux") == 0 || strcmp(cmd, "boot_pmos") == 0 || strcmp(cmd, "pmos") == 0) {
         boot_linux_init();
     } else if (strcmp(cmd, "usb") == 0) {
-        char state[64], speed[64];
+        char udc[96], state[64], speed[64], vid[16], pid[16];
+        if (!find_udc(udc, sizeof(udc)))
+            snprintf(udc, sizeof(udc), "6a00000.usb");
         get_udc_state(state, sizeof(state));
-        read_first_line("/sys/class/udc/6a00000.usb/current_speed", speed, sizeof(speed));
-        char out[192];
-        snprintf(out, sizeof(out), "UDC=6a00000.usb state=%s speed=%s\n", state, speed);
+        char sp_path[160];
+        snprintf(sp_path, sizeof(sp_path), "/sys/class/udc/%s/current_speed", udc);
+        read_first_line(sp_path, speed, sizeof(speed));
+        read_first_line("/sys/kernel/config/usb_gadget/g1/idVendor", vid, sizeof(vid));
+        read_first_line("/sys/kernel/config/usb_gadget/g1/idProduct", pid, sizeof(pid));
+        char out[256];
+        snprintf(out, sizeof(out), "UDC=%s state=%s speed=%s id=%s:%s ffs_adb=%s\n",
+                 udc, state, speed, vid, pid,
+                 access("/sys/kernel/config/usb_gadget/g1/configs/c.1/ffs.adb", F_OK) == 0 ? "linked" : "unlinked");
         usb_write(out);
+        dump_sysfs_dir("USB gadget configs/c.1", "/sys/kernel/config/usb_gadget/g1/configs/c.1", true);
     } else if (strcmp(cmd, "parts") == 0) {
         dump_file_lines("/proc/partitions", 120, NULL, true);
     } else if (strcmp(cmd, "dtb") == 0 || strcmp(cmd, "stock_dtb") == 0) {
@@ -4205,6 +5518,10 @@ stream_done:
         usleep(100000);
         syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
                 LINUX_REBOOT_CMD_RESTART2, "recovery");
+    } else if (strcmp(cmd, "format_userdata") == 0) {
+        cmd_format_userdata(false);
+    } else if (strcmp(cmd, "format_userdata confirm") == 0) {
+        cmd_format_userdata(true);
     } else if (strcmp(cmd, "reboot") == 0) {
         print_msg("[sailfish-shell] Rebooting...\n");
         sync();
