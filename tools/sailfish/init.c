@@ -171,7 +171,7 @@ static void usb_write_ex(const char *msg, bool wait_drain) {
 
 static void print_msg_local(const char *msg) {
     if (!msg) return;
-    const char *devs[] = { "/dev/tty0", "/dev/kmsg", "/dev/pmsg0" };
+    const char *devs[] = { "/dev/kmsg", "/dev/pmsg0" };
     for (size_t i = 0; i < sizeof(devs) / sizeof(devs[0]); i++) {
         int fd = open(devs[i], O_WRONLY | O_NOCTTY | O_NONBLOCK);
         if (fd >= 0) {
@@ -1261,11 +1261,11 @@ static void dump_wifi_info(void) {
     usb_write("  [4] Staged Wi-Fi Firmware & RRO:\n");
     snprintf(out, sizeof(out),
              "      firmware-6.bin(tools): %s  firmware-6.bin(lib): %s\n"
-             "      board-2.bin(tools):    %s  regulatory.db(tools): %s\n"
+             "      board.bin(tools):      %s  regulatory.db(tools): %s\n"
              "      SailfishWifiOverlay:   %s\n",
              access("/tools/firmware/ath10k/QCA6174/hw3.0/firmware-6.bin", F_OK) == 0 ? "yes" : "no",
              access("/lib/firmware/ath10k/QCA6174/hw3.0/firmware-6.bin", F_OK) == 0 ? "yes" : "no",
-             access("/tools/firmware/ath10k/QCA6174/hw3.0/board-2.bin", F_OK) == 0 ? "yes" : "no",
+             access("/tools/firmware/ath10k/QCA6174/hw3.0/board.bin", F_OK) == 0 ? "yes" : "no",
              access("/tools/firmware/regulatory.db", F_OK) == 0 ? "yes" : "no",
              access("/tools/SailfishWifiOverlay.apk", F_OK) == 0 ? "yes" : "no");
     usb_write(out);
@@ -1559,47 +1559,6 @@ static void clean_zero_byte_libs(const char *dir_path) {
         }
     }
     closedir(d);
-}
-
-/* Ensure every library in libs exists as a valid ELF binary of elf_class (1=32, 2=64). */
-static void ensure_elf_libs(const char *dst_dir, const char *src_dir,
-                            unsigned char elf_class, const char *const *libs) {
-    for (int i = 0; libs[i]; i++) {
-        char target[256], src[256];
-        snprintf(target, sizeof(target), "%s/%s", dst_dir, libs[i]);
-        snprintf(src, sizeof(src), "%s/%s", src_dir, libs[i]);
-        if (elf_class == 2 && access(src, F_OK) != 0)
-            snprintf(src, sizeof(src), "/tools/%s", libs[i]);
-
-        struct stat st;
-        bool need_restore = (lstat(target, &st) != 0 || S_ISLNK(st.st_mode) || st.st_size < 10000);
-        if (!need_restore) {
-            int fd = open(target, O_RDONLY);
-            if (fd >= 0) {
-                unsigned char ehdr[5] = {0};
-                if (read(fd, ehdr, 5) != 5 || ehdr[0] != 0x7f || ehdr[4] != elf_class)
-                    need_restore = true;
-                close(fd);
-            } else {
-                need_restore = true;
-            }
-        }
-        if (need_restore && access(src, F_OK) == 0) {
-            unlink(target);
-            if (!copy_file(src, target)) {
-                int dummy = creat(target, 0644);
-                if (dummy >= 0) close(dummy);
-                mount(src, target, NULL, MS_BIND, NULL);
-            } else {
-                chmod(target, 0644);
-                set_selinux_label(target, "u:object_r:system_lib_file:s0");
-            }
-            char rmsg[128];
-            snprintf(rmsg, sizeof(rmsg), "[+] Restored %s-bit %s\n",
-                     elf_class == 2 ? "64" : "32", libs[i]);
-            usb_write(rmsg);
-        }
-    }
 }
 
 /* Non-destructively overlay an Android ueventd.rc file with 0666 ION/DMA-BUF/DRM rules. */
@@ -2243,21 +2202,45 @@ static bool write_permissive_ld_config(const char *path, const char *label) {
         "dir.product = /product/bin\n\n"
     );
 
-    static const char *const apex_ns[] = {
-        "system", "system_ext", "product", "com_android_art", "com_android_i18n",
-        "com_android_conscrypt", "com_android_media", "com_android_tethering",
-        "com_android_os_statsd", "com_android_sdkext", "com_android_adbd",
-        "com_android_resolv", "com_android_neuralnetworks", "com_android_bt",
-        "com_android_configinfrastructure", "com_android_appsearch",
-        "com_android_uprobestats", "com_android_uwb", "com_android_virt",
-        "com_android_permission", "com_android_wifi", "com_android_mediaprovider",
-        "com_android_adservices", "com_android_rkpd", NULL
+    struct ns_spec {
+        const char *name;
+        const char *search_paths;
+    };
+    /* Intentionally omit "system" here so libnativeloader's GetSystemNamespace()
+     * falls through to "default", where zygote64 already loaded libc.so. */
+    static const struct ns_spec apex_ns[] = {
+        { "system_ext", "/system_ext/${LIB}:/system/system_ext/${LIB}" },
+        { "product", "/product/${LIB}:/system/product/${LIB}" },
+        { "com_android_runtime", NULL },
+        { "com_android_art", "/apex/com.android.art/${LIB}" },
+        { "com_android_i18n", "/apex/com.android.i18n/${LIB}" },
+        { "com_android_conscrypt", "/apex/com.android.conscrypt/${LIB}" },
+        { "com_android_media", "/apex/com.android.media/${LIB}" },
+        { "com_android_media_swcodec", "/apex/com.android.media.swcodec/${LIB}" },
+        { "com_android_tethering", "/apex/com.android.tethering/${LIB}" },
+        { "com_android_os_statsd", "/apex/com.android.os.statsd/${LIB}" },
+        { "com_android_sdkext", "/apex/com.android.sdkext/${LIB}" },
+        { "com_android_adbd", "/apex/com.android.adbd/${LIB}" },
+        { "com_android_resolv", "/apex/com.android.resolv/${LIB}" },
+        { "com_android_neuralnetworks", "/apex/com.android.neuralnetworks/${LIB}" },
+        { "com_android_bt", "/apex/com.android.bt/${LIB}" },
+        { "com_android_configinfrastructure", "/apex/com.android.configinfrastructure/${LIB}" },
+        { "com_android_appsearch", "/apex/com.android.appsearch/${LIB}" },
+        { "com_android_uprobestats", "/apex/com.android.uprobestats/${LIB}" },
+        { "com_android_uwb", "/apex/com.android.uwb/${LIB}" },
+        { "com_android_virt", "/apex/com.android.virt/${LIB}" },
+        { "com_android_permission", "/apex/com.android.permission/${LIB}" },
+        { "com_android_wifi", "/apex/com.android.wifi/${LIB}" },
+        { "com_android_mediaprovider", "/apex/com.android.mediaprovider/${LIB}" },
+        { "com_android_adservices", "/apex/com.android.adservices/${LIB}" },
+        { "com_android_rkpd", "/apex/com.android.rkpd/${LIB}" },
+        { NULL, NULL }
     };
 
     const char *bionic_paths =
         "/apex/com.android.runtime/${LIB}/bionic:/bootstrap-apex/com.android.runtime/${LIB}/bionic:/system/${LIB}/bootstrap:";
     const char *sys_lib_paths =
-        "/system/${LIB}:/system_ext/${LIB}:/product/${LIB}:";
+        "/system/${LIB}:/system_ext/${LIB}:/system/system_ext/${LIB}:/product/${LIB}:/system/product/${LIB}:";
     const char *apex_lib_paths =
         "/apex/com.android.art/${LIB}:/apex/com.android.runtime/${LIB}:"
         "/apex/com.android.i18n/${LIB}:/apex/com.android.adbd/${LIB}:/apex/com.android.tethering/${LIB}:"
@@ -2277,30 +2260,33 @@ static bool write_permissive_ld_config(const char *path, const char *label) {
 
     static const char *const sections[] = { "system", "system_ext", "product", "data", "vendor", NULL };
     for (int s = 0; sections[s]; s++) {
-        const char *search_paths = common_paths;
         fprintf(ldf, "[%s]\n", sections[s]);
         fprintf(ldf, "additional.namespaces = ");
-        for (int i = 0; apex_ns[i]; i++) {
-            fprintf(ldf, "%s%s", apex_ns[i], apex_ns[i + 1] ? "," : "\n");
+        for (int i = 0; apex_ns[i].name; i++) {
+            fprintf(ldf, "%s%s", apex_ns[i].name, apex_ns[i + 1].name ? "," : "\n");
         }
         fprintf(ldf, "namespace.default.isolated = false\n");
         fprintf(ldf, "namespace.default.visible = true\n");
-        fprintf(ldf, "namespace.default.search.paths = %s\n", search_paths);
+        fprintf(ldf, "namespace.default.search.paths = %s\n", common_paths);
         fprintf(ldf, "namespace.default.permitted.paths = /\n");
         fprintf(ldf, "namespace.default.links = ");
-        for (int i = 0; apex_ns[i]; i++) {
-            fprintf(ldf, "%s%s", apex_ns[i], apex_ns[i + 1] ? "," : "\n");
+        for (int i = 0; apex_ns[i].name; i++) {
+            fprintf(ldf, "%s%s", apex_ns[i].name, apex_ns[i + 1].name ? "," : "\n");
         }
-        for (int i = 0; apex_ns[i]; i++) {
-            fprintf(ldf, "namespace.default.link.%s.allow_all_shared_libs = true\n", apex_ns[i]);
+        for (int i = 0; apex_ns[i].name; i++) {
+            fprintf(ldf, "namespace.default.link.%s.allow_all_shared_libs = true\n", apex_ns[i].name);
         }
         fprintf(ldf, "\n");
 
-        for (int i = 0; apex_ns[i]; i++) {
-            const char *ns = apex_ns[i];
+        /* Secondary namespaces never list bionic_paths or /system/${LIB} in search.paths,
+         * so unbundled product/system_ext/APEX JNI loads share zygote's libc.so from default
+         * instead of re-dlopening a second copy into their own namespace (IE TLS failure). */
+        for (int i = 0; apex_ns[i].name; i++) {
+            const char *ns = apex_ns[i].name;
             fprintf(ldf, "namespace.%s.isolated = false\n", ns);
             fprintf(ldf, "namespace.%s.visible = true\n", ns);
-            fprintf(ldf, "namespace.%s.search.paths = %s\n", ns, search_paths);
+            if (apex_ns[i].search_paths)
+                fprintf(ldf, "namespace.%s.search.paths = %s\n", ns, apex_ns[i].search_paths);
             fprintf(ldf, "namespace.%s.permitted.paths = /\n", ns);
             fprintf(ldf, "namespace.%s.links = default\n", ns);
             fprintf(ldf, "namespace.%s.link.default.allow_all_shared_libs = true\n\n", ns);
@@ -2393,41 +2379,59 @@ static void setup_mdss_sysfs_mock(void) {
         "hw_rev=268894210\n"
         "max_upscale_ratio=20\n"
         "max_downscale_ratio=4\n"
-        "max_bandwidth_low=9600000000\n"
-        "max_bandwidth_high=9600000000\n"
-        "max_pipe_bandwidth=2500000000\n"
-        "max_sde_clk=412500000\n"
-        "clk_fudge_factor=105 100\n"
+        "max_bandwidth_low=9600000\n"
+        "max_bandwidth_high=9600000\n"
+        "max_pipe_bw=4500000\n"
+        "max_mdp_clk=412500000\n"
+        "clk_fudge_factor=105,100\n"
         "scale_factor=1\n"
         "xtra_ff_factor=1\n"
-        "blending_stages=4\n"
-        "features=qseed3,ubwc,src_split\n"
-        "pipe_count=10\n"
-        "pipe_type=vig pipe_ndx=1 rects=1\n"
-        "pipe_type=vig pipe_ndx=2 rects=1\n"
-        "pipe_type=vig pipe_ndx=3 rects=1\n"
-        "pipe_type=vig pipe_ndx=4 rects=1\n"
-        "pipe_type=dma pipe_ndx=5 rects=1\n"
-        "pipe_type=dma pipe_ndx=6 rects=1\n"
-        "pipe_type=dma pipe_ndx=7 rects=1\n"
-        "pipe_type=dma pipe_ndx=8 rects=1\n"
-        "pipe_type=cursor pipe_ndx=9 rects=1\n"
-        "pipe_type=cursor pipe_ndx=10 rects=1\n";
+        "fmt_linear_factor=1\n"
+        "fmt_mt_factor=1\n"
+        "fmt_mt_nv12_factor=8\n"
+        "amortizable_threshold=25\n"
+        "system_overhead_lines=20\n"
+        "blending_stages=8\n"
+        "max_mixer_width=2560\n"
+        "max_pipe_width=2560\n"
+        "max_cursor_size=512\n"
+        "non_scalar_rgb=0\n"
+        "features=bwc,decimation,tile_format,src_split\n"
+        "pipe_count=12\n"
+        "pipe_type=vig pipe_ndx=1 rects=1 fmts_supported=51,224,0,22\n"
+        "pipe_type=vig pipe_ndx=2 rects=1 fmts_supported=51,224,0,22\n"
+        "pipe_type=vig pipe_ndx=3 rects=1 fmts_supported=51,224,0,22\n"
+        "pipe_type=vig pipe_ndx=4 rects=1 fmts_supported=51,224,0,22\n"
+        "pipe_type=rgb pipe_ndx=5 rects=1 fmts_supported=51,224,0,22\n"
+        "pipe_type=rgb pipe_ndx=6 rects=1 fmts_supported=51,224,0,22\n"
+        "pipe_type=rgb pipe_ndx=7 rects=1 fmts_supported=51,224,0,22\n"
+        "pipe_type=rgb pipe_ndx=8 rects=1 fmts_supported=51,224,0,22\n"
+        "pipe_type=dma pipe_ndx=9 rects=1 fmts_supported=51,224,0,22\n"
+        "pipe_type=dma pipe_ndx=10 rects=1 fmts_supported=51,224,0,22\n"
+        "pipe_type=cursor pipe_ndx=11 rects=1 fmts_supported=18,96\n"
+        "pipe_type=cursor pipe_ndx=12 rects=1 fmts_supported=18,96\n";
     write_file_str("/sys/devices/virtual/graphics/fb0/mdp/caps", caps_content);
+    write_file_str("/sys/devices/virtual/graphics/fb0/mdp/bw_mode_bitmap", "0\n");
 
     const char *panel_content =
         "panel_name=s6e3fa5_cmd\n"
         "primary_panel=1\n"
+        "is_pluggable=0\n"
         "xres=1080\n"
         "yres=1920\n"
         "bpp=24\n"
         "type=mipi dsi cmd panel\n"
-        "fps=60\n";
+        "min_fps=60\n"
+        "max_fps=60\n"
+        "fps=60\n"
+        "dyn_fps_en=0\n"
+        "pu_en=0\n";
     write_file_str("/sys/devices/virtual/graphics/fb0/msm_fb_panel_info", panel_content);
 
     write_file_str("/sys/devices/virtual/graphics/fb0/msm_fb_type", "mipi dsi cmd panel\n");
     write_file_str("/sys/devices/virtual/graphics/fb0/connected", "1\n");
     write_file_str("/sys/devices/virtual/graphics/fb0/msm_fb_split", "0 0\n");
+    write_file_str("/sys/devices/virtual/graphics/fb0/msm_cmd_autorefresh_en", "0\n");
     write_file_str("/sys/devices/virtual/graphics/fb0/vsync_event", "VSYNC=0\n");
     chmod("/sys/devices/virtual/graphics/fb0/vsync_event", 0666);
 
@@ -2469,6 +2473,80 @@ static void rm_rf(const char *path) {
     }
 }
 
+static void stage_oem_wifi_board_data(void) {
+    if (access("/tmp/.ath10k_oem_bd_loaded", F_OK) == 0)
+        return;
+
+    const char *src_bd = NULL;
+    char cand[128] = {0};
+    char sub_hex[32] = {0};
+    struct stat st;
+
+    if (read_first_line("/sys/bus/pci/devices/0000:01:00.0/subsystem_device",
+                        sub_hex, sizeof(sub_hex))) {
+        unsigned long sub_id = strtoul(sub_hex, NULL, 0);
+        snprintf(cand, sizeof(cand), "/mnt/vendor_a/firmware/bdwlan30.b%02lx",
+                 sub_id & 0xffUL);
+        if (stat(cand, &st) == 0 && st.st_size >= 4096)
+            src_bd = cand;
+    }
+
+    if (!src_bd) {
+        const char *fallback = "/mnt/vendor_a/firmware/bdwlan30.bin";
+        if (stat(fallback, &st) == 0 && st.st_size >= 4096)
+            src_bd = fallback;
+    }
+
+    if (!src_bd) {
+        usb_write("[!] No Pixel OEM bdwlan30 board data found on vendor_a\n");
+        return;
+    }
+
+    unlink("/tools/firmware/ath10k/QCA6174/hw3.0/board-2.bin");
+    if (!copy_file(src_bd, "/tools/firmware/ath10k/QCA6174/hw3.0/board.bin")) {
+        usb_write("[!] Failed to stage OEM QCA6174 board.bin into /tools/firmware\n");
+        return;
+    }
+
+    bool rebound = false;
+    if (access("/sys/bus/pci/drivers/ath10k_pci/0000:01:00.0", F_OK) == 0) {
+        /* Wait briefly for early async register_work so unbind doesn't race init */
+        for (int i = 0; i < 40; i++) {
+            if (access("/sys/class/net/wlan0", F_OK) == 0)
+                break;
+            usleep(50000);
+        }
+        write_str("/sys/bus/pci/drivers/ath10k_pci/unbind", "0000:01:00.0");
+        usleep(100000);
+        write_str("/sys/bus/pci/drivers/ath10k_pci/bind", "0000:01:00.0");
+        for (int i = 0; i < 60; i++) {
+            if (access("/sys/class/net/wlan0", F_OK) == 0)
+                break;
+            usleep(50000);
+        }
+        rebound = true;
+    } else if (access("/sys/bus/pci/devices/0000:01:00.0", F_OK) == 0) {
+        write_str("/sys/bus/pci/drivers/ath10k_pci/bind", "0000:01:00.0");
+        for (int i = 0; i < 60; i++) {
+            if (access("/sys/class/net/wlan0", F_OK) == 0)
+                break;
+            usleep(50000);
+        }
+        rebound = true;
+    }
+
+    int mfd = open("/tmp/.ath10k_oem_bd_loaded", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (mfd >= 0)
+        close(mfd);
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "[+] Staged OEM QCA6174 board data %s (%lld bytes) -> board.bin%s\n",
+             src_bd, (long long)st.st_size,
+             rebound ? " (rebound ath10k_pci)" : "");
+    usb_write(msg);
+}
+
 static bool prepare_android_rootfs(bool for_shell) {
     /* Keep kernel /dev/kmsg ratelimiting enabled so noisy BPF Rust loaders cannot
      * stall early init/userspace for ~57s dumping unbuffered messages to /dev/kmsg. */
@@ -2508,6 +2586,7 @@ static bool prepare_android_rootfs(bool for_shell) {
         }
     }
     mount("/dev/sda31", "/mnt/vendor_a", "ext4", MS_RDONLY, NULL);
+    stage_oem_wifi_board_data();
 
     /* Bind vendor into system_a/vendor */
     mkdir("/mnt/system_a/vendor", 0755);
@@ -3571,26 +3650,6 @@ static bool prepare_android_rootfs(bool for_shell) {
         set_selinux_label("/mnt/system_a/system/bin/linker", "u:object_r:system_file:s0");
     }
 
-    /* Automated: Ensure critical 64-bit and 32-bit bionic/system libraries on disk are genuine ELF binaries */
-    const char *crit_libs[] = {
-        "libbase.so", "libcutils.so", "liblog.so", "libc++.so",
-        "libunwindstack.so", "liblzma.so", "libz.so",
-        "libfs_mgr.so", "libselinux.so", "libutils.so",
-        "libcrypto.so", "libcrypto_utils.so", "liblp.so",
-        "libprocessgroup.so", "libprocessgroup_setup.so",
-        "libvendorsupport.so", "libext4_utils.so", "libgsi.so",
-        "libsparse.so", "libbootloader_message.so", "libjsoncpp.so",
-        "libext2_uuid.so", "liblogwrap.so", "libsdm_shim.so",
-        "libexpat.so",
-        NULL
-    };
-    ensure_elf_libs("/mnt/system_a/system/lib64", "/tools/lib64", 2, crit_libs);
-
-    const char *crit_libs32[] = {
-        "libbase.so", "libc++.so", "libcutils.so", "liblog.so", NULL
-    };
-    ensure_elf_libs("/mnt/system_a/system/lib", "/tools/lib32", 1, crit_libs32);
-
     /* Mount tmpfs on system_a/apex, bootstrap-apex, and linkerconfig */
     mkdir("/mnt/system_a/apex", 0755);
     umount2("/mnt/system_a/apex", MNT_DETACH);
@@ -3989,7 +4048,6 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "    qservice_up=0\n"
                     "    nfc_hidden=0\n"
                     "    fbcon_unbound=0\n"
-                    "    sf_pid_last=\"\"\n"
                     "    if ! pgrep -f android.hardware.power-service.sailfish >/dev/null 2>&1; then\n"
                     "        /system/bin/android.hardware.power-service.sailfish >/dev/null 2>&1 &\n"
                     "    fi\n"
@@ -4059,13 +4117,6 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "            done\n"
                     "            fbcon_unbound=1\n"
                     "        fi\n"
-                    "        if [ -n \"$sf_pid\" ] && [ \"$sf_pid\" != \"$sf_pid_last\" ]; then\n"
-                    "            if /system/bin/service check SurfaceFlinger 2>/dev/null | grep -q \": found\"; then\n"
-                    "                sleep 1\n"
-                    "                /system/bin/service call SurfaceFlinger 1008 i32 1 >/dev/null 2>&1 || true\n"
-                    "                sf_pid_last=\"$sf_pid\"\n"
-                    "            fi\n"
-                    "        fi\n"
                     "        if [ \"$boot_done\" = \"1\" ]; then\n"
                     "            if [ -n \"$(pidof bootanimation.real 2>/dev/null || pidof bootanimation 2>/dev/null || pgrep -f '/system/bin/bootanimation' 2>/dev/null)\" ]; then\n"
                     "                setprop service.bootanim.exit 1 2>/dev/null || true\n"
@@ -4074,7 +4125,6 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "            fi\n"
                     "        fi\n"
                     "        if [ \"$boot_done\" = \"1\" ] && [ \"$bootanim_stopped\" = \"0\" ]; then\n"
-                    "            /system/bin/service call SurfaceFlinger 1008 i32 1 >/dev/null 2>&1 || true\n"
                     "            echo 0 > /sys/class/graphics/fb0/blank 2>/dev/null || true\n"
                     "            echo 0 > /sys/class/backlight/994000.dsi.0/bl_power 2>/dev/null || true\n"
                     "            echo 96 > /sys/class/backlight/994000.dsi.0/brightness 2>/dev/null || true\n"
@@ -4108,7 +4158,6 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "                        if [ -n \"$sf_pid\" ]; then\n"
                     "                            sleep 1\n"
                     "                            setprop ctl.restart surfaceflinger 2>/dev/null || true\n"
-                    "                            sf_pid_last=\"\"\n"
                     "                        fi\n"
                     "                        hwc_restarted=1\n"
                     "                    fi\n"

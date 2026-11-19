@@ -21,7 +21,7 @@ mkdir -p "$OUT_DIR/initramfs_root/lib/firmware/qcom"
 for fw in a530_pm4.fw a530_pfp.fw a530v3_gpmu.fw2; do
     if [ -f "/lib/firmware/qcom/$fw.zst" ]; then
         zstd -d -c "/lib/firmware/qcom/$fw.zst" > "$OUT_DIR/initramfs_root/lib/firmware/qcom/$fw"
-        cp "$OUT_DIR/initramfs_root/lib/firmware/qcom/$fw" "$OUT_DIR/initramfs_root/lib/firmware/$fw"
+        ln -sf "qcom/$fw" "$OUT_DIR/initramfs_root/lib/firmware/$fw"
     fi
 done
 
@@ -29,12 +29,15 @@ done
 if [ -d "$SCRIPT_DIR/firmware" ] && [ "$(ls -A "$SCRIPT_DIR/firmware")" ]; then
     echo "[+] Staging device-specific firmware from $SCRIPT_DIR/firmware"
     cp -r "$SCRIPT_DIR/firmware/"* "$OUT_DIR/initramfs_root/lib/firmware/qcom/"
-    cp -r "$SCRIPT_DIR/firmware/"* "$OUT_DIR/initramfs_root/lib/firmware/"
+    for f in "$SCRIPT_DIR/firmware/"*; do
+        base="$(basename "$f")"
+        ln -sf "qcom/$base" "$OUT_DIR/initramfs_root/lib/firmware/$base"
+    done
 elif [ -f "/lib/firmware/qcom/apq8096/a530_zap.mbn.zst" ]; then
     zstd -d -c "/lib/firmware/qcom/apq8096/a530_zap.mbn.zst" > "$OUT_DIR/initramfs_root/lib/firmware/qcom/a530_zap.mdt"
-    cp "$OUT_DIR/initramfs_root/lib/firmware/qcom/a530_zap.mdt" "$OUT_DIR/initramfs_root/lib/firmware/qcom/a530_zap.mbn"
-    cp "$OUT_DIR/initramfs_root/lib/firmware/qcom/a530_zap.mdt" "$OUT_DIR/initramfs_root/lib/firmware/a530_zap.mdt"
-    cp "$OUT_DIR/initramfs_root/lib/firmware/qcom/a530_zap.mdt" "$OUT_DIR/initramfs_root/lib/firmware/a530_zap.mbn"
+    ln -sf "a530_zap.mdt" "$OUT_DIR/initramfs_root/lib/firmware/qcom/a530_zap.mbn"
+    ln -sf "qcom/a530_zap.mdt" "$OUT_DIR/initramfs_root/lib/firmware/a530_zap.mdt"
+    ln -sf "qcom/a530_zap.mbn" "$OUT_DIR/initramfs_root/lib/firmware/a530_zap.mbn"
 fi
 
 # Stage Android 17 graphics compatibility shims and manifests
@@ -50,35 +53,19 @@ if [ -f "$SCRIPT_DIR/mesa/lib64/libgallium_dri.so" ]; then
 fi
 if [ -f "$SCRIPT_DIR/sdm_shim/libsdm_shim.c" ]; then
     echo "[+] Building libsdm_shim.so"
-    aarch64-linux-gnu-gcc -shared -fPIC -O2 -nostdlib "$SCRIPT_DIR/sdm_shim/libsdm_shim.c" -o "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" -Wl,-z,max-page-size=4096
+    VER_FLAG=""
+    if [ -f "$SCRIPT_DIR/sdm_shim/libsdm_shim.ver" ]; then
+        VER_FLAG="-Wl,--version-script=$SCRIPT_DIR/sdm_shim/libsdm_shim.ver"
+    fi
+    aarch64-linux-gnu-gcc -shared -fPIC -O2 -nostdlib "$SCRIPT_DIR/sdm_shim/libsdm_shim.c" -o "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" $VER_FLAG -Wl,-z,max-page-size=4096
 fi
 if [ -f "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" ]; then
     cp "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" "$OUT_DIR/initramfs_root/tools/libsdm_shim.so"
-    mkdir -p "$OUT_DIR/initramfs_root/tools/lib64"
-    cp "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" "$OUT_DIR/initramfs_root/tools/lib64/libsdm_shim.so"
 fi
 if [ -f "$SCRIPT_DIR/libui_patched.so" ]; then
     echo "[+] Staging patched libui.so (Gralloc 2.x support)"
     cp "$SCRIPT_DIR/libui_patched.so" "$OUT_DIR/initramfs_root/tools/libui.so"
 fi
-mkdir -p "$OUT_DIR/initramfs_root/tools/lib64"
-CRIT_LIBS="libbase.so libcutils.so liblog.so libc++.so libunwindstack.so liblzma.so libz.so libfs_mgr.so libselinux.so libutils.so libcrypto.so libcrypto_utils.so liblp.so libprocessgroup.so libprocessgroup_setup.so libvendorsupport.so libext4_utils.so libgsi.so libsparse.so libbootloader_message.so libjsoncpp.so libext2_uuid.so liblogwrap.so libexpat.so"
-for lib in $CRIT_LIBS; do
-    if [ -f "$SCRIPT_DIR/$lib" ]; then
-        echo "[+] Staging clean 64-bit $lib"
-        cp "$SCRIPT_DIR/$lib" "$OUT_DIR/initramfs_root/tools/lib64/$lib"
-    fi
-    # Avoid duplicate copy directly under tools/ to keep boot.img under 32MB limit
-    rm -f "$OUT_DIR/initramfs_root/tools/$lib"
-done
-
-mkdir -p "$OUT_DIR/initramfs_root/tools/lib32"
-for lib in libbase.so libcutils.so liblog.so libc++.so; do
-    if [ -f "$SCRIPT_DIR/lib32/$lib" ]; then
-        echo "[+] Staging clean 32-bit $lib"
-        cp "$SCRIPT_DIR/lib32/$lib" "$OUT_DIR/initramfs_root/tools/lib32/$lib"
-    fi
-done
 if [ -f "$SCRIPT_DIR/adreno_utils/libadreno_utils.so" ]; then
     cp "$SCRIPT_DIR/adreno_utils/libadreno_utils.so" "$OUT_DIR/initramfs_root/tools/libadreno_utils.so"
 fi
@@ -113,20 +100,19 @@ chmod +x "$SCRIPT_DIR/sensors_hal/build.sh"
 cp "$SCRIPT_DIR/sensors_hal/sensors_hal" "$OUT_DIR/initramfs_root/tools/sensors_hal"
 chmod +x "$OUT_DIR/initramfs_root/tools/sensors_hal"
 
-# Stage QCA6174 ath10k firmware & regulatory database in both /tools/firmware (survives vendor mount)
-# and /lib/firmware (early pre-mount fallback).
+# Stage QCA6174 ath10k firmware & regulatory database under /tools/firmware (survives vendor mount)
+# and symlink from /lib/firmware (early pre-mount fallback) without duplicating ~1.4 MB in initramfs.
 mkdir -p "$OUT_DIR/initramfs_root/tools/firmware/ath10k/QCA6174/hw3.0" \
-         "$OUT_DIR/initramfs_root/lib/firmware/ath10k/QCA6174/hw3.0"
-for fw in firmware-6.bin board-2.bin board.bin; do
+         "$OUT_DIR/initramfs_root/lib/firmware"
+for fw in firmware-6.bin board.bin; do
     zstd -d -f -c "/lib/firmware/ath10k/QCA6174/hw3.0/$fw.zst" \
         > "$OUT_DIR/initramfs_root/tools/firmware/ath10k/QCA6174/hw3.0/$fw"
-    cp "$OUT_DIR/initramfs_root/tools/firmware/ath10k/QCA6174/hw3.0/$fw" \
-       "$OUT_DIR/initramfs_root/lib/firmware/ath10k/QCA6174/hw3.0/$fw"
 done
+ln -sfn "/tools/firmware/ath10k" "$OUT_DIR/initramfs_root/lib/firmware/ath10k"
 for reg in regulatory.db regulatory.db.p7s; do
     if [ -f "/lib/firmware/$reg" ]; then
         cp "/lib/firmware/$reg" "$OUT_DIR/initramfs_root/tools/firmware/$reg"
-        cp "/lib/firmware/$reg" "$OUT_DIR/initramfs_root/lib/firmware/$reg"
+        ln -sf "/tools/firmware/$reg" "$OUT_DIR/initramfs_root/lib/firmware/$reg"
     fi
 done
 
@@ -192,7 +178,7 @@ python3 "$SCRIPT_DIR/mkbootimg.py" \
   --ramdisk_offset 0x02800000 \
   --tags_offset 0x02600000 \
   --pagesize 4096 \
-  --cmdline "console=ramoops0 console=tty0 keep_bootcon androidboot.hardware=sailfish androidboot.debuggable=1 androidboot.selinux=permissive androidboot.veritymode=disabled root=/dev/ram0 rw rdinit=/init init=/init clk_ignore_unused pd_ignore_unused firmware_class.path=/vendor/firmware,/tools/firmware initcall_debug iommu.passthrough=1 pcie_aspm=off audit=0" \
+  --cmdline "console=ramoops0 androidboot.hardware=sailfish androidboot.debuggable=1 androidboot.selinux=permissive androidboot.veritymode=disabled root=/dev/ram0 rw rdinit=/init init=/init clk_ignore_unused pd_ignore_unused firmware_class.path=/vendor/firmware,/tools/firmware iommu.passthrough=1 pcie_aspm=off audit=0" \
   -o "$OUT_DIR/boot.img"
 
 echo "=== Build Complete: out/boot.img ($(ls -lh "$OUT_DIR/boot.img" | awk '{print $5}')) ==="

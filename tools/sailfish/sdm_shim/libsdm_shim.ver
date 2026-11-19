@@ -1,0 +1,17 @@
+LIBC {
+  global:
+    ioctl;
+    open;
+    open64;
+    openat;
+    openat64;
+    __open_2;
+    close;
+    read;
+    pread;
+    pread64;
+    poll;
+    ppoll;
+    dlopen;
+    android_dlopen_ext;
+};

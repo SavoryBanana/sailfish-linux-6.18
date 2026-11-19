@@ -152,8 +152,8 @@ void msm_devfreq_init(struct msm_gpu *gpu)
 	 * where due to stalling waiting for vblank we could get stuck
 	 * at (for ex) 30fps at 50% utilization.
 	 */
-	priv->gpu_devfreq_config.upthreshold = 25;
-	priv->gpu_devfreq_config.downdifferential = 10;
+	priv->gpu_devfreq_config.upthreshold = 12;
+	priv->gpu_devfreq_config.downdifferential = 8;
 	priv->gpu_clamp_to_idle = true;
 
 	mutex_init(&df->lock);
@@ -371,6 +371,6 @@ void msm_devfreq_idle(struct msm_gpu *gpu)
 	if (!has_devfreq(gpu))
 		return;
 
-	msm_hrtimer_queue_work(&df->idle_work, ms_to_ktime(1),
+	msm_hrtimer_queue_work(&df->idle_work, ms_to_ktime(50),
 			       HRTIMER_MODE_REL);
 }

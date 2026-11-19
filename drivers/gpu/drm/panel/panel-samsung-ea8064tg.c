@@ -155,11 +155,19 @@ static int ea8064tg_unprepare(struct drm_panel *panel)
 }
 
 static const struct drm_display_mode ea8064tg_panel_mode = {
-	.clock = 130932,
+	/*
+	 * Command-mode panel: pad horizontal blanking (htotal=1350) so the
+	 * 4-lane DSI burst link runs at 941.9 Mbps/lane (pclk=156.978 MHz,
+	 * byte_clk=117.73 MHz, VCO=1883.7 MHz) while keeping exact 60.00 Hz
+	 * vrefresh. This drops active 1080x1920 GRAM transfer from ~16.06 ms
+	 * to ~13.4 ms, leaving ~2.6 ms headroom per 16.67 ms frame for atomic
+	 * commits and GPU in-fences.
+	 */
+	.clock = 156978,
 	.hdisplay = 1080,
-	.hsync_start = 1080 + 18,
-	.hsync_end = 1080 + 18 + 10,
-	.htotal = 1080 + 18 + 10 + 18,
+	.hsync_start = 1080 + 120,
+	.hsync_end = 1080 + 120 + 30,
+	.htotal = 1080 + 120 + 30 + 120,
 	.vdisplay = 1920,
 	.vsync_start = 1920 + 5,
 	.vsync_end = 1920 + 5 + 2,

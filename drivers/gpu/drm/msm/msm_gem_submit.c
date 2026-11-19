@@ -634,7 +634,8 @@ static void retire_scanout_work_fn(struct work_struct *work)
 			mutex_lock(&retire_fb_lock);
 			if (fbh->info && fbh->info->screen_buffer &&
 			    fbh->info->state == FBINFO_STATE_RUNNING &&
-			    !msm_fbdev_is_blanked()) {
+			    !msm_fbdev_is_blanked() &&
+			    !READ_ONCE(dev->master)) {
 				u32 dst_stride = fbh->info->fix.line_length ?
 						 (fbh->info->fix.line_length / 4) : 1080;
 				u32 src_stride = 1088;
@@ -928,6 +929,7 @@ void msm_submit_retire(struct msm_gem_submit *submit)
 	    submit->hw_fence && kref_read(&submit->hw_fence->refcount) > 0 &&
 	    submit->nr_cmds > 0 && submit->dev && submit->dev->fb_helper &&
 	    !msm_fbdev_is_blanked() &&
+	    !READ_ONCE(submit->dev->master) &&
 	    !(submit->is_bootanim && sf_recently_retired())) {
 		unsigned int c, nr_cands = 0;
 
