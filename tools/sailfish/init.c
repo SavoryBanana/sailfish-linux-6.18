@@ -2547,6 +2547,96 @@ static void stage_oem_wifi_board_data(void) {
     usb_write(msg);
 }
 
+static bool find_serial_serdev(const char *dir, char *out, size_t out_sz) {
+    DIR *d = opendir(dir);
+    if (!d) return false;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, "serial", 6) == 0 && strchr(de->d_name, '-') != NULL) {
+            snprintf(out, out_sz, "%s", de->d_name);
+            closedir(d);
+            return true;
+        }
+    }
+    closedir(d);
+    return false;
+}
+
+/* Stage Pixel's own QCA6174 Rome 3.2 Bluetooth patch + NVM under exact DT
+ * firmware-name filenames and rebind hci_uart_qca after vendor_a mounts. */
+static void stage_oem_bt_firmware(void) {
+    if (access("/tmp/.bt_oem_fw_loaded", F_OK) == 0)
+        return;
+
+    static const struct { const char *src; const char *dst; } bt_fw[] = {
+        { "/mnt/vendor_a/firmware/btfw32.tlv", "/tools/firmware/qca/btfw32.tlv" },
+        { "/mnt/vendor_a/firmware/btnv32.bin", "/tools/firmware/qca/btnv32.bin" },
+    };
+    mkdir("/tools/firmware", 0755);
+    mkdir("/tools/firmware/qca", 0755);
+    mkdir("/lib/firmware", 0755);
+    unlink("/lib/firmware/qca");
+    symlink("/tools/firmware/qca", "/lib/firmware/qca");
+
+    bool staged_all = true;
+    for (size_t i = 0; i < sizeof(bt_fw) / sizeof(bt_fw[0]); i++) {
+        struct stat st;
+        char msg[256];
+        if (stat(bt_fw[i].src, &st) != 0 || st.st_size <= 0) {
+            snprintf(msg, sizeof(msg), "[!] Missing OEM Bluetooth firmware %s\n", bt_fw[i].src);
+            usb_write(msg);
+            staged_all = false;
+            continue;
+        }
+        if (copy_file(bt_fw[i].src, bt_fw[i].dst)) {
+            chmod(bt_fw[i].dst, 0644);
+            snprintf(msg, sizeof(msg), "[+] Staged OEM Bluetooth firmware %s (%lld bytes) -> %s\n",
+                     bt_fw[i].src, (long long)st.st_size, bt_fw[i].dst);
+            usb_write(msg);
+        } else {
+            snprintf(msg, sizeof(msg), "[!] Failed to stage %s\n", bt_fw[i].dst);
+            usb_write(msg);
+            staged_all = false;
+        }
+    }
+    if (!staged_all)
+        return;
+
+    char serdev[64] = {0};
+    bool rebound = false;
+    if (find_serial_serdev("/sys/bus/serial/drivers/hci_uart_qca", serdev, sizeof(serdev))) {
+        write_str("/sys/bus/serial/drivers/hci_uart_qca/unbind", serdev);
+        usleep(100000);
+        write_str("/sys/bus/serial/drivers/hci_uart_qca/bind", serdev);
+        for (int i = 0; i < 40; i++) {
+            if (access("/sys/class/bluetooth/hci0", F_OK) == 0)
+                break;
+            usleep(50000);
+        }
+        rebound = true;
+    } else if (find_serial_serdev("/sys/bus/serial/devices", serdev, sizeof(serdev))) {
+        write_str("/sys/bus/serial/drivers/hci_uart_qca/bind", serdev);
+        for (int i = 0; i < 40; i++) {
+            if (access("/sys/class/bluetooth/hci0", F_OK) == 0)
+                break;
+            usleep(50000);
+        }
+        rebound = true;
+    }
+
+    int mfd = open("/tmp/.bt_oem_fw_loaded", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (mfd >= 0)
+        close(mfd);
+
+    char msg[160];
+    snprintf(msg, sizeof(msg), "[+] OEM Bluetooth firmware ready%s%s%s (hci0=%s)\n",
+             rebound ? " (rebound " : "",
+             rebound ? serdev : "",
+             rebound ? ")" : "",
+             access("/sys/class/bluetooth/hci0", F_OK) == 0 ? "present" : "pending");
+    usb_write(msg);
+}
+
 static bool prepare_android_rootfs(bool for_shell) {
     /* Keep kernel /dev/kmsg ratelimiting enabled so noisy BPF Rust loaders cannot
      * stall early init/userspace for ~57s dumping unbuffered messages to /dev/kmsg. */
@@ -2587,6 +2677,7 @@ static bool prepare_android_rootfs(bool for_shell) {
     }
     mount("/dev/sda31", "/mnt/vendor_a", "ext4", MS_RDONLY, NULL);
     stage_oem_wifi_board_data();
+    stage_oem_bt_firmware();
 
     /* Bind vendor into system_a/vendor */
     mkdir("/mnt/system_a/vendor", 0755);
@@ -2841,8 +2932,8 @@ static bool prepare_android_rootfs(bool for_shell) {
         }
     }
 
-    /* Automated: Filter NFC and Bluetooth permissions out of /vendor/etc/permissions so
-     * PackageManagerService does not respawn NfcNciApex or crash-loop com.android.bluetooth. */
+    /* Automated: Filter NFC permissions out of /vendor/etc/permissions so
+     * PackageManagerService does not respawn NfcNciApex (Bluetooth is enabled via AIDL HAL). */
     const char *vperm_dir = "/mnt/system_a/vendor/etc/permissions";
     if (access(vperm_dir, F_OK) == 0) {
         mkdir("/tmp", 0755);
@@ -2856,8 +2947,7 @@ static bool prepare_android_rootfs(bool for_shell) {
                 while ((de = readdir(pd)) != NULL) {
                     if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
                         continue;
-                    if (strcasestr(de->d_name, "nfc") || strcasestr(de->d_name, "mifare") ||
-                        strcasestr(de->d_name, "bluetooth"))
+                    if (strcasestr(de->d_name, "nfc") || strcasestr(de->d_name, "mifare"))
                         continue;
                     char src_path[512], dst_path[512];
                     snprintf(src_path, sizeof(src_path), "%s/%s", vperm_dir, de->d_name);
@@ -2872,11 +2962,20 @@ static bool prepare_android_rootfs(bool for_shell) {
                 }
                 closedir(pd);
             }
+            const char *bt_feat_xml =
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                "<permissions>\n"
+                "    <feature name=\"android.hardware.bluetooth\" />\n"
+                "    <feature name=\"android.hardware.bluetooth_le\" />\n"
+                "</permissions>\n";
+            const char *bt_feat_path = "/tmp/vendor_permissions/sailfish_bluetooth_features.xml";
+            write_file_str(bt_feat_path, bt_feat_xml);
+            chmod(bt_feat_path, 0644);
+            set_selinux_label(bt_feat_path, "u:object_r:vendor_configs_file:s0");
+
             const char *unavail_xml =
                 "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
                 "<permissions>\n"
-                "    <unavailable-feature name=\"android.hardware.bluetooth\" />\n"
-                "    <unavailable-feature name=\"android.hardware.bluetooth_le\" />\n"
                 "    <unavailable-feature name=\"android.hardware.nfc\" />\n"
                 "    <unavailable-feature name=\"android.hardware.nfc.hce\" />\n"
                 "    <unavailable-feature name=\"android.hardware.nfc.hcef\" />\n"
@@ -3221,10 +3320,12 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    exec - root root -- /system/bin/sh /system/etc/sailfish_ensure_user0.sh\n"
         "    start sailfish_power_aidl\n"
         "    start sailfish_sensors_aidl\n"
+        "    start sailfish_bluetooth_aidl\n"
         "\n"
         "on boot\n"
         "    start sailfish_power_aidl\n"
         "    start sailfish_sensors_aidl\n"
+        "    start sailfish_bluetooth_aidl\n"
         "\n"
         "service sailfish_power_aidl /system/bin/android.hardware.power-service.sailfish\n"
         "    interface aidl android.hardware.power.IPower/default\n"
@@ -3236,7 +3337,13 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    interface aidl android.hardware.sensors.ISensors/default\n"
         "    class hal\n"
         "    user system\n"
-        "    group system\n";
+        "    group system\n"
+        "\n"
+        "service sailfish_bluetooth_aidl /system/bin/android.hardware.bluetooth-service.sailfish\n"
+        "    interface aidl android.hardware.bluetooth.IBluetoothHci/default\n"
+        "    class hal\n"
+        "    user root\n"
+        "    group bluetooth net_bt_admin system\n";
     const char *user0_rc_dst = "/mnt/system_a/system/etc/init/sailfish_user0_fallback.rc";
     const char *user0_rc_tmp = "/tmp/sailfish_user0_fallback.rc";
     write_file_str(user0_rc_tmp, user0_rc);
@@ -3426,10 +3533,33 @@ static bool prepare_android_rootfs(bool for_shell) {
         }
     }
 
-    /* Automated: Inject VINTF manifest fragments (graphics HALs + AIDL Power/Sensors HALs) */
+    /* Automated: Install AIDL Bluetooth HAL (IBluetoothHci/default over Linux hci0 HCI_CHANNEL_USER) */
+    if (access("/tools/bluetooth_hal", F_OK) == 0) {
+        const char *bt_dst = "/mnt/system_a/system/bin/android.hardware.bluetooth-service.sailfish";
+        const char *bt_label = "u:object_r:hal_bluetooth_default_exec:s0";
+        umount_all(bt_dst);
+        unlink(bt_dst);
+        if (copy_file("/tools/bluetooth_hal", bt_dst)) {
+            chmod(bt_dst, 0755);
+            set_selinux_label(bt_dst, bt_label);
+            usb_write("[+] Automated: Installed /system/bin/android.hardware.bluetooth-service.sailfish\n");
+        } else if (copy_file("/tools/bluetooth_hal", "/tmp/bluetooth_hal")) {
+            chmod("/tmp/bluetooth_hal", 0755);
+            set_selinux_label("/tmp/bluetooth_hal", bt_label);
+            int bfd = open(bt_dst, O_WRONLY | O_CREAT | O_EXCL, 0755);
+            if (bfd >= 0) close(bfd);
+            if (bind_mount_clean("/tmp/bluetooth_hal", bt_dst) == 0) {
+                set_selinux_label(bt_dst, bt_label);
+                usb_write("[+] Automated: Bind-mounted /system/bin/android.hardware.bluetooth-service.sailfish\n");
+            }
+        }
+    }
+
+    /* Automated: Inject VINTF manifest fragments (graphics HALs + AIDL Power/Sensors/Bluetooth HALs) */
     if (access("/tools/android.hardware.graphics.xml", F_OK) == 0 ||
         access("/tools/android.hardware.power.xml", F_OK) == 0 ||
-        access("/tools/android.hardware.sensors.xml", F_OK) == 0) {
+        access("/tools/android.hardware.sensors.xml", F_OK) == 0 ||
+        access("/tools/android.hardware.bluetooth.xml", F_OK) == 0) {
         const char *vintf_dir = "/mnt/system_a/system/etc/vintf/manifest";
         mkdir("/tmp/vintf_manifest", 0755);
         umount2("/tmp/vintf_manifest", MNT_DETACH);
@@ -3459,8 +3589,12 @@ static bool prepare_android_rootfs(bool for_shell) {
                 copy_file("/tools/android.hardware.sensors.xml", "/tmp/vintf_manifest/android.hardware.sensors.xml");
                 set_selinux_label("/tmp/vintf_manifest/android.hardware.sensors.xml", "u:object_r:system_file:s0");
             }
+            if (access("/tools/android.hardware.bluetooth.xml", F_OK) == 0) {
+                copy_file("/tools/android.hardware.bluetooth.xml", "/tmp/vintf_manifest/android.hardware.bluetooth.xml");
+                set_selinux_label("/tmp/vintf_manifest/android.hardware.bluetooth.xml", "u:object_r:system_file:s0");
+            }
             if (mount("/tmp/vintf_manifest", vintf_dir, NULL, MS_BIND, NULL) == 0) {
-                usb_write("[+] Automated: Overlaid /system/etc/vintf/manifest with graphics, power & sensors HAL fragments\n");
+                usb_write("[+] Automated: Overlaid /system/etc/vintf/manifest with graphics, power, sensors & bluetooth HAL fragments\n");
             }
         }
     }

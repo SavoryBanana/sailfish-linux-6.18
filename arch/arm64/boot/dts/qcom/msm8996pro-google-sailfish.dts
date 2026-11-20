@@ -139,6 +139,17 @@
 		regulator-always-on;
 	};
 
+	/*
+	 * PM8994 GPIO18 DIV_CLK 32.768 kHz sleep clock for QCA6174. The pin is
+	 * already muxed to FUNC2 by rome_sleep_default on &pcie0, so no pinctrl here.
+	 */
+	divclk4: divclk4 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <32768>;
+		clock-output-names = "divclk4";
+	};
+
 	wlan_en: wlan-en-regulator {
 		compatible = "regulator-fixed";
 		regulator-name = "wlan_en";
@@ -508,6 +519,21 @@
 	status = "disabled";
 };
 
+/* QCA6174 (Rome 3.2) Bluetooth HCI over BLSP1 UART2 (gpio41-44) */
+&blsp1_uart2 {
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth {
+		compatible = "qcom,qca6174-bt";
+		pinctrl-names = "default";
+		pinctrl-0 = <&bt_en_default>;
+		enable-gpios = <&pm8994_gpios 19 GPIO_ACTIVE_HIGH>;
+		clocks = <&divclk4>;
+		firmware-name = "btnv32.bin", "btfw32.tlv";
+	};
+};
+
 &ufshc {
 	vcc-supply = <&vreg_l20a_2p95>;
 	vccq-supply = <&vreg_l25a_1p2>;
@@ -869,7 +895,7 @@
 	wake-gpios = <&tlmm 37 GPIO_ACTIVE_HIGH>;
 	vdda-supply = <&vreg_l28a_0p925>;
 	vddpe-3v3-supply = <&wlan_en>;
-	pinctrl-0 = <&pcie0_state_on &cnss_bootstrap_default &rome_sleep_default &bt_en_default>;
+	pinctrl-0 = <&pcie0_state_on &cnss_bootstrap_default &rome_sleep_default>;
 	status = "okay";
 };
 

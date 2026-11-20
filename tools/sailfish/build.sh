@@ -100,6 +100,11 @@ chmod +x "$SCRIPT_DIR/sensors_hal/build.sh"
 cp "$SCRIPT_DIR/sensors_hal/sensors_hal" "$OUT_DIR/initramfs_root/tools/sensors_hal"
 chmod +x "$OUT_DIR/initramfs_root/tools/sensors_hal"
 
+chmod +x "$SCRIPT_DIR/bluetooth_hal/build.sh"
+"$SCRIPT_DIR/bluetooth_hal/build.sh"
+cp "$SCRIPT_DIR/bluetooth_hal/bluetooth_hal" "$OUT_DIR/initramfs_root/tools/bluetooth_hal"
+chmod +x "$OUT_DIR/initramfs_root/tools/bluetooth_hal"
+
 # Stage QCA6174 ath10k firmware & regulatory database under /tools/firmware (survives vendor mount)
 # and symlink from /lib/firmware (early pre-mount fallback) without duplicating ~1.4 MB in initramfs.
 mkdir -p "$OUT_DIR/initramfs_root/tools/firmware/ath10k/QCA6174/hw3.0" \
@@ -122,6 +127,7 @@ python3 "$SCRIPT_DIR/wifi_overlay/build_wifi_overlay.py" "$OUT_DIR/initramfs_roo
 cp "$SCRIPT_DIR/android.hardware.graphics.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.graphics.xml"
 cp "$SCRIPT_DIR/android.hardware.power.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.power.xml"
 cp "$SCRIPT_DIR/android.hardware.sensors.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.sensors.xml"
+cp "$SCRIPT_DIR/android.hardware.bluetooth.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.bluetooth.xml"
 if [ -f "$SCRIPT_DIR/setup_composer_sysfs.sh" ]; then
     cp "$SCRIPT_DIR/setup_composer_sysfs.sh" "$OUT_DIR/initramfs_root/tools/setup_composer_sysfs.sh"
     chmod +x "$OUT_DIR/initramfs_root/tools/setup_composer_sysfs.sh"
