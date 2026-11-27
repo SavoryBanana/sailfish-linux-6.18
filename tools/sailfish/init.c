@@ -2227,6 +2227,7 @@ static bool write_permissive_ld_config(const char *path, const char *label) {
     static const struct ns_spec apex_ns[] = {
         { "system_ext", "/system_ext/${LIB}:/system/system_ext/${LIB}" },
         { "product", "/product/${LIB}:/system/product/${LIB}" },
+        { "sphal", "/vendor/${LIB}:/vendor/${LIB}/hw:/vendor/${LIB}/egl:/odm/${LIB}:/odm/${LIB}/hw" },
         { "com_android_runtime", NULL },
         { "com_android_art", "/apex/com.android.art/${LIB}" },
         { "com_android_i18n", "/apex/com.android.i18n/${LIB}" },
@@ -2268,7 +2269,7 @@ static bool write_permissive_ld_config(const char *path, const char *label) {
         "/apex/com.android.adservices/${LIB}:/apex/com.android.sdkext/${LIB}:/apex/com.android.rkpd/${LIB}:"
         "/bootstrap-apex/com.android.art/${LIB}:/bootstrap-apex/com.android.runtime/${LIB}:/bootstrap-apex/com.android.i18n/${LIB}:";
     const char *vndk_paths =
-        "/vendor/${LIB}:/apex/com.android.vndk.v34/${LIB}:/apex/com.android.vndk.v33/${LIB}:/apex/com.android.vndk.v32/${LIB}:/apex/com.android.vndk.v31/${LIB}";
+        "/vendor/${LIB}:/vendor/${LIB}/hw:/system/${LIB}/hw:/apex/com.android.vndk.v34/${LIB}:/apex/com.android.vndk.v33/${LIB}:/apex/com.android.vndk.v32/${LIB}:/apex/com.android.vndk.v31/${LIB}";
 
     char common_paths[2048];
     snprintf(common_paths, sizeof(common_paths), "%s%s%s%s",
@@ -3101,14 +3102,25 @@ static bool prepare_android_rootfs(bool for_shell) {
         }
     }
 
-    /* Automated: Strip 'onrestart restart surfaceflinger' from composer service definition so
-     * any HAL hiccup never kills SurfaceFlinger */
-    overlay_filtered_rc(
+    /* Automated: Silence legacy HIDL graphics composer@2.1 & allocator@2.0 services
+     * (replaced by native AIDL Gralloc 5 IAllocator + IMapper5 and DRM/KMS IComposer3). */
+    write_file_str("/tmp/empty_vendor.rc", "# Silenced by sailfish-init (replaced by AIDL Gralloc5 + IComposer3)\n");
+    chmod("/tmp/empty_vendor.rc", 0644);
+    set_selinux_label("/tmp/empty_vendor.rc", "u:object_r:vendor_configs_file:s0");
+    const char *legacy_gfx_rcs[] = {
         "/mnt/system_a/vendor/etc/init/android.hardware.graphics.composer@2.1-service.rc",
-        "/tmp/composer.rc",
-        "u:object_r:vendor_configs_file:s0",
-        drop_composer_restart,
-        "[+] Automated: Overlaid composer@2.1-service.rc (removed onrestart restart surfaceflinger)\n");
+        "/mnt/system_a/vendor/etc/init/android.hardware.graphics.allocator@2.0-service.rc",
+        NULL
+    };
+    for (int i = 0; legacy_gfx_rcs[i]; i++) {
+        if (access(legacy_gfx_rcs[i], F_OK) == 0) {
+            if (bind_mount_clean("/tmp/empty_vendor.rc", legacy_gfx_rcs[i]) == 0) {
+                char msg[192];
+                snprintf(msg, sizeof(msg), "[+] Automated: Silenced legacy %s\n", legacy_gfx_rcs[i]);
+                usb_write(msg);
+            }
+        }
+    }
 
     /* Automated: Prevent vendor init.rc 'on post-fs-data' from starting netd prematurely
      * before 'on load-bpf-programs' sets bpf.progs_loaded=1 (stops netd crash-loop). */
@@ -3142,18 +3154,6 @@ static bool prepare_android_rootfs(bool for_shell) {
             const char *real_path;
             const char *label;
         } wrap_targets[] = {
-            { "/mnt/system_a/vendor/bin/hw/android.hardware.graphics.composer@2.1-service",
-              "/mnt/system_a/system/bin/android.hardware.graphics.composer@2.1-service.real",
-              "u:object_r:hal_graphics_composer_default_exec:s0" },
-            { "/mnt/system_a/vendor/bin/hw/android.hardware.graphics.allocator@2.0-service",
-              "/mnt/system_a/system/bin/android.hardware.graphics.allocator@2.0-service.real",
-              "u:object_r:hal_graphics_allocator_default_exec:s0" },
-            { "/mnt/system_a/system/bin/surfaceflinger",
-              "/mnt/system_a/system/bin/surfaceflinger.real",
-              "u:object_r:surfaceflinger_exec:s0" },
-            { "/mnt/system_a/system/bin/bootanimation",
-              "/mnt/system_a/system/bin/bootanimation.real",
-              "u:object_r:bootanim_exec:s0" },
             { "/mnt/system_a/vendor/bin/hw/android.hardware.health@2.0-service.marlin",
               "/mnt/system_a/system/bin/android.hardware.health@2.0-service.marlin.real",
               "u:object_r:hal_health_default_exec:s0" },
@@ -3409,16 +3409,36 @@ static bool prepare_android_rootfs(bool for_shell) {
     }
 
     const char *user0_rc =
+        "on early-boot\n"
+        "    start sailfish_allocator_aidl\n"
+        "    start sailfish_composer3_aidl\n"
+        "\n"
         "on post-fs-data\n"
         "    exec - root root -- /system/bin/sh /system/etc/sailfish_ensure_user0.sh\n"
+        "    start sailfish_allocator_aidl\n"
+        "    start sailfish_composer3_aidl\n"
         "    start sailfish_power_aidl\n"
         "    start sailfish_sensors_aidl\n"
         "    start sailfish_bluetooth_aidl\n"
         "\n"
         "on boot\n"
+        "    start sailfish_allocator_aidl\n"
+        "    start sailfish_composer3_aidl\n"
         "    start sailfish_power_aidl\n"
         "    start sailfish_sensors_aidl\n"
         "    start sailfish_bluetooth_aidl\n"
+        "\n"
+        "service sailfish_allocator_aidl /system/bin/android.hardware.graphics.allocator-service.sailfish\n"
+        "    interface aidl android.hardware.graphics.allocator.IAllocator/default\n"
+        "    class hal\n"
+        "    user root\n"
+        "    group graphics drmrpc system\n"
+        "\n"
+        "service sailfish_composer3_aidl /system/bin/android.hardware.graphics.composer3-service.sailfish\n"
+        "    interface aidl android.hardware.graphics.composer3.IComposer/default\n"
+        "    class hal\n"
+        "    user root\n"
+        "    group graphics drmrpc system\n"
         "\n"
         "service sailfish_power_aidl /system/bin/android.hardware.power-service.sailfish\n"
         "    interface aidl android.hardware.power.IPower/default\n"
@@ -3597,6 +3617,113 @@ static bool prepare_android_rootfs(bool for_shell) {
     if (access("/dev/dri/card1", F_OK) == 0) {
         if (access("/dev/dri/card0", F_OK) != 0) symlink("/dev/dri/card1", "/dev/dri/card0");
         if (access("/mnt/system_a/dev/dri/card0", F_OK) != 0) symlink("/dev/dri/card1", "/mnt/system_a/dev/dri/card0");
+    }
+
+    /* Automated: Install native Gralloc 5 (IAllocator V2 + IMapper5) and DRM/KMS IComposer3 */
+    if (access("/tools/allocator_hal", F_OK) == 0) {
+        const char *dst = "/mnt/system_a/system/bin/android.hardware.graphics.allocator-service.sailfish";
+        umount_all(dst);
+        unlink(dst);
+        if (copy_file("/tools/allocator_hal", dst)) {
+            chmod(dst, 0755);
+            set_selinux_label(dst, "u:object_r:hal_graphics_allocator_default_exec:s0");
+            usb_write("[+] Automated: Installed Gralloc 5 IAllocator V2 service\n");
+        } else if (copy_file("/tools/allocator_hal", "/tmp/allocator_hal")) {
+            chmod("/tmp/allocator_hal", 0755);
+            set_selinux_label("/tmp/allocator_hal", "u:object_r:hal_graphics_allocator_default_exec:s0");
+            int fd = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0755);
+            if (fd >= 0) close(fd);
+            bind_mount_clean("/tmp/allocator_hal", dst);
+        }
+    }
+    if (access("/tools/composer_hal", F_OK) == 0) {
+        const char *dst = "/mnt/system_a/system/bin/android.hardware.graphics.composer3-service.sailfish";
+        umount_all(dst);
+        unlink(dst);
+        if (copy_file("/tools/composer_hal", dst)) {
+            chmod(dst, 0755);
+            set_selinux_label(dst, "u:object_r:hal_graphics_composer_default_exec:s0");
+            usb_write("[+] Automated: Installed native DRM/KMS IComposer3 service\n");
+        } else if (copy_file("/tools/composer_hal", "/tmp/composer_hal")) {
+            chmod("/tmp/composer_hal", 0755);
+            set_selinux_label("/tmp/composer_hal", "u:object_r:hal_graphics_composer_default_exec:s0");
+            int fd = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0755);
+            if (fd >= 0) close(fd);
+            bind_mount_clean("/tmp/composer_hal", dst);
+        }
+    }
+    /* Overlay read-only /vendor/lib64/hw and /vendor/lib/hw with tmpfs so mapper.sailfish.so
+     * is visible to sphal/AServiceManager_openDeclaredPassthroughHal, while omitting legacy
+     * QCOM gralloc.msm8996.so so Mesa Freedreno cleanly uses u_gralloc_fallback. */
+    struct {
+        const char *src_mapper;
+        const char *tmp_dir;
+        const char *vendor_hw;
+        const char *sys_hw;
+        const char *tag;
+    } mapper_overlays[] = {
+        { "/tools/mapper.sailfish.so",    "/vendor_hw64",
+          "/mnt/system_a/vendor/lib64/hw", "/mnt/system_a/system/lib64/hw/mapper.sailfish.so", "64-bit" },
+        { "/tools/mapper.sailfish.so.32", "/vendor_hw32",
+          "/mnt/system_a/vendor/lib/hw",   "/mnt/system_a/system/lib/hw/mapper.sailfish.so",   "32-bit" },
+    };
+    for (int m = 0; m < 2; m++) {
+        if (access(mapper_overlays[m].src_mapper, F_OK) != 0)
+            continue;
+        mkdir(mapper_overlays[m].tmp_dir, 0755);
+        umount_all(mapper_overlays[m].tmp_dir);
+        if (mount("tmpfs", mapper_overlays[m].tmp_dir, "tmpfs", 0, "mode=0755") == 0) {
+            set_selinux_label(mapper_overlays[m].tmp_dir, "u:object_r:vendor_file:s0");
+            DIR *dp = opendir(mapper_overlays[m].vendor_hw);
+            if (dp) {
+                struct dirent *de;
+                while ((de = readdir(dp)) != NULL) {
+                    if (de->d_name[0] == '.') continue;
+                    if (strcmp(de->d_name, "gralloc.msm8996.so") == 0 ||
+                        strcmp(de->d_name, "android.hardware.graphics.mapper@2.0-impl.so") == 0)
+                        continue;
+                    char sp[512], dpth[512];
+                    snprintf(sp, sizeof(sp), "%s/%s", mapper_overlays[m].vendor_hw, de->d_name);
+                    snprintf(dpth, sizeof(dpth), "%s/%s", mapper_overlays[m].tmp_dir, de->d_name);
+                    struct stat st;
+                    if (lstat(sp, &st) != 0) continue;
+                    if (S_ISLNK(st.st_mode)) {
+                        char target[512];
+                        ssize_t n = readlink(sp, target, sizeof(target) - 1);
+                        if (n > 0) {
+                            target[n] = '\0';
+                            symlink(target, dpth);
+                        }
+                    } else if (S_ISREG(st.st_mode)) {
+                        if (copy_file(sp, dpth)) {
+                            chmod(dpth, 0644);
+                            set_selinux_label(dpth, "u:object_r:vendor_file:s0");
+                        }
+                    }
+                }
+                closedir(dp);
+            }
+            char mdst[512];
+            snprintf(mdst, sizeof(mdst), "%s/mapper.sailfish.so", mapper_overlays[m].tmp_dir);
+            if (copy_file(mapper_overlays[m].src_mapper, mdst)) {
+                chmod(mdst, 0644);
+                set_selinux_label(mdst, "u:object_r:same_process_hal_file:s0");
+            }
+            if (bind_mount_clean(mapper_overlays[m].tmp_dir, mapper_overlays[m].vendor_hw) == 0) {
+                char msg[192];
+                snprintf(msg, sizeof(msg),
+                         "[+] Automated: Overlaid %s with %s IMapper5 (mapper.sailfish.so)\n",
+                         mapper_overlays[m].vendor_hw, mapper_overlays[m].tag);
+                usb_write(msg);
+            }
+        }
+        /* Also mirror into /system/lib[64]/hw/mapper.sailfish.so */
+        umount_all(mapper_overlays[m].sys_hw);
+        unlink(mapper_overlays[m].sys_hw);
+        if (copy_file(mapper_overlays[m].src_mapper, mapper_overlays[m].sys_hw)) {
+            chmod(mapper_overlays[m].sys_hw, 0644);
+            set_selinux_label(mapper_overlays[m].sys_hw, "u:object_r:same_process_hal_file:s0");
+        }
     }
 
     /* Automated: Install AIDL Power HAL stub binary for HintManagerService (IPower/default) */
@@ -3813,38 +3940,23 @@ static bool prepare_android_rootfs(bool for_shell) {
     if (access("/mnt/system_a/vendor/etc/vintf/manifest.xml", F_OK) == 0) {
         const char *vendor_manifest_xml =
             "<manifest version=\"1.0\" type=\"device\" target-level=\"2\">\n"
-            "    <hal format=\"hidl\">\n"
+            "    <hal format=\"aidl\">\n"
             "        <name>android.hardware.graphics.allocator</name>\n"
-            "        <transport>hwbinder</transport>\n"
-            "        <version>2.0</version>\n"
-            "        <interface>\n"
-            "            <name>IAllocator</name>\n"
-            "            <instance>default</instance>\n"
-            "        </interface>\n"
-            "        <fqname>@2.0::IAllocator/default</fqname>\n"
+            "        <version>2</version>\n"
+            "        <fqname>IAllocator/default</fqname>\n"
             "    </hal>\n"
-            "    <hal format=\"hidl\">\n"
-            "        <name>android.hardware.graphics.composer</name>\n"
-            "        <transport>hwbinder</transport>\n"
-            "        <version>2.0</version>\n"
-            "        <version>2.1</version>\n"
-            "        <interface>\n"
-            "            <name>IComposer</name>\n"
-            "            <instance>default</instance>\n"
-            "        </interface>\n"
-            "        <fqname>@2.1::IComposer/default</fqname>\n"
-            "    </hal>\n"
-            "    <hal format=\"hidl\">\n"
-            "        <name>android.hardware.graphics.mapper</name>\n"
-            "        <transport arch=\"32+64\">passthrough</transport>\n"
-            "        <version>2.0</version>\n"
-            "        <version>2.1</version>\n"
+            "    <hal format=\"native\">\n"
+            "        <name>mapper</name>\n"
+            "        <version>5.0</version>\n"
             "        <interface>\n"
             "            <name>IMapper</name>\n"
-            "            <instance>default</instance>\n"
+            "            <instance>sailfish</instance>\n"
             "        </interface>\n"
-            "        <fqname>@2.0::IMapper/default</fqname>\n"
-            "        <fqname>@2.1::IMapper/default</fqname>\n"
+            "    </hal>\n"
+            "    <hal format=\"aidl\">\n"
+            "        <name>android.hardware.graphics.composer3</name>\n"
+            "        <version>1</version>\n"
+            "        <fqname>IComposer/default</fqname>\n"
             "    </hal>\n"
             "    <hal format=\"hidl\">\n"
             "        <name>android.hardware.health</name>\n"
@@ -4215,21 +4327,8 @@ static bool prepare_android_rootfs(bool for_shell) {
         set_selinux_label(ven_shim, "u:object_r:vendor_file:s0");
     }
 
-    /* Automated: Install patched libui.so via writable /tmp to bypass Android 17 Gralloc 4/5 restriction */
-    const char *orig_libui = "/mnt/system_a/system/lib64/libui.so";
-    const char *tmp_libui = "/tmp/libui.so";
-    mkdir("/tmp", 0755);
-    bool libui_ready = false;
-    if (access("/tools/libui.so", F_OK) == 0 && copy_file("/tools/libui.so", tmp_libui)) {
-        chmod(tmp_libui, 0755);
-        set_selinux_label(tmp_libui, "u:object_r:system_lib_file:s0");
-        libui_ready = true;
-    }
-    if (libui_ready && access(tmp_libui, F_OK) == 0 && access(orig_libui, F_OK) == 0) {
-        if (mount(tmp_libui, orig_libui, NULL, MS_BIND, NULL) == 0) {
-            usb_write("[+] Automated: Successfully bind-mounted Gralloc2-enabled libui.so over /system/lib64/libui.so\n");
-        }
-    }
+    /* Stock Android 17 /system/lib64/libui.so runs unmodified with Gralloc 5 (IAllocator V2 + IMapper5). */
+    umount_all("/mnt/system_a/system/lib64/libui.so");
 
     /* Automated: Short-circuit AudioSystem/mediautils service wait stubs so StartAudioService
      * returns in 0ms instead of starving system_server for 75s+ Watchdog timeouts, and skip
@@ -4509,29 +4608,6 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "            fi\n"
                     "            /system/bin/cmd statusbar collapse 2>/dev/null || true\n"
                     "            bootanim_stopped=1\n"
-                    "        fi\n"
-                    "        if [ \"$qservice_up\" = \"0\" ]; then\n"
-                    "            if pgrep -f vndservicemanager >/dev/null 2>&1 || [ \"$(getprop init.svc.vndservicemanager)\" = \"running\" ]; then\n"
-                    "                if pgrep -x qservice_daemon >/dev/null 2>&1; then\n"
-                    "                    qservice_up=1\n"
-                    "                else\n"
-                    "                    hwc_was_up=0\n"
-                    "                    if pgrep -f graphics.composer@2.1-service >/dev/null 2>&1 || [ \"$(getprop init.svc.vendor.hwcomposer-2-1)\" = \"running\" ]; then\n"
-                    "                        hwc_was_up=1\n"
-                    "                    fi\n"
-                    "                    /data/qservice_daemon >/dev/null 2>&1 &\n"
-                    "                    if [ \"$boot_done\" != \"1\" ] && [ \"$hwc_was_up\" = \"1\" ] && [ \"$hwc_restarted\" = \"0\" ]; then\n"
-                    "                        sleep 1\n"
-                    "                        setprop ctl.restart vendor.hwcomposer-2-1 2>/dev/null || true\n"
-                    "                        if [ -n \"$sf_pid\" ]; then\n"
-                    "                            sleep 1\n"
-                    "                            setprop ctl.restart surfaceflinger 2>/dev/null || true\n"
-                    "                        fi\n"
-                    "                        hwc_restarted=1\n"
-                    "                    fi\n"
-                    "                    qservice_up=1\n"
-                    "                fi\n"
-                    "            fi\n"
                     "        fi\n"
                     "        if [ \"$boot_done\" = \"1\" ] && [ \"$bootanim_stopped\" = \"1\" ]; then\n"
                     "            sleep 10\n"

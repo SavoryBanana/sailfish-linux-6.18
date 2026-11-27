@@ -1,18 +1,20 @@
 <manifest version="9.0" type="framework">
-    <hal format="hidl">
-        <name>android.hardware.graphics.composer</name>
-        <transport>hwbinder</transport>
-        <fqname>@2.1::IComposer/default</fqname>
-    </hal>
-    <hal format="hidl">
+    <hal format="aidl">
         <name>android.hardware.graphics.allocator</name>
-        <transport>hwbinder</transport>
-        <fqname>@2.0::IAllocator/default</fqname>
+        <version>2</version>
+        <fqname>IAllocator/default</fqname>
     </hal>
-    <hal format="hidl">
-        <name>android.hardware.graphics.mapper</name>
-        <transport arch="32+64">passthrough</transport>
-        <fqname>@2.0::IMapper/default</fqname>
+    <hal format="native">
+        <name>mapper</name>
+        <version>5.0</version>
+        <interface>
+            <name>IMapper</name>
+            <instance>sailfish</instance>
+        </interface>
+    </hal>
+    <hal format="aidl">
+        <name>android.hardware.graphics.composer3</name>
+        <version>1</version>
+        <fqname>IComposer/default</fqname>
     </hal>
 </manifest>
-

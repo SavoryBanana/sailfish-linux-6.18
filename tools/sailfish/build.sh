@@ -62,10 +62,16 @@ fi
 if [ -f "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" ]; then
     cp "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" "$OUT_DIR/initramfs_root/tools/libsdm_shim.so"
 fi
-if [ -f "$SCRIPT_DIR/libui_patched.so" ]; then
-    echo "[+] Staging patched libui.so (Gralloc 2.x support)"
-    cp "$SCRIPT_DIR/libui_patched.so" "$OUT_DIR/initramfs_root/tools/libui.so"
-fi
+chmod +x "$SCRIPT_DIR/gralloc_hal/build.sh"
+"$SCRIPT_DIR/gralloc_hal/build.sh"
+cp "$SCRIPT_DIR/gralloc_hal/allocator_hal" "$OUT_DIR/initramfs_root/tools/allocator_hal"
+chmod +x "$OUT_DIR/initramfs_root/tools/allocator_hal"
+cp "$SCRIPT_DIR/gralloc_hal/mapper.sailfish.so" "$OUT_DIR/initramfs_root/tools/mapper.sailfish.so"
+cp "$SCRIPT_DIR/gralloc_hal/mapper.sailfish.so.32" "$OUT_DIR/initramfs_root/tools/mapper.sailfish.so.32"
+chmod +x "$SCRIPT_DIR/composer_hal/build.sh"
+"$SCRIPT_DIR/composer_hal/build.sh"
+cp "$SCRIPT_DIR/composer_hal/composer_hal" "$OUT_DIR/initramfs_root/tools/composer_hal"
+chmod +x "$OUT_DIR/initramfs_root/tools/composer_hal"
 if [ -f "$SCRIPT_DIR/adreno_utils/libadreno_utils.so" ]; then
     cp "$SCRIPT_DIR/adreno_utils/libadreno_utils.so" "$OUT_DIR/initramfs_root/tools/libadreno_utils.so"
 fi
