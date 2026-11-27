@@ -471,9 +471,10 @@ static struct {
     int active_slot;
     layer_state_t layers[MAX_LAYERS];
     int64_t next_layer_id;
-    bool validated_all_device;
-    int validated_device_idx[MAX_HW_PLANES];
-    int32_t n_validated_device;
+    /* Each entry is a layer index (>= 0) or -1 for clientTarget */
+    int validated_planes[MAX_HW_PLANES];
+    int32_t n_validated_planes;
+    bool validated_has_client;
     int64_t prev_device_layers[MAX_HW_PLANES];
     int32_t n_prev_device_layers;
     AIBinder *callback;
@@ -764,11 +765,13 @@ static bool import_slot_buf_locked(client_slot_t *s, int dmabuf_fd,
     uint32_t pitch = (info && info->stride_bytes) ? info->stride_bytes : (((w + 63U) & ~63U) * 4U);
     uint32_t fourcc = (info && info->drm_fourcc) ? info->drm_fourcc : FOURCC_CODE('A', 'B', '2', '4');
 
-    /* Only import MDP5-safe single-plane RGB formats into DRM FBs */
+    /* Only import MDP5-safe RGB and NV12 YUV formats into DRM FBs */
+    bool is_nv12 = (fourcc == FOURCC_CODE('N', 'V', '1', '2'));
     if (fourcc != FOURCC_CODE('A', 'B', '2', '4') &&
         fourcc != FOURCC_CODE('X', 'B', '2', '4') &&
         fourcc != FOURCC_CODE('A', 'R', '2', '4') &&
-        fourcc != FOURCC_CODE('R', 'G', '1', '6')) {
+        fourcc != FOURCC_CODE('R', 'G', '1', '6') &&
+        !is_nv12) {
         if (!allow_xb24_fallback) {
             struct drm_gem_close gc = { ph.handle, 0 };
             ioctl(g_disp.card_fd, DRM_IOCTL_GEM_CLOSE, &gc);
@@ -784,6 +787,12 @@ static bool import_slot_buf_locked(client_slot_t *s, int dmabuf_fd,
     fb.pixel_format = fourcc;
     fb.handles[0] = ph.handle;
     fb.pitches[0] = pitch;
+    if (is_nv12) {
+        uint32_t h_aligned = (h + 1U) & ~1U;
+        fb.handles[1] = ph.handle;
+        fb.pitches[1] = pitch;
+        fb.offsets[1] = pitch * h_aligned;
+    }
     if (ioctl(g_disp.card_fd, DRM_IOCTL_MODE_ADDFB2, &fb) < 0) {
         if (!allow_xb24_fallback) {
             struct drm_gem_close gc = { ph.handle, 0 };
@@ -921,9 +930,31 @@ static void areq_disable_plane(atomic_req_t *req, const drm_plane_info_t *pl) {
     areq_add_prop(req, pl->p_crtc, 0);
 }
 
-static bool drm_test_device_planes_locked(const int *layer_idxs, int n_layers) {
-    if (!drm_init_locked() || !g_disp.crtc_active || n_layers <= 0 ||
-        (uint32_t)n_layers > g_disp.n_planes)
+static void areq_add_plane_client(atomic_req_t *req, const drm_plane_info_t *pl,
+                                  const client_slot_t *s, uint64_t zpos,
+                                  bool blend_premulti, int acquire_fence) {
+    areq_begin_obj(req, pl->id);
+    areq_add_prop(req, pl->p_fb, s->fb_id);
+    areq_add_prop(req, pl->p_crtc, g_disp.crtc_id);
+    areq_add_prop(req, pl->p_sx, 0);
+    areq_add_prop(req, pl->p_sy, 0);
+    areq_add_prop(req, pl->p_sw, (uint64_t)s->w << 16);
+    areq_add_prop(req, pl->p_sh, (uint64_t)s->h << 16);
+    areq_add_prop(req, pl->p_cx, 0);
+    areq_add_prop(req, pl->p_cy, 0);
+    areq_add_prop(req, pl->p_cw, g_disp.disp_w);
+    areq_add_prop(req, pl->p_ch, g_disp.disp_h);
+    areq_add_prop(req, pl->p_zpos, zpos);
+    areq_add_prop(req, pl->p_alpha, 0xffffU);
+    areq_add_prop(req, pl->p_blend,
+                  blend_premulti ? DRM_MODE_BLEND_PREMULTI : DRM_MODE_BLEND_PIXEL_NONE);
+    if (pl->p_infence && acquire_fence >= 0)
+        areq_add_prop(req, pl->p_infence, (uint64_t)(int64_t)acquire_fence);
+}
+
+static bool drm_test_plan_locked(const int *plan, int n_plan, int ct_slot) {
+    if (!drm_init_locked() || !g_disp.crtc_active || n_plan <= 0 ||
+        (uint32_t)n_plan > g_disp.n_planes)
         return false;
 
     atomic_req_t req;
@@ -936,11 +967,18 @@ static bool drm_test_device_planes_locked(const int *layer_idxs, int n_layers) {
     areq_add_prop(&req, g_disp.prop_crtc_active, 1);
     areq_add_prop(&req, g_disp.prop_crtc_mode_id, g_disp.mode_blob_id);
 
-    for (int i = 0; i < n_layers; i++) {
-        areq_add_plane_layer(&req, &g_disp.planes[i], &g_disp.layers[layer_idxs[i]],
-                             (uint64_t)(i + 1), false);
+    for (int i = 0; i < n_plan; i++) {
+        if (plan[i] < 0) {
+            if (ct_slot < 0 || ct_slot >= MAX_CLIENT_SLOTS || !g_disp.slots[ct_slot].fb_id)
+                return false;
+            areq_add_plane_client(&req, &g_disp.planes[i], &g_disp.slots[ct_slot],
+                                  (uint64_t)(i + 1), (i > 0), -1);
+        } else {
+            areq_add_plane_layer(&req, &g_disp.planes[i], &g_disp.layers[plan[i]],
+                                 (uint64_t)(i + 1), false);
+        }
     }
-    for (uint32_t p = (uint32_t)n_layers; p < g_disp.n_planes; p++) {
+    for (uint32_t p = (uint32_t)n_plan; p < g_disp.n_planes; p++) {
         areq_disable_plane(&req, &g_disp.planes[p]);
     }
 
@@ -956,7 +994,8 @@ static bool drm_test_device_planes_locked(const int *layer_idxs, int n_layers) {
     return ioctl(g_disp.card_fd, DRM_IOCTL_MODE_ATOMIC, &ma) == 0;
 }
 
-static int drm_commit_present_locked(int slot, int acquire_fence, bool use_device_planes) {
+static int drm_commit_present_locked(int slot, int acquire_fence, bool *out_used_hw) {
+    if (out_used_hw) *out_used_hw = false;
     if (!drm_init_locked()) {
         if (acquire_fence >= 0) close(acquire_fence);
         return -1;
@@ -966,23 +1005,31 @@ static int drm_commit_present_locked(int slot, int acquire_fence, bool use_devic
         return drm_create_signaled_fence_locked();
     }
 
-    if (use_device_planes) {
-        if (g_disp.n_validated_device <= 0 ||
-            (uint32_t)g_disp.n_validated_device > g_disp.n_planes) {
-            use_device_planes = false;
-        } else {
-            for (int i = 0; i < g_disp.n_validated_device; i++) {
-                layer_state_t *L = &g_disp.layers[g_disp.validated_device_idx[i]];
-                if (!L->used || L->active_slot < 0 || L->active_slot >= MAX_LAYER_SLOTS ||
-                    !L->slots[L->active_slot].fb_id) {
-                    use_device_planes = false;
+    /* Validate that all planes in g_disp.validated_planes[] are still live */
+    bool use_plan = (g_disp.n_validated_planes > 0 &&
+                     (uint32_t)g_disp.n_validated_planes <= g_disp.n_planes);
+    bool plan_has_dev = false;
+    if (use_plan) {
+        for (int i = 0; i < g_disp.n_validated_planes; i++) {
+            int idx = g_disp.validated_planes[i];
+            if (idx < 0) {
+                if (slot < 0 || slot >= MAX_CLIENT_SLOTS || !g_disp.slots[slot].fb_id) {
+                    use_plan = false;
                     break;
                 }
+            } else {
+                layer_state_t *L = &g_disp.layers[idx];
+                if (!L->used || L->active_slot < 0 || L->active_slot >= MAX_LAYER_SLOTS ||
+                    !L->slots[L->active_slot].fb_id) {
+                    use_plan = false;
+                    break;
+                }
+                plan_has_dev = true;
             }
         }
     }
 
-    if (!use_device_planes &&
+    if (!use_plan &&
         (slot < 0 || slot >= MAX_CLIENT_SLOTS || !g_disp.slots[slot].fb_id)) {
         if (acquire_fence >= 0) close(acquire_fence);
         return drm_create_signaled_fence_locked();
@@ -1002,24 +1049,42 @@ static int drm_commit_present_locked(int slot, int acquire_fence, bool use_devic
         areq_add_prop(&req, g_disp.prop_crtc_out_fence_ptr, (uint64_t)(uintptr_t)&out_fence);
 
     uint32_t primary_fb = 0, primary_w = g_disp.disp_w, primary_h = g_disp.disp_h;
-    if (use_device_planes) {
-        for (int i = 0; i < g_disp.n_validated_device; i++) {
-            layer_state_t *L = &g_disp.layers[g_disp.validated_device_idx[i]];
+    if (use_plan && plan_has_dev) {
+        if (out_used_hw) *out_used_hw = true;
+        for (int i = 0; i < g_disp.n_validated_planes; i++) {
+            int idx = g_disp.validated_planes[i];
             const drm_plane_info_t *pl = &g_disp.planes[i];
-            if (!pl->p_infence && L->acquire_fence >= 0) {
-                struct pollfd pfd = { .fd = L->acquire_fence, .events = POLLIN };
-                (void)poll(&pfd, 1, 500);
-                close(L->acquire_fence);
-                L->acquire_fence = -1;
-            }
-            areq_add_plane_layer(&req, pl, L, (uint64_t)(i + 1), true);
-            if (i == 0) {
-                primary_fb = L->slots[L->active_slot].fb_id;
-                primary_w = L->slots[L->active_slot].w;
-                primary_h = L->slots[L->active_slot].h;
+            if (idx < 0) {
+                client_slot_t *s = &g_disp.slots[slot];
+                if (!pl->p_infence && acquire_fence >= 0) {
+                    struct pollfd pfd = { .fd = acquire_fence, .events = POLLIN };
+                    (void)poll(&pfd, 1, 500);
+                    close(acquire_fence);
+                    acquire_fence = -1;
+                }
+                areq_add_plane_client(&req, pl, s, (uint64_t)(i + 1), (i > 0), acquire_fence);
+                if (i == 0) {
+                    primary_fb = s->fb_id;
+                    primary_w = s->w;
+                    primary_h = s->h;
+                }
+            } else {
+                layer_state_t *L = &g_disp.layers[idx];
+                if (!pl->p_infence && L->acquire_fence >= 0) {
+                    struct pollfd pfd = { .fd = L->acquire_fence, .events = POLLIN };
+                    (void)poll(&pfd, 1, 500);
+                    close(L->acquire_fence);
+                    L->acquire_fence = -1;
+                }
+                areq_add_plane_layer(&req, pl, L, (uint64_t)(i + 1), true);
+                if (i == 0) {
+                    primary_fb = L->slots[L->active_slot].fb_id;
+                    primary_w = L->slots[L->active_slot].w;
+                    primary_h = L->slots[L->active_slot].h;
+                }
             }
         }
-        for (uint32_t p = (uint32_t)g_disp.n_validated_device; p < g_disp.n_planes; p++) {
+        for (uint32_t p = (uint32_t)g_disp.n_validated_planes; p < g_disp.n_planes; p++) {
             areq_disable_plane(&req, &g_disp.planes[p]);
         }
     } else {
@@ -1034,22 +1099,7 @@ static int drm_commit_present_locked(int slot, int acquire_fence, bool use_devic
             close(acquire_fence);
             acquire_fence = -1;
         }
-        areq_begin_obj(&req, pl->id);
-        areq_add_prop(&req, pl->p_fb, s->fb_id);
-        areq_add_prop(&req, pl->p_crtc, g_disp.crtc_id);
-        areq_add_prop(&req, pl->p_sx, 0);
-        areq_add_prop(&req, pl->p_sy, 0);
-        areq_add_prop(&req, pl->p_sw, (uint64_t)s->w << 16);
-        areq_add_prop(&req, pl->p_sh, (uint64_t)s->h << 16);
-        areq_add_prop(&req, pl->p_cx, 0);
-        areq_add_prop(&req, pl->p_cy, 0);
-        areq_add_prop(&req, pl->p_cw, g_disp.disp_w);
-        areq_add_prop(&req, pl->p_ch, g_disp.disp_h);
-        areq_add_prop(&req, pl->p_zpos, 1);
-        areq_add_prop(&req, pl->p_alpha, 0xffffU);
-        areq_add_prop(&req, pl->p_blend, DRM_MODE_BLEND_PIXEL_NONE);
-        if (pl->p_infence && acquire_fence >= 0)
-            areq_add_prop(&req, pl->p_infence, (uint64_t)(int64_t)acquire_fence);
+        areq_add_plane_client(&req, pl, s, 1, false, acquire_fence);
         for (uint32_t p = 1; p < g_disp.n_planes; p++) {
             areq_disable_plane(&req, &g_disp.planes[p]);
         }
@@ -1101,14 +1151,16 @@ static int drm_commit_present_locked(int slot, int acquire_fence, bool use_devic
             set_backlight_sysfs(0, g_last_brightness);
             g_disp.need_modeset = false;
         }
-        if (use_device_planes && g_hw_overlay_logs < 5) {
+        if (use_plan && plan_has_dev && g_hw_overlay_logs < 5) {
             g_hw_overlay_logs++;
             char msg[160];
             snprintf(msg, sizeof(msg),
-                     "<6>sailfish_composer_hal: MDP5 HW overlay commit #%d OK (%d planes, fb0=%u %ux%u fence=%d)\n",
-                     g_hw_overlay_logs, g_disp.n_validated_device, primary_fb, primary_w, primary_h, out_fence);
+                     "<6>sailfish_composer_hal: MDP5 HW overlay commit #%d OK (%d planes%s, fb0=%u %ux%u fence=%d)\n",
+                     g_hw_overlay_logs, g_disp.n_validated_planes,
+                     g_disp.validated_has_client ? " hybrid" : "",
+                     primary_fb, primary_w, primary_h, out_fence);
             kmsg_log(msg);
-        } else if (!use_device_planes && g_commit_ok_logs < 3) {
+        } else if ((!use_plan || !plan_has_dev) && g_commit_ok_logs < 3) {
             g_commit_ok_logs++;
             char msg[128];
             snprintf(msg, sizeof(msg),
@@ -1124,8 +1176,8 @@ static int drm_commit_present_locked(int slot, int acquire_fence, bool use_devic
         g_commit_err_logs++;
         char msg[128];
         snprintf(msg, sizeof(msg),
-                 "<3>sailfish_composer_hal: atomic commit FAILED errno=%d dev=%d fb=%u\n",
-                 saved_err, (int)use_device_planes, primary_fb);
+                 "<3>sailfish_composer_hal: atomic commit FAILED errno=%d hw=%d fb=%u\n",
+                 saved_err, (int)(use_plan && plan_has_dev), primary_fb);
         kmsg_log(msg);
     }
     return drm_create_signaled_fence_locked();
@@ -1818,25 +1870,91 @@ static int32_t handle_execute_commands(const AParcel *in, AParcel *out) {
                 active_idx[j + 1] = key;
             }
 
-            /* Try full MDP5 hardware overlay composition when all layers are eligible */
-            bool all_hw = (!g_disp.disp_has_color_transform &&
-                           n_active > 0 && (uint32_t)n_active <= g_disp.n_planes);
-            for (int i = 0; all_hw && i < n_active; i++) {
-                if (!layer_is_hw_eligible(&g_disp.layers[active_idx[i]]))
-                    all_hw = false;
-            }
-            if (all_hw && !drm_test_device_planes_locked(active_idx, n_active)) {
-                all_hw = false;
-            }
-
-            g_disp.validated_all_device = all_hw;
-            g_disp.n_validated_device = all_hw ? n_active : 0;
-            if (all_hw) {
-                for (int i = 0; i < n_active; i++)
-                    g_disp.validated_device_idx[i] = active_idx[i];
+            /* Build composition plan:
+             *  1. Full MDP5 hardware overlay (ALL DEVICE) when all layers are eligible
+             *  2. Hybrid MDP5 overlay (CLIENT span + DEVICE overlays above/below)
+             *  3. Pure CLIENT fallback */
+            bool elig[MAX_LAYERS];
+            int first_cli = -1, last_cli = -1;
+            for (int i = 0; i < n_active; i++) {
+                elig[i] = layer_is_hw_eligible(&g_disp.layers[active_idx[i]]);
+                if (!elig[i]) {
+                    if (first_cli < 0) first_cli = i;
+                    last_cli = i;
+                }
             }
 
-            int32_t target_comp = all_hw ? COMP_DEVICE : COMP_CLIENT;
+            int plan[MAX_HW_PLANES];
+            int n_plan = 0;
+            bool plan_has_client = true;
+            int32_t layer_target[MAX_LAYERS];
+            for (int i = 0; i < n_active; i++) layer_target[i] = COMP_CLIENT;
+
+            /* 1. Try ALL DEVICE */
+            if (!g_disp.disp_has_color_transform && first_cli < 0 &&
+                n_active > 0 && (uint32_t)n_active <= g_disp.n_planes) {
+                for (int i = 0; i < n_active; i++) plan[i] = active_idx[i];
+                if (drm_test_plan_locked(plan, n_active, g_disp.active_slot)) {
+                    n_plan = n_active;
+                    plan_has_client = false;
+                    for (int i = 0; i < n_active; i++) layer_target[i] = COMP_DEVICE;
+                }
+            }
+
+            /* 2. Try HYBRID (CLIENT span + DEVICE overlays above/below) */
+            if (n_plan == 0 && !g_disp.disp_has_color_transform &&
+                n_active >= 2 && g_disp.n_planes >= 2 &&
+                g_disp.active_slot >= 0 && g_disp.slots[g_disp.active_slot].fb_id) {
+                int fc = first_cli, lc = last_cli;
+                if (fc < 0) {
+                    /* All eligible, just more layers than HW planes */
+                    fc = 0;
+                    lc = n_active - (int)g_disp.n_planes;
+                }
+                int n_below = fc;
+                int n_above = (n_active - 1) - lc;
+                /* If placing DEVICE layers below clientTarget, require fullscreen opaque base */
+                if (n_below > 0) {
+                    const layer_state_t *base = &g_disp.layers[active_idx[0]];
+                    if (base->df_left != 0 || base->df_top != 0 ||
+                        (uint32_t)base->df_right != g_disp.disp_w ||
+                        (uint32_t)base->df_bottom != g_disp.disp_h ||
+                        base->blend_mode != BLEND_NONE) {
+                        fc = 0;
+                        n_below = 0;
+                    }
+                }
+                while (n_below + 1 + n_above > (int)g_disp.n_planes) {
+                    if (n_above > 0) { lc++; n_above--; }
+                    else if (n_below > 0) { fc--; n_below--; }
+                    else break;
+                }
+                if (n_below + n_above >= 1 && n_below + 1 + n_above <= (int)g_disp.n_planes) {
+                    int np = 0;
+                    for (int i = 0; i < n_below; i++) plan[np++] = active_idx[i];
+                    plan[np++] = -1; /* clientTarget for [fc..lc] */
+                    for (int i = lc + 1; i < n_active; i++) plan[np++] = active_idx[i];
+                    if (drm_test_plan_locked(plan, np, g_disp.active_slot)) {
+                        n_plan = np;
+                        plan_has_client = true;
+                        for (int i = 0; i < n_below; i++) layer_target[i] = COMP_DEVICE;
+                        for (int i = lc + 1; i < n_active; i++) layer_target[i] = COMP_DEVICE;
+                    }
+                }
+            }
+
+            /* 3. Fallback: ALL CLIENT on primary plane */
+            if (n_plan == 0) {
+                plan[0] = -1;
+                n_plan = 1;
+                plan_has_client = true;
+            }
+
+            g_disp.n_validated_planes = n_plan;
+            g_disp.validated_has_client = plan_has_client;
+            for (int i = 0; i < n_plan; i++)
+                g_disp.validated_planes[i] = plan[i];
+
             payload_t ch;
             memset(&ch, 0, sizeof(ch));
             ch.tag = CRP_TAG_CHANGED_COMPOSITION_TYPES;
@@ -1844,22 +1962,23 @@ static int32_t handle_execute_commands(const AParcel *in, AParcel *out) {
             ch.fence_fd = -1;
             for (int i = 0; i < n_active; i++) {
                 layer_state_t *L = &g_disp.layers[active_idx[i]];
-                if (L->req_comp != target_comp) {
+                int32_t tcomp = layer_target[i];
+                if (L->req_comp != tcomp) {
                     ch.changed_layers[ch.n_changed] = L->id;
-                    ch.changed_types[ch.n_changed] = target_comp;
+                    ch.changed_types[ch.n_changed] = tcomp;
                     ch.n_changed++;
                 }
-                L->comp_type = target_comp;
+                L->comp_type = tcomp;
             }
             if (ch.n_changed > 0 && n_payloads < 16)
                 payloads[n_payloads++] = ch;
 
             if (pov && n_payloads < 16) {
                 /* Present immediately if no composition type changes AND either:
-                 *  - all layers are MDP5 DEVICE overlays (no clientTarget needed), OR
-                 *  - CLIENT composition with a fresh clientTarget already supplied. */
+                 *  - pure MDP5 DEVICE overlays (no clientTarget needed), OR
+                 *  - CLIENT/HYBRID with a fresh clientTarget already supplied. */
                 bool can_present_now = (ch.n_changed == 0) &&
-                    (all_hw || (has_ct && g_disp.active_slot >= 0));
+                    (!plan_has_client || (has_ct && g_disp.active_slot >= 0));
                 payload_t pr;
                 memset(&pr, 0, sizeof(pr));
                 pr.tag = CRP_TAG_PRESENT_OR_VALIDATE;
@@ -1873,8 +1992,8 @@ static int32_t handle_execute_commands(const AParcel *in, AParcel *out) {
         }
 
         if (present_disp && n_payloads < 16) {
-            bool use_dev = g_disp.validated_all_device;
-            int p_fence = drm_commit_present_locked(g_disp.active_slot, ct_fence, use_dev);
+            bool used_hw = false;
+            int p_fence = drm_commit_present_locked(g_disp.active_slot, ct_fence, &used_hw);
             ct_fence = -1;
 
             payload_t pf;
@@ -1902,10 +2021,13 @@ static int32_t handle_execute_commands(const AParcel *in, AParcel *out) {
             }
 
             g_disp.n_prev_device_layers = 0;
-            if (use_dev) {
-                for (int i = 0; i < g_disp.n_validated_device; i++) {
-                    g_disp.prev_device_layers[g_disp.n_prev_device_layers++] =
-                        g_disp.layers[g_disp.validated_device_idx[i]].id;
+            if (used_hw) {
+                for (int i = 0; i < g_disp.n_validated_planes; i++) {
+                    int idx = g_disp.validated_planes[i];
+                    if (idx >= 0) {
+                        g_disp.prev_device_layers[g_disp.n_prev_device_layers++] =
+                            g_disp.layers[idx].id;
+                    }
                 }
             }
         }

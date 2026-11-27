@@ -1241,6 +1241,11 @@
 			qcom,vmax-mv = <2784>;
 			qcom,wave-play-rate-us = <5000>;
 		};
+
+		pmi8994_flash: flash@d300 {
+			compatible = "qcom,pmi8994-flash-led";
+			reg = <0xd300>;
+		};
 	};
 };
 
