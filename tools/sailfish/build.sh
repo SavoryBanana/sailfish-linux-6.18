@@ -52,12 +52,8 @@ if [ -f "$SCRIPT_DIR/mesa/lib64/libgallium_dri.so" ]; then
     cp "$SCRIPT_DIR/mesa/lib64/"*.so "$OUT_DIR/initramfs_root/tools/mesa/"
 fi
 if [ -f "$SCRIPT_DIR/sdm_shim/libsdm_shim.c" ]; then
-    echo "[+] Building libsdm_shim.so"
-    VER_FLAG=""
-    if [ -f "$SCRIPT_DIR/sdm_shim/libsdm_shim.ver" ]; then
-        VER_FLAG="-Wl,--version-script=$SCRIPT_DIR/sdm_shim/libsdm_shim.ver"
-    fi
-    aarch64-linux-gnu-gcc -shared -fPIC -O2 -nostdlib "$SCRIPT_DIR/sdm_shim/libsdm_shim.c" -o "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" $VER_FLAG -Wl,-z,max-page-size=4096
+    echo "[+] Building minimal compat libsdm_shim.so (String8 + software KeyMint)"
+    aarch64-linux-gnu-gcc -shared -fPIC -O2 -s -nostdlib -mno-outline-atomics "$SCRIPT_DIR/sdm_shim/libsdm_shim.c" -o "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" -Wl,-z,max-page-size=4096
 fi
 if [ -f "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" ]; then
     cp "$SCRIPT_DIR/sdm_shim/libsdm_shim.so" "$OUT_DIR/initramfs_root/tools/libsdm_shim.so"
@@ -103,9 +99,6 @@ mkdir -p "$SCRIPT_DIR/wrap_preload"
 aarch64-linux-gnu-gcc -nostdlib -static -s -O2 -o "$SCRIPT_DIR/wrap_preload/wrap_preload" "$SCRIPT_DIR/wrap_preload/wrap_preload.c"
 cp "$SCRIPT_DIR/wrap_preload/wrap_preload" "$OUT_DIR/initramfs_root/tools/wrap_preload"
 chmod +x "$OUT_DIR/initramfs_root/tools/wrap_preload"
-
-cp "$SCRIPT_DIR/qservice_daemon/qservice_daemon" "$OUT_DIR/initramfs_root/tools/qservice_daemon"
-chmod +x "$OUT_DIR/initramfs_root/tools/qservice_daemon"
 
 "$SCRIPT_DIR/power_hal/build.sh"
 cp "$SCRIPT_DIR/power_hal/power_hal" "$OUT_DIR/initramfs_root/tools/power_hal"
@@ -157,10 +150,6 @@ cp "$SCRIPT_DIR/android.hardware.graphics.xml" "$OUT_DIR/initramfs_root/tools/an
 cp "$SCRIPT_DIR/android.hardware.power.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.power.xml"
 cp "$SCRIPT_DIR/android.hardware.sensors.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.sensors.xml"
 cp "$SCRIPT_DIR/android.hardware.bluetooth.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.bluetooth.xml"
-if [ -f "$SCRIPT_DIR/setup_composer_sysfs.sh" ]; then
-    cp "$SCRIPT_DIR/setup_composer_sysfs.sh" "$OUT_DIR/initramfs_root/tools/setup_composer_sysfs.sh"
-    chmod +x "$OUT_DIR/initramfs_root/tools/setup_composer_sysfs.sh"
-fi
 
 # Note: initramfs_root is embedded directly into the kernel Image via
 # CONFIG_INITRAMFS_SOURCE (compressed with XZ). Provide a minimal valid

@@ -733,6 +733,7 @@ static void set_backlight_sysfs(int bl_power, int brightness) {
     }
 }
 
+static int g_last_brightness = 180;
 static int g_commit_ok_logs = 0;
 static int g_commit_err_logs = 0;
 
@@ -809,7 +810,7 @@ static int drm_commit_present_locked(int slot, int acquire_fence) {
 
     if (ret == 0) {
         if (g_disp.need_modeset) {
-            set_backlight_sysfs(0, -1);
+            set_backlight_sysfs(0, g_last_brightness);
             g_disp.need_modeset = false;
         }
         if (g_commit_ok_logs < 3) {
@@ -837,11 +838,14 @@ static int drm_commit_present_locked(int slot, int acquire_fence) {
 
 static void drm_set_power_locked(bool on) {
     if (!drm_init_locked()) return;
-    if (on == g_disp.crtc_active) return;
+    if (on == g_disp.crtc_active) {
+        if (on) set_backlight_sysfs(0, g_last_brightness);
+        return;
+    }
     g_disp.crtc_active = on;
     if (on) {
         g_disp.need_modeset = true;
-        set_backlight_sysfs(0, 128);
+        set_backlight_sysfs(0, g_last_brightness);
         return;
     }
 
@@ -1135,6 +1139,7 @@ static int32_t handle_execute_commands(const AParcel *in, AParcel *out) {
                         int level = (int)(br * 255.0f + 0.5f);
                         if (level < 8) level = 8;
                         if (level > 255) level = 255;
+                        g_last_brightness = level;
                         set_backlight_sysfs(0, level);
                     } else {
                         set_backlight_sysfs(4, 0);

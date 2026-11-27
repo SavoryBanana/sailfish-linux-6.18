@@ -3331,7 +3331,6 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    chmod 0666 /dev/dma_heap/system\n"
         "    chmod 0666 /dev/dma_heap/system-uncached\n"
         "    chmod 0666 /dev/dri/card0\n"
-        "    exec - root root -- /system/bin/sh /data/start_qservice.sh\n"
         "    class_start hal\n"
         "    class_start core\n"
         "    trigger nonencrypted\n",
@@ -4390,24 +4389,7 @@ static bool prepare_android_rootfs(bool for_shell) {
     chmod("/mnt/system_a/data/sailfish_ensure_user0.sh", 0755);
     set_selinux_label("/mnt/system_a/data/sailfish_ensure_user0.sh", "u:object_r:system_file:s0");
 
-    /* Automated: Install qservice_daemon and setup_composer_sysfs.sh into /data */
-    install_data_file("/tools/qservice_daemon", "/mnt/system_a/data/qservice_daemon",
-                      0755, "u:object_r:system_file:s0",
-                      "[+] Automated: Installed /data/qservice_daemon\n");
-    install_data_file("/tools/setup_composer_sysfs.sh", "/mnt/system_a/data/setup_composer_sysfs.sh",
-                      0755, "u:object_r:system_file:s0",
-                      "[+] Automated: Installed /data/setup_composer_sysfs.sh\n");
-    unlink("/mnt/system_a/data/start_qservice.sh");
-    write_file_str("/mnt/system_a/data/start_qservice.sh",
-                   "#!/system/bin/sh\n"
-                   "if ! pgrep -x qservice_daemon >/dev/null 2>&1 && [ -x /data/qservice_daemon ]; then\n"
-                   "    /data/qservice_daemon >/dev/null 2>&1 &\n"
-                   "    sleep 1\n"
-                   "fi\n");
-    chmod("/mnt/system_a/data/start_qservice.sh", 0755);
-    set_selinux_label("/mnt/system_a/data/start_qservice.sh", "u:object_r:system_file:s0");
-
-    /* Automated: Install libsdm_shim.so into /system/lib64, /vendor/lib64, and /data */
+    /* Automated: Install minimal compat libsdm_shim.so (String8 + software KeyMint) */
     if (access("/tools/libsdm_shim.so", F_OK) == 0) {
         mkdir("/mnt/system_a/system/lib64", 0755);
         mkdir("/mnt/system_a/vendor/lib64", 0755);
@@ -5148,15 +5130,6 @@ static void launch_android_shell(void) {
                 if (vp == 0) {
                     execve(vargs[0], vargs, envp);
                     _exit(1);
-                }
-                usleep(500000);
-                if (access("/data/qservice_daemon", F_OK) == 0) {
-                    char *qargs[] = { (char *)"/data/qservice_daemon", NULL };
-                    pid_t qp = fork();
-                    if (qp == 0) {
-                        execve(qargs[0], qargs, envp);
-                        _exit(1);
-                    }
                 }
                 _exit(0);
             }
