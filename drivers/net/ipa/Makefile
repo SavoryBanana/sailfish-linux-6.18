@@ -23,3 +23,6 @@ ipa-y			+=	$(IPA_REG_VERSIONS:%=reg/ipa_reg-v%.o)
 ipa-y			+=	$(GSI_REG_VERSIONS:%=reg/gsi_reg-v%.o)
 
 ipa-y			+=	$(IPA_DATA_VERSIONS:%=data/ipa_data-v%.o)
+
+obj-$(CONFIG_QCOM_IPA_V2)	+=	ipa_v2_drv.o
+ipa_v2_drv-y			:=	ipa_v2.o ipa_qmi_msg.o

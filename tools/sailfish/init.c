@@ -2637,6 +2637,65 @@ static void stage_oem_bt_firmware(void) {
     usb_write(msg);
 }
 
+static void stage_oem_modem_firmware(void) {
+    int kfd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+    char kbuf[256];
+    mkdir("/tools/modem_fw", 0755);
+    int m1 = mount("/dev/sda25", "/tools/modem_fw", "vfat", MS_RDONLY, NULL);
+    int e1 = errno;
+    if (m1 != 0) {
+        m1 = mount("/dev/sda26", "/tools/modem_fw", "vfat", MS_RDONLY, NULL);
+        e1 = errno;
+    }
+    if (m1 != 0) {
+        if (kfd >= 0) {
+            int len = snprintf(kbuf, sizeof(kbuf),
+                               "<3>init_modem: mount sda25/26 failed errno=%d\n", e1);
+            (void)write(kfd, kbuf, (size_t)len);
+            close(kfd);
+        }
+        return;
+    }
+    mkdir("/tools/firmware", 0755);
+    const char *fw_dir = "/tools/modem_fw/image";
+    DIR *d = opendir(fw_dir);
+    if (!d) {
+        fw_dir = "/tools/modem_fw";
+        d = opendir(fw_dir);
+    }
+    if (!d) {
+        if (kfd >= 0) {
+            int len = snprintf(kbuf, sizeof(kbuf),
+                               "<3>init_modem: opendir /tools/modem_fw failed errno=%d\n", errno);
+            (void)write(kfd, kbuf, (size_t)len);
+            close(kfd);
+        }
+        return;
+    }
+    int count = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, "mba.mbn") == 0 ||
+            strncmp(de->d_name, "modem.", 6) == 0) {
+            char src[256], dst[256];
+            snprintf(src, sizeof(src), "%s/%s", fw_dir, de->d_name);
+            snprintf(dst, sizeof(dst), "/tools/firmware/%s", de->d_name);
+            unlink(dst);
+            if (symlink(src, dst) == 0)
+                count++;
+        }
+    }
+    closedir(d);
+
+    if (kfd >= 0) {
+        int len = snprintf(kbuf, sizeof(kbuf),
+                           "<6>init_modem: staged=%d (fw ready for remoteproc0)\n",
+                           count);
+        (void)write(kfd, kbuf, (size_t)len);
+        close(kfd);
+    }
+}
+
 static bool prepare_android_rootfs(bool for_shell) {
     /* Keep kernel /dev/kmsg ratelimiting enabled so noisy BPF Rust loaders cannot
      * stall early init/userspace for ~57s dumping unbuffered messages to /dev/kmsg. */
@@ -2678,6 +2737,7 @@ static bool prepare_android_rootfs(bool for_shell) {
     mount("/dev/sda31", "/mnt/vendor_a", "ext4", MS_RDONLY, NULL);
     stage_oem_wifi_board_data();
     stage_oem_bt_firmware();
+    stage_oem_modem_firmware();
 
     /* Bind vendor into system_a/vendor */
     mkdir("/mnt/system_a/vendor", 0755);
@@ -2973,6 +3033,22 @@ static bool prepare_android_rootfs(bool for_shell) {
             chmod(bt_feat_path, 0644);
             set_selinux_label(bt_feat_path, "u:object_r:vendor_configs_file:s0");
 
+            const char *tel_feat_xml =
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                "<permissions>\n"
+                "    <feature name=\"android.hardware.telephony\" />\n"
+                "    <feature name=\"android.hardware.telephony.radio.access\" />\n"
+                "    <feature name=\"android.hardware.telephony.subscription\" />\n"
+                "    <feature name=\"android.hardware.telephony.calling\" />\n"
+                "    <feature name=\"android.hardware.telephony.data\" />\n"
+                "    <feature name=\"android.hardware.telephony.messaging\" />\n"
+                "    <feature name=\"android.hardware.telephony.gsm\" />\n"
+                "</permissions>\n";
+            const char *tel_feat_path = "/tmp/vendor_permissions/sailfish_telephony_features.xml";
+            write_file_str(tel_feat_path, tel_feat_xml);
+            chmod(tel_feat_path, 0644);
+            set_selinux_label(tel_feat_path, "u:object_r:vendor_configs_file:s0");
+
             const char *unavail_xml =
                 "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
                 "<permissions>\n"
@@ -2982,6 +3058,7 @@ static bool prepare_android_rootfs(bool for_shell) {
                 "    <unavailable-feature name=\"android.hardware.nfc.uicc\" />\n"
                 "    <unavailable-feature name=\"android.hardware.nfc.ese\" />\n"
                 "    <unavailable-feature name=\"com.nxp.mifare\" />\n"
+                "    <unavailable-feature name=\"android.hardware.telephony.ims\" />\n"
                 "</permissions>\n";
             const char *unavail_path = "/tmp/vendor_permissions/sailfish_unavailable_features.xml";
             write_file_str(unavail_path, unavail_xml);
@@ -3336,14 +3413,31 @@ static bool prepare_android_rootfs(bool for_shell) {
         "service sailfish_sensors_aidl /system/bin/android.hardware.sensors-service.sailfish\n"
         "    interface aidl android.hardware.sensors.ISensors/default\n"
         "    class hal\n"
-        "    user system\n"
+        "    user root\n"
         "    group system\n"
         "\n"
         "service sailfish_bluetooth_aidl /system/bin/android.hardware.bluetooth-service.sailfish\n"
         "    interface aidl android.hardware.bluetooth.IBluetoothHci/default\n"
         "    class hal\n"
         "    user root\n"
-        "    group bluetooth net_bt_admin system\n";
+        "    group bluetooth net_bt_admin system\n"
+        "\n"
+        "service sailfish_rmtfs /system/bin/sailfish_rmtfs\n"
+        "    class core\n"
+        "    user root\n"
+        "    group root\n"
+        "\n"
+        "service sailfish_radio_hal /system/bin/sailfish_radio_hal\n"
+        "    interface aidl android.hardware.radio.config.IRadioConfig/default\n"
+        "    interface aidl android.hardware.radio.modem.IRadioModem/slot1\n"
+        "    interface aidl android.hardware.radio.sim.IRadioSim/slot1\n"
+        "    interface aidl android.hardware.radio.network.IRadioNetwork/slot1\n"
+        "    interface aidl android.hardware.radio.data.IRadioData/slot1\n"
+        "    interface aidl android.hardware.radio.voice.IRadioVoice/slot1\n"
+        "    interface aidl android.hardware.radio.messaging.IRadioMessaging/slot1\n"
+        "    class hal\n"
+        "    user root\n"
+        "    group radio system\n";
     const char *user0_rc_dst = "/mnt/system_a/system/etc/init/sailfish_user0_fallback.rc";
     const char *user0_rc_tmp = "/tmp/sailfish_user0_fallback.rc";
     write_file_str(user0_rc_tmp, user0_rc);
@@ -3555,11 +3649,77 @@ static bool prepare_android_rootfs(bool for_shell) {
         }
     }
 
-    /* Automated: Inject VINTF manifest fragments (graphics HALs + AIDL Power/Sensors/Bluetooth HALs) */
+    /* Automated: Install QRTR RMTFS daemon for MPSS modem EFS storage */
+    if (access("/tools/sailfish_rmtfs", F_OK) == 0) {
+        const char *rmt_dst = "/mnt/system_a/system/bin/sailfish_rmtfs";
+        const char *rmt_label = "u:object_r:system_file:s0";
+        umount_all(rmt_dst);
+        unlink(rmt_dst);
+        if (copy_file("/tools/sailfish_rmtfs", rmt_dst)) {
+            chmod(rmt_dst, 0755);
+            set_selinux_label(rmt_dst, rmt_label);
+            usb_write("[+] Automated: Installed /system/bin/sailfish_rmtfs\n");
+        } else if (copy_file("/tools/sailfish_rmtfs", "/tmp/sailfish_rmtfs")) {
+            chmod("/tmp/sailfish_rmtfs", 0755);
+            set_selinux_label("/tmp/sailfish_rmtfs", rmt_label);
+            int rfd = open(rmt_dst, O_WRONLY | O_CREAT | O_EXCL, 0755);
+            if (rfd >= 0) close(rfd);
+            if (bind_mount_clean("/tmp/sailfish_rmtfs", rmt_dst) == 0) {
+                set_selinux_label(rmt_dst, rmt_label);
+                usb_write("[+] Automated: Bind-mounted /system/bin/sailfish_rmtfs\n");
+            }
+        }
+    }
+
+    /* Automated: Install QMI live probe CLI (/system/bin/sailfish_qmi_test) */
+    if (access("/tools/sailfish_qmi_test", F_OK) == 0) {
+        const char *qt_dst = "/mnt/system_a/system/bin/sailfish_qmi_test";
+        const char *qt_label = "u:object_r:system_file:s0";
+        umount_all(qt_dst);
+        unlink(qt_dst);
+        if (copy_file("/tools/sailfish_qmi_test", qt_dst)) {
+            chmod(qt_dst, 0755);
+            set_selinux_label(qt_dst, qt_label);
+        } else if (copy_file("/tools/sailfish_qmi_test", "/tmp/sailfish_qmi_test")) {
+            chmod("/tmp/sailfish_qmi_test", 0755);
+            set_selinux_label("/tmp/sailfish_qmi_test", qt_label);
+            int qfd = open(qt_dst, O_WRONLY | O_CREAT | O_EXCL, 0755);
+            if (qfd >= 0) close(qfd);
+            if (bind_mount_clean("/tmp/sailfish_qmi_test", qt_dst) == 0) {
+                set_selinux_label(qt_dst, qt_label);
+                usb_write("[+] Automated: Bind-mounted /system/bin/sailfish_qmi_test\n");
+            }
+        }
+    }
+
+    /* Automated: Install AIDL Radio HAL (/system/bin/sailfish_radio_hal) */
+    if (access("/tools/sailfish_radio_hal", F_OK) == 0) {
+        const char *rh_dst = "/mnt/system_a/system/bin/sailfish_radio_hal";
+        const char *rh_label = "u:object_r:system_file:s0";
+        umount_all(rh_dst);
+        unlink(rh_dst);
+        if (copy_file("/tools/sailfish_radio_hal", rh_dst)) {
+            chmod(rh_dst, 0755);
+            set_selinux_label(rh_dst, rh_label);
+            usb_write("[+] Automated: Installed /system/bin/sailfish_radio_hal\n");
+        } else if (copy_file("/tools/sailfish_radio_hal", "/tmp/sailfish_radio_hal")) {
+            chmod("/tmp/sailfish_radio_hal", 0755);
+            set_selinux_label("/tmp/sailfish_radio_hal", rh_label);
+            int rfd = open(rh_dst, O_WRONLY | O_CREAT | O_EXCL, 0755);
+            if (rfd >= 0) close(rfd);
+            if (bind_mount_clean("/tmp/sailfish_radio_hal", rh_dst) == 0) {
+                set_selinux_label(rh_dst, rh_label);
+                usb_write("[+] Automated: Bind-mounted /system/bin/sailfish_radio_hal\n");
+            }
+        }
+    }
+
+    /* Automated: Inject VINTF manifest fragments (graphics + AIDL Power/Sensors/Bluetooth/Radio HALs) */
     if (access("/tools/android.hardware.graphics.xml", F_OK) == 0 ||
         access("/tools/android.hardware.power.xml", F_OK) == 0 ||
         access("/tools/android.hardware.sensors.xml", F_OK) == 0 ||
-        access("/tools/android.hardware.bluetooth.xml", F_OK) == 0) {
+        access("/tools/android.hardware.bluetooth.xml", F_OK) == 0 ||
+        access("/tools/android.hardware.radio.xml", F_OK) == 0) {
         const char *vintf_dir = "/mnt/system_a/system/etc/vintf/manifest";
         mkdir("/tmp/vintf_manifest", 0755);
         umount2("/tmp/vintf_manifest", MNT_DETACH);
@@ -3592,6 +3752,10 @@ static bool prepare_android_rootfs(bool for_shell) {
             if (access("/tools/android.hardware.bluetooth.xml", F_OK) == 0) {
                 copy_file("/tools/android.hardware.bluetooth.xml", "/tmp/vintf_manifest/android.hardware.bluetooth.xml");
                 set_selinux_label("/tmp/vintf_manifest/android.hardware.bluetooth.xml", "u:object_r:system_file:s0");
+            }
+            if (access("/tools/android.hardware.radio.xml", F_OK) == 0) {
+                copy_file("/tools/android.hardware.radio.xml", "/tmp/vintf_manifest/android.hardware.radio.xml");
+                set_selinux_label("/tmp/vintf_manifest/android.hardware.radio.xml", "u:object_r:system_file:s0");
             }
             if (mount("/tmp/vintf_manifest", vintf_dir, NULL, MS_BIND, NULL) == 0) {
                 usb_write("[+] Automated: Overlaid /system/etc/vintf/manifest with graphics, power, sensors & bluetooth HAL fragments\n");
@@ -4339,8 +4503,16 @@ static bool prepare_android_rootfs(bool for_shell) {
     mount("/dev/sda3", "/mnt/system_a/mnt/vendor/persist", "ext4", 0, NULL);
     set_selinux_label("/mnt/system_a/mnt/vendor/persist", "u:object_r:persist_file:s0");
 
+    mkdir("/mnt/system_a/mnt/vendor/modem_fw", 0755);
+    if (mount("/dev/sda25", "/mnt/system_a/mnt/vendor/modem_fw", "vfat", MS_RDONLY, NULL) != 0)
+        mount("/dev/sda26", "/mnt/system_a/mnt/vendor/modem_fw", "vfat", MS_RDONLY, NULL);
+    set_selinux_label("/mnt/system_a/mnt/vendor/modem_fw", "u:object_r:firmware_file:s0");
+
     mkdir("/mnt/system_a/vendor/firmware_mnt", 0755);
-    mount("/dev/sda2", "/mnt/system_a/vendor/firmware_mnt", "vfat", MS_RDONLY, NULL);
+    if (mount("/dev/sda25", "/mnt/system_a/vendor/firmware_mnt", "vfat", MS_RDONLY, NULL) != 0 &&
+        mount("/dev/sda26", "/mnt/system_a/vendor/firmware_mnt", "vfat", MS_RDONLY, NULL) != 0) {
+        mount("/dev/sda2", "/mnt/system_a/vendor/firmware_mnt", "vfat", MS_RDONLY, NULL);
+    }
     set_selinux_label("/mnt/system_a/vendor/firmware_mnt", "u:object_r:firmware_file:s0");
 
     /* Ensure block device symlinks and loop devices exist for Android fstab & apexd */

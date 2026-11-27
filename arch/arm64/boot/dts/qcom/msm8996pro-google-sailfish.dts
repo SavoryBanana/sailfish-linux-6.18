@@ -98,6 +98,11 @@
 			reg = <0x0 0x83600000 0x0 0xa00000>;
 			no-map;
 		};
+
+		htc_radio_sec: memory@8e9f0000 {
+			reg = <0x0 0x8e9f0000 0x0 0x10000>;
+			no-map;
+		};
 	};
 
 	etm {
@@ -193,6 +198,32 @@
 	etm@3b40000 { status = "disabled"; };
 	funnel@3bb0000 { status = "disabled"; };
 	funnel@3bc0000 { status = "disabled"; };
+
+	/* STM32F411 Nanohub sensor hub on BLSP1 QUP6 SPI (gpio25-28) */
+	blsp1_spi6: spi@757a000 {
+		compatible = "qcom,spi-qup-v2.2.1";
+		reg = <0x0757a000 0x600>;
+		interrupts = <GIC_SPI 100 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&gcc GCC_BLSP1_QUP6_SPI_APPS_CLK>,
+			 <&gcc GCC_BLSP1_AHB_CLK>;
+		clock-names = "core", "iface";
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&blsp1_spi6_default &blsp1_spi6_cs>;
+		pinctrl-1 = <&blsp1_spi6_sleep>;
+		cs-gpios = <&tlmm 27 GPIO_ACTIVE_LOW>;
+		spi-max-frequency = <19200000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "okay";
+
+		nanohub@0 {
+			compatible = "google,nanohub";
+			reg = <0>;
+			spi-max-frequency = <19200000>;
+			spi-cpol;
+			spi-cpha;
+		};
+	};
 };
 
 &tlmm {
@@ -261,6 +292,28 @@
 		function = "blsp_i2c3";
 		drive-strength = <8>;
 		bias-pull-up;
+	};
+
+	blsp1_spi6_default: blsp1-spi6-default-state {
+		pins = "gpio25", "gpio26", "gpio28";
+		function = "blsp_spi6";
+		drive-strength = <12>;
+		bias-disable;
+	};
+
+	blsp1_spi6_cs: blsp1-spi6-cs-state {
+		pins = "gpio27";
+		function = "gpio";
+		drive-strength = <12>;
+		bias-disable;
+		output-high;
+	};
+
+	blsp1_spi6_sleep: blsp1-spi6-sleep-state {
+		pins = "gpio25", "gpio26", "gpio27", "gpio28";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
 	};
 };
 
@@ -897,5 +950,43 @@
 	vddpe-3v3-supply = <&wlan_en>;
 	pinctrl-0 = <&pcie0_state_on &cnss_bootstrap_default &rome_sleep_default>;
 	status = "okay";
+};
+
+&mpss_mem {
+	reg = <0x0 0x88800000 0x0 0x61f0000>;
+};
+
+&mss_pil {
+	pll-supply = <&vreg_l12a_1p8>;
+	status = "okay";
+};
+
+&soc {
+	ipa_bam: dma-controller@684000 {
+		compatible = "qcom,bam-v1.7.0";
+		reg = <0x00684000 0x26934>;
+		interrupts = <GIC_SPI 432 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&rpmcc RPM_SMD_IPA_CLK>;
+		clock-names = "bam_clk";
+		qcom,controlled-remotely;
+		#dma-cells = <1>;
+		qcom,ee = <0>;
+	};
+
+	ipa: ipa@6c0000 {
+		compatible = "qcom,msm8996-ipa";
+		reg = <0x006c0000 0x5000>,
+		      <0x006c5000 0x4000>;
+		reg-names = "ipa-reg", "ipa-shared";
+		interrupts = <GIC_SPI 333 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "ipa";
+		clocks = <&rpmcc RPM_SMD_IPA_CLK>;
+		clock-names = "core";
+		interconnects = <&a2noc MASTER_IPA &bimc SLAVE_EBI_CH0>,
+				<&a2noc MASTER_IPA &snoc SLAVE_IMEM>;
+		interconnect-names = "memory", "imem";
+		dmas = <&ipa_bam 2>, <&ipa_bam 3>, <&ipa_bam 4>, <&ipa_bam 5>;
+		dma-names = "ap_lan_rx", "cmd_tx", "ap_modem_tx", "ap_modem_rx";
+	};
 };
 

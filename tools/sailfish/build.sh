@@ -105,6 +105,19 @@ chmod +x "$SCRIPT_DIR/bluetooth_hal/build.sh"
 cp "$SCRIPT_DIR/bluetooth_hal/bluetooth_hal" "$OUT_DIR/initramfs_root/tools/bluetooth_hal"
 chmod +x "$OUT_DIR/initramfs_root/tools/bluetooth_hal"
 
+chmod +x "$SCRIPT_DIR/rmtfs/build.sh"
+"$SCRIPT_DIR/rmtfs/build.sh"
+cp "$SCRIPT_DIR/rmtfs/sailfish_rmtfs" "$OUT_DIR/initramfs_root/tools/sailfish_rmtfs"
+chmod +x "$OUT_DIR/initramfs_root/tools/sailfish_rmtfs"
+
+chmod +x "$SCRIPT_DIR/radio_hal/build.sh"
+"$SCRIPT_DIR/radio_hal/build.sh"
+cp "$SCRIPT_DIR/radio_hal/sailfish_qmi_test" "$OUT_DIR/initramfs_root/tools/sailfish_qmi_test"
+chmod +x "$OUT_DIR/initramfs_root/tools/sailfish_qmi_test"
+cp "$SCRIPT_DIR/radio_hal/sailfish_radio_hal" "$OUT_DIR/initramfs_root/tools/sailfish_radio_hal"
+chmod +x "$OUT_DIR/initramfs_root/tools/sailfish_radio_hal"
+cp "$SCRIPT_DIR/android.hardware.radio.xml" "$OUT_DIR/initramfs_root/tools/android.hardware.radio.xml"
+
 # Stage QCA6174 ath10k firmware & regulatory database under /tools/firmware (survives vendor mount)
 # and symlink from /lib/firmware (early pre-mount fallback) without duplicating ~1.4 MB in initramfs.
 mkdir -p "$OUT_DIR/initramfs_root/tools/firmware/ath10k/QCA6174/hw3.0" \

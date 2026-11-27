@@ -21,3 +21,10 @@ config QCOM_IPA
 	  of QCOM_Q6V5_COMMON (Y or M).
 
 	  If unsure, say N.
+
+config QCOM_IPA_V2
+	tristate "Qualcomm IPA v2.5 (BAM) support for MSM8996"
+	depends on NET && ARCH_QCOM && INTERCONNECT && QCOM_BAM_DMA
+	select QCOM_QMI_HELPERS
+	help
+	  Standalone Qualcomm IPA v2.5 (BAM transport) driver for MSM8996.

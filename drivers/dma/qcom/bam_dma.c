@@ -58,6 +58,7 @@ struct bam_desc_hw {
 #define DESC_FLAG_EOB BIT(13)
 #define DESC_FLAG_NWD BIT(12)
 #define DESC_FLAG_CMD BIT(11)
+#define DESC_FLAG_IMM BIT(8)
 
 struct bam_async_desc {
 	struct virt_dma_desc vd;
@@ -69,11 +70,13 @@ struct bam_async_desc {
 	u16 flags;
 
 	struct bam_desc_hw *curr_desc;
+	u32 *rx_length;
 
 	/* list node for the desc in the bam_chan list of descriptors */
 	struct list_head desc_node;
 	enum dma_transfer_direction dir;
 	size_t length;
+	size_t pos;
 	struct bam_desc_hw desc[] __counted_by(num_desc);
 };
 
@@ -377,6 +380,11 @@ static inline struct bam_chan *to_bam_chan(struct dma_chan *common)
 	return container_of(common, struct bam_chan, vc.chan);
 }
 
+static inline struct bam_async_desc *to_bam_desc(struct dma_async_tx_descriptor *desc)
+{
+	return container_of(desc, struct bam_async_desc, vd.tx);
+}
+
 struct bam_device {
 	void __iomem *regs;
 	struct device *dev;
@@ -509,6 +517,8 @@ static void bam_chan_init_hw(struct bam_chan *bchan,
 
 	/* unmask the specific pipe and EE combo */
 	val = readl_relaxed(bam_addr(bdev, 0, BAM_IRQ_SRCS_MSK_EE));
+	if (bdev->controlled_remotely)
+		val &= ~BAM_IRQ_MSK;
 	val |= BIT(bchan->id);
 	writel_relaxed(val, bam_addr(bdev, 0, BAM_IRQ_SRCS_MSK_EE));
 
@@ -634,6 +644,22 @@ static int bam_slave_config(struct dma_chan *chan,
 	return 0;
 }
 
+static int bam_attach_metadata(struct dma_async_tx_descriptor *desc,
+			       void *data, size_t len)
+{
+	struct bam_async_desc *async_desc = to_bam_desc(desc);
+
+	if (!data || len < sizeof(u32))
+		return -EINVAL;
+
+	async_desc->rx_length = data;
+	return 0;
+}
+
+static struct dma_descriptor_metadata_ops bam_metadata_ops = {
+	.attach = bam_attach_metadata,
+};
+
 /**
  * bam_prep_slave_sg - Prep slave sg transaction
  *
@@ -693,6 +719,8 @@ static struct dma_async_tx_descriptor *bam_prep_slave_sg(struct dma_chan *chan,
 		do {
 			if (flags & DMA_PREP_CMD)
 				desc->flags |= cpu_to_le16(DESC_FLAG_CMD);
+			else if (flags & DMA_PREP_IMM_CMD)
+				desc->flags |= cpu_to_le16(DESC_FLAG_IMM);
 
 			desc->addr = cpu_to_le32(sg_dma_address(sg) +
 						 curr_offset);
@@ -710,6 +738,8 @@ static struct dma_async_tx_descriptor *bam_prep_slave_sg(struct dma_chan *chan,
 			desc++;
 		} while (remainder > 0);
 	}
+
+	async_desc->vd.tx.metadata_ops = &bam_metadata_ops;
 
 	return vchan_tx_prep(&bchan->vc, &async_desc->vd, flags);
 }
@@ -816,6 +846,21 @@ static int bam_resume(struct dma_chan *chan)
 	return 0;
 }
 
+static u32 bam_get_rx_length(struct bam_async_desc *async_desc,
+			     struct bam_desc_hw *fifo)
+{
+	u32 len = 0, i;
+
+	rmb();
+	for (i = 0; i < async_desc->xfer_len; i++) {
+		u32 pos = (i + async_desc->pos) % MAX_DESCRIPTORS;
+
+		len += le16_to_cpu(fifo[pos].size);
+	}
+
+	return len;
+}
+
 /**
  * process_channel_irqs - processes the channel interrupts
  * @bdev: bam controller
@@ -837,12 +882,19 @@ static u32 process_channel_irqs(struct bam_device *bdev)
 
 	for (i = 0; i < bdev->num_channels; i++) {
 		struct bam_chan *bchan = &bdev->channels[i];
+		struct bam_desc_hw *fifo = PTR_ALIGN(bchan->fifo_virt,
+						     sizeof(struct bam_desc_hw));
 
 		if (!(srcs & BIT(i)))
 			continue;
 
 		/* clear pipe irq */
 		pipe_stts = readl_relaxed(bam_addr(bdev, i, BAM_P_IRQ_STTS));
+
+		if (pipe_stts & P_ERR_EN)
+			dev_err_ratelimited(bdev->dev,
+					    "BAM pipe %u irq err stts=%#x\n",
+					    i, pipe_stts);
 
 		writel_relaxed(pipe_stts, bam_addr(bdev, i, BAM_P_IRQ_CLR));
 
@@ -878,6 +930,9 @@ static u32 process_channel_irqs(struct bam_device *bdev)
 			 * it gets restarted by the tasklet
 			 */
 			if (!async_desc->num_desc) {
+				if (async_desc->rx_length)
+					*async_desc->rx_length =
+						bam_get_rx_length(async_desc, fifo);
 				vchan_cookie_complete(&async_desc->vd);
 			} else {
 				list_add(&async_desc->vd.node,
@@ -915,7 +970,7 @@ static irqreturn_t bam_dma_irq(int irq, void *data)
 	if (ret < 0)
 		return IRQ_NONE;
 
-	if (srcs & BAM_IRQ) {
+	if (!bdev->controlled_remotely && (srcs & BAM_IRQ)) {
 		clr_mask = readl_relaxed(bam_addr(bdev, 0, BAM_IRQ_STTS));
 
 		/*
@@ -925,6 +980,14 @@ static irqreturn_t bam_dma_irq(int irq, void *data)
 		mb();
 
 		writel_relaxed(clr_mask, bam_addr(bdev, 0, BAM_IRQ_CLR));
+	} else if (bdev->controlled_remotely && (srcs & BAM_IRQ)) {
+		u32 msk = readl_relaxed(bam_addr(bdev, 0, BAM_IRQ_SRCS_MSK_EE));
+
+		msk &= ~BAM_IRQ_MSK;
+		writel_relaxed(msk, bam_addr(bdev, 0, BAM_IRQ_SRCS_MSK_EE));
+		dev_err_ratelimited(bdev->dev,
+				    "unexpected BAM_IRQ srcs=%#x (masked)\n",
+				    srcs);
 	}
 
 	pm_runtime_mark_last_busy(bdev->dev);
@@ -1092,6 +1155,7 @@ static void bam_start_dma(struct bam_chan *bchan)
 			       sizeof(struct bam_desc_hw));
 		}
 
+		async_desc->pos = bchan->tail;
 		bchan->tail += async_desc->xfer_len;
 		bchan->tail %= MAX_DESCRIPTORS;
 		list_add_tail(&async_desc->desc_node, &bchan->desc_list);
@@ -1245,6 +1309,10 @@ static int bam_dma_probe(struct platform_device *pdev)
 
 	bdev->dev = &pdev->dev;
 
+	ret = dma_set_mask_and_coherent(bdev->dev, DMA_BIT_MASK(32));
+	if (ret)
+		return ret;
+
 	match = of_match_node(bam_of_match, pdev->dev.of_node);
 	if (!match) {
 		dev_err(&pdev->dev, "Unsupported BAM module\n");
@@ -1302,9 +1370,15 @@ static int bam_dma_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	dev_info(bdev->dev, "probing BAM (ee=%u remote=%d powered_remote=%d)\n",
+		 bdev->ee, bdev->controlled_remotely, bdev->powered_remotely);
+
 	ret = bam_init(bdev);
 	if (ret)
 		goto err_disable_clk;
+
+	dev_info(bdev->dev, "BAM ready (num_ees=%u num_channels=%u)\n",
+		 bdev->num_ees, bdev->num_channels);
 
 	tasklet_setup(&bdev->task, dma_tasklet);
 
@@ -1342,6 +1416,7 @@ static int bam_dma_probe(struct platform_device *pdev)
 	bdev->common.residue_granularity = DMA_RESIDUE_GRANULARITY_SEGMENT;
 	bdev->common.src_addr_widths = DMA_SLAVE_BUSWIDTH_4_BYTES;
 	bdev->common.dst_addr_widths = DMA_SLAVE_BUSWIDTH_4_BYTES;
+	bdev->common.desc_metadata_modes = DESC_METADATA_CLIENT;
 	bdev->common.device_alloc_chan_resources = bam_alloc_chan;
 	bdev->common.device_free_chan_resources = bam_free_chan;
 	bdev->common.device_prep_slave_sg = bam_prep_slave_sg;
