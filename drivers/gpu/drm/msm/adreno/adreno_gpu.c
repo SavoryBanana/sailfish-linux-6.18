@@ -1203,6 +1203,12 @@ int adreno_gpu_init(struct drm_device *drm, struct platform_device *pdev,
 			devm_pm_opp_set_clkname(dev, "core_clk");
 		} else
 			devm_pm_opp_set_clkname(dev, "core");
+
+		if (of_property_present(dev->of_node, "vdd-supply")) {
+			static const char * const reg_names[] = { "vdd", NULL };
+
+			devm_pm_opp_set_regulators(dev, reg_names);
+		}
 	}
 
 	if (adreno_read_speedbin(dev, &speedbin) || !speedbin)

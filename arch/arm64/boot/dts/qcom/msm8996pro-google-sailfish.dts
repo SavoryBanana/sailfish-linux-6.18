@@ -484,25 +484,38 @@
 };
 
 /*
- * Keep GPU clock within the fixed bootloader nominal vdd_gfx voltage corner
- * (<= 401.8 MHz) since dynamic CPR3/APM rail scaling is not active.
+ * Scale Adreno 530 up to its factory 624 MHz clock using Sailfish's stock
+ * open-loop vdd_gfx voltage ceiling table via pm_opp_set_regulators().
  */
 &gpu_opp_table {
 	/delete-node/ opp-652800000;
-	/delete-node/ opp-624000000;
-	/delete-node/ opp-560000000;
-	/delete-node/ opp-510000000;
 
+	opp-624000000 {
+		opp-microvolt = <1025000 1015000 1065000>;
+		opp-peak-kBps = <14432000>;
+	};
+	opp-560000000 {
+		opp-microvolt = <975000 960000 1065000>;
+		opp-peak-kBps = <14432000>;
+	};
+	opp-510000000 {
+		opp-microvolt = <925000 905000 1065000>;
+		opp-peak-kBps = <14432000>;
+	};
 	opp-401800000 {
+		opp-microvolt = <850000 825000 1065000>;
 		opp-peak-kBps = <14432000>;
 	};
 	opp-315000000 {
+		opp-microvolt = <775000 745000 1065000>;
 		opp-peak-kBps = <10368000>;
 	};
 	opp-214000000 {
+		opp-microvolt = <725000 670000 1065000>;
 		opp-peak-kBps = <8136000>;
 	};
 	opp-133000000 {
+		opp-microvolt = <725000 670000 1065000>;
 		opp-peak-kBps = <6400000>;
 	};
 };
