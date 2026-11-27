@@ -1918,65 +1918,81 @@ static void overlay_usb_configfs_rc(void) {
         }
     }
 
-    char usb_rc[4096];
+    char usb_rc[6144];
     snprintf(usb_rc, sizeof(usb_rc),
         "on early-init\n"
         "    setprop sys.usb.configfs 1\n"
         "    setprop sys.usb.controller %s\n"
+        "    setprop sys.usb.mtp.device_type 3\n"
         "    setprop ro.adb.secure 0\n"
         "\n"
         "on post-fs-data\n"
         "    mkdir /data/adb 0700 root root\n"
         "    mkdir /data/misc/adb 02750 system shell\n"
-        "    mkdir /dev/usb-ffs 0770 shell shell\n"
+        "    mkdir /dev/usb-ffs 0775 shell shell\n"
         "    mkdir /dev/usb-ffs/adb 0770 shell shell\n"
+        "    mkdir /dev/usb-ffs/mtp 0777 mtp mtp\n"
+        "    mkdir /dev/usb-ffs/ptp 0777 mtp mtp\n"
+        "    chmod 0777 /dev/usb-ffs/mtp\n"
+        "    chmod 0777 /dev/usb-ffs/ptp\n"
+        "    chmod 0666 /dev/usb-ffs/mtp/ep0\n"
+        "    chmod 0666 /dev/usb-ffs/ptp/ep0\n"
         "    mkdir /config/usb_gadget/g1/functions/ffs.adb 0770 shell shell\n"
+        "    mkdir /config/usb_gadget/g1/functions/ffs.mtp 0770 mtp mtp\n"
+        "    mkdir /config/usb_gadget/g1/functions/ffs.ptp 0770 mtp mtp\n"
         "    setprop sys.usb.ffs.ready 0\n"
         "    setprop sys.usb.state none\n"
         "\n"
         "on boot\n"
-        "    setprop sys.sailfish.adb 0\n"
-        "    setprop sys.usb.config none\n"
-        "    stop adbd\n"
-        "    setprop sys.usb.ffs.ready 0\n"
-        "    setprop sys.usb.state none\n"
-        "\n"
-        "on property:sys.usb.config=none && property:sys.usb.configfs=1\n"
-        "    stop adbd\n"
-        "    setprop sys.usb.ffs.ready 0\n"
-        "    setprop sys.usb.state none\n"
+        "    setprop sys.usb.configfs 1\n"
+        "    setprop sys.usb.mtp.device_type 3\n"
+        "    setprop persist.sys.usb.config adb\n"
+        "    setprop sys.usb.config adb\n"
         "\n"
         "on property:init.svc.adbd=stopped\n"
         "    setprop sys.usb.ffs.ready 0\n"
         "\n"
-        "# Keep adbd stopped unless opted in via sys.sailfish.adb=1 (prevents 1-Hz FUNCTIONFS_BIND spin)\n"
-        "on property:sys.usb.config=adb && property:sys.sailfish.adb=0 && property:sys.usb.configfs=1\n"
+        "on property:sys.usb.config=none && property:sys.usb.configfs=1\n"
         "    stop adbd\n"
         "    setprop sys.usb.ffs.ready 0\n"
-        "    setprop sys.usb.config none\n"
-        "    setprop sys.usb.state none\n"
+        "    exec - root root -- /system/bin/sh /data/setup_usb_adb.sh none ${sys.usb.controller}\n"
+        "    setprop sys.usb.state ${sys.usb.config}\n"
         "\n"
-        "on property:init.svc.adbd=running && property:sys.sailfish.adb=0\n"
-        "    stop adbd\n"
-        "    setprop sys.usb.ffs.ready 0\n"
-        "    setprop sys.usb.config none\n"
-        "    setprop sys.usb.state none\n"
-        "\n"
-        "# Opt-in ADB only (never bounce UDC during boot so CDC-ACM /dev/ttyACM0 stays up):\n"
-        "on property:sys.sailfish.adb=1 && property:sys.usb.configfs=1\n"
-        "    setprop sys.usb.config adb\n"
+        "on property:sys.usb.config=adb && property:sys.usb.configfs=1\n"
         "    start adbd\n"
         "\n"
-        "on property:sys.sailfish.adb=0 && property:sys.usb.configfs=1\n"
+        "on property:sys.usb.config=adb && property:sys.usb.ffs.ready=1 && property:sys.usb.configfs=1\n"
+        "    exec - root root -- /system/bin/sh /data/setup_usb_adb.sh adb ${sys.usb.controller}\n"
+        "    setprop sys.usb.state ${sys.usb.config}\n"
+        "\n"
+        "on property:sys.usb.config=mtp && property:sys.usb.configfs=1\n"
         "    stop adbd\n"
         "    setprop sys.usb.ffs.ready 0\n"
-        "    exec - root root -- /system/bin/sh /data/setup_usb_adb.sh unbind ${sys.usb.controller}\n"
-        "    setprop sys.usb.config none\n"
-        "    setprop sys.usb.state none\n"
+        "    setprop sys.usb.state ${sys.usb.config}\n"
+        "    exec_background - root root -- /system/bin/sh /data/setup_usb_adb.sh mtp ${sys.usb.controller}\n"
         "\n"
-        "on property:sys.sailfish.adb=1 && property:sys.usb.config=adb && property:sys.usb.ffs.ready=1 && property:sys.usb.configfs=1\n"
-        "    exec - root root -- /system/bin/sh /data/setup_usb_adb.sh bind ${sys.usb.controller}\n"
-        "    setprop sys.usb.state adb\n",
+        "on property:sys.usb.config=mtp,adb && property:sys.usb.configfs=1\n"
+        "    start adbd\n"
+        "\n"
+        "on property:sys.usb.config=mtp,adb && property:sys.usb.ffs.ready=1 && property:sys.usb.configfs=1\n"
+        "    setprop sys.usb.state ${sys.usb.config}\n"
+        "    exec_background - root root -- /system/bin/sh /data/setup_usb_adb.sh mtp_adb ${sys.usb.controller}\n"
+        "\n"
+        "on property:sys.usb.config=ptp && property:sys.usb.configfs=1\n"
+        "    stop adbd\n"
+        "    setprop sys.usb.ffs.ready 0\n"
+        "    setprop sys.usb.state ${sys.usb.config}\n"
+        "    exec_background - root root -- /system/bin/sh /data/setup_usb_adb.sh ptp ${sys.usb.controller}\n"
+        "\n"
+        "on property:sys.usb.config=ptp,adb && property:sys.usb.configfs=1\n"
+        "    start adbd\n"
+        "\n"
+        "on property:sys.usb.config=ptp,adb && property:sys.usb.ffs.ready=1 && property:sys.usb.configfs=1\n"
+        "    setprop sys.usb.state ${sys.usb.config}\n"
+        "    exec_background - root root -- /system/bin/sh /data/setup_usb_adb.sh ptp_adb ${sys.usb.controller}\n"
+        "\n"
+        "on property:sys.boot_completed=1\n"
+        "    exec_background - root root -- /system/bin/sh /data/setup_usb_adb.sh init_port ${sys.usb.controller}\n",
         udc_name);
 
     const char *dst_rc = "/mnt/system_a/system/etc/init/hw/init.usb.configfs.rc";
@@ -4024,19 +4040,55 @@ static bool prepare_android_rootfs(bool for_shell) {
     /* Automated: Populate Qualcomm MDSS sysfs mock before binding /sys */
     setup_mdss_sysfs_mock();
 
-    /* Pre-create FunctionFS ADB mount & gadget function dir inside shared devtmpfs before
-     * MS_REC bind into /mnt/system_a/dev so adbd can always open /dev/usb-ffs/adb/ep0. */
+    /* Pre-create FunctionFS ADB/MTP/PTP mounts & gadget function dirs inside shared devtmpfs
+     * before MS_REC bind into /mnt/system_a/dev so adbd and MtpService can always open ep0. */
     mkdir("/sys/kernel/config/usb_gadget/g1/functions/ffs.adb", 0770);
     chown("/sys/kernel/config/usb_gadget/g1/functions/ffs.adb", 2000, 2000);
+    mkdir("/sys/kernel/config/usb_gadget/g1/functions/ffs.mtp", 0770);
+    chown("/sys/kernel/config/usb_gadget/g1/functions/ffs.mtp", 1024, 1024);
+    mkdir("/sys/kernel/config/usb_gadget/g1/functions/ffs.ptp", 0770);
+    chown("/sys/kernel/config/usb_gadget/g1/functions/ffs.ptp", 1024, 1024);
+
+    /* Enable Microsoft OS Descriptors on g1 so hosts auto-detect MTP over FunctionFS */
+    write_str("/sys/kernel/config/usb_gadget/g1/os_desc/use", "1\n");
+    write_str("/sys/kernel/config/usb_gadget/g1/os_desc/b_vendor_code", "0x1\n");
+    write_str("/sys/kernel/config/usb_gadget/g1/os_desc/qw_sign", "MSFT100\n");
+    symlink("/sys/kernel/config/usb_gadget/g1/configs/c.1",
+            "/sys/kernel/config/usb_gadget/g1/os_desc/c.1");
+
     umount_all("/dev/usb-ffs/adb");
-    mkdir("/dev/usb-ffs", 0770);
+    umount_all("/dev/usb-ffs/mtp");
+    umount_all("/dev/usb-ffs/ptp");
+    mkdir("/dev/usb-ffs", 0775);
     chown("/dev/usb-ffs", 2000, 2000);
     set_selinux_label("/dev/usb-ffs", "u:object_r:functionfs:s0");
+
     mkdir("/dev/usb-ffs/adb", 0770);
     chown("/dev/usb-ffs/adb", 2000, 2000);
-    if (mount("adb", "/dev/usb-ffs/adb", "functionfs", 0, "rmode=0770,fmode=0660,uid=2000,gid=2000") == 0) {
+    if (mount("adb", "/dev/usb-ffs/adb", "functionfs", 0,
+              "rmode=0770,fmode=0660,uid=2000,gid=2000") == 0) {
         set_selinux_label("/dev/usb-ffs/adb", "u:object_r:functionfs:s0");
         usb_write("[+] Automated: Mounted FunctionFS /dev/usb-ffs/adb\n");
+    }
+
+    mkdir("/dev/usb-ffs/mtp", 0777);
+    chown("/dev/usb-ffs/mtp", 1024, 1024);
+    if (mount("mtp", "/dev/usb-ffs/mtp", "functionfs", 0,
+              "rmode=0777,fmode=0666,uid=1024,gid=1024,no_disconnect=1") == 0) {
+        chmod("/dev/usb-ffs/mtp", 0777);
+        chmod("/dev/usb-ffs/mtp/ep0", 0666);
+        set_selinux_label("/dev/usb-ffs/mtp", "u:object_r:functionfs:s0");
+        usb_write("[+] Automated: Mounted FunctionFS /dev/usb-ffs/mtp\n");
+    }
+
+    mkdir("/dev/usb-ffs/ptp", 0777);
+    chown("/dev/usb-ffs/ptp", 1024, 1024);
+    if (mount("ptp", "/dev/usb-ffs/ptp", "functionfs", 0,
+              "rmode=0777,fmode=0666,uid=1024,gid=1024,no_disconnect=1") == 0) {
+        chmod("/dev/usb-ffs/ptp", 0777);
+        chmod("/dev/usb-ffs/ptp/ep0", 0666);
+        set_selinux_label("/dev/usb-ffs/ptp", "u:object_r:functionfs:s0");
+        usb_write("[+] Automated: Mounted FunctionFS /dev/usb-ffs/ptp\n");
     }
 
     /* Bind /dev, /proc, /sys into system_a */
@@ -4246,50 +4298,68 @@ static bool prepare_android_rootfs(bool for_shell) {
         usb_write("[+] Automated: Installed /data/ld.config.sailfish.txt backup\n");
     }
 
-    /* Automated: Write safe composite USB ADB helper script (leaves acm.gs0 active if ffs fails) */
+    /* Automated: Write safe composite USB ACM + ADB + MTP/PTP helper script */
     const char *setup_usb_adb_sh =
         "#!/system/bin/sh\n"
         "ACTION=\"$1\"\n"
         "UDC=\"$2\"\n"
+        "if [ \"$ACTION\" = \"init_port\" ]; then\n"
+        "  chmod 0777 /dev/usb-ffs/mtp /dev/usb-ffs/ptp 2>/dev/null || true\n"
+        "  chmod 0666 /dev/usb-ffs/mtp/ep0 /dev/usb-ffs/ptp/ep0 2>/dev/null || true\n"
+        "  /system/bin/dumpsys usb add-port port0 ufp 2>/dev/null || true\n"
+        "  /system/bin/dumpsys usb connect-port port0 ufp sink device 2>/dev/null || true\n"
+        "  exit 0\n"
+        "fi\n"
         "[ -z \"$UDC\" ] && UDC=\"$(ls /sys/class/udc 2>/dev/null | head -n 1)\"\n"
         "[ -z \"$UDC\" ] && exit 0\n"
         "G1=/config/usb_gadget/g1\n"
+        "[ -d \"$G1\" ] || G1=/sys/kernel/config/usb_gadget/g1\n"
         "[ -d \"$G1\" ] || exit 0\n"
-        "CUR_UDC=\"$(cat $G1/UDC 2>/dev/null)\"\n"
-        "if [ \"$ACTION\" = \"unbind\" ]; then\n"
-        "    [ -e \"$G1/configs/c.1/ffs.adb\" ] || exit 0\n"
-        "    echo \"none\" > \"$G1/UDC\" 2>/dev/null || echo \"\" > \"$G1/UDC\" 2>/dev/null || true\n"
-        "    rm -f \"$G1/configs/c.1/ffs.adb\"\n"
-        "    echo 0x18d1 > \"$G1/idVendor\" 2>/dev/null || true\n"
-        "    echo 0xd001 > \"$G1/idProduct\" 2>/dev/null || true\n"
-        "    echo \"CDC-ACM\" > \"$G1/configs/c.1/strings/0x409/configuration\" 2>/dev/null || true\n"
-        "    [ -e \"$G1/configs/c.1/acm.gs0\" ] || ln -s \"$G1/functions/acm.gs0\" \"$G1/configs/c.1/acm.gs0\" 2>/dev/null || true\n"
-        "    echo \"$UDC\" > \"$G1/UDC\" 2>/dev/null || true\n"
-        "    exit 0\n"
+        "NEED_ADB=0; NEED_MTP=0; NEED_PTP=0; PID=0xd001; CFG=\"CDC-ACM\"\n"
+        "case \"$ACTION\" in\n"
+        "  adb|bind)   NEED_ADB=1; PID=0x4ee7; CFG=\"ACM-ADB\" ;;\n"
+        "  mtp)        NEED_MTP=1; PID=0x4ee1; CFG=\"MTP-ACM\" ;;\n"
+        "  mtp_adb)    NEED_MTP=1; NEED_ADB=1; PID=0x4ee2; CFG=\"MTP-ADB-ACM\" ;;\n"
+        "  ptp)        NEED_PTP=1; PID=0x4ee5; CFG=\"PTP-ACM\" ;;\n"
+        "  ptp_adb)    NEED_PTP=1; NEED_ADB=1; PID=0x4ee6; CFG=\"PTP-ADB-ACM\" ;;\n"
+        "  none|unbind) PID=0xd001; CFG=\"CDC-ACM\" ;;\n"
+        "  *)          exit 0 ;;\n"
+        "esac\n"
+        "wait_ep() {\n"
+        "  local d=\"$1\" i=0\n"
+        "  while [ $i -lt 30 ]; do\n"
+        "    [ -e \"$d/ep1\" ] && return 0\n"
+        "    i=$((i+1))\n"
+        "    sleep 0.2\n"
+        "  done\n"
+        "  return 1\n"
+        "}\n"
+        "if [ \"$NEED_MTP\" = 1 ]; then\n"
+        "  wait_ep /dev/usb-ffs/mtp || NEED_MTP=0\n"
         "fi\n"
-        "if [ ! -e /dev/usb-ffs/adb/ep0 ]; then\n"
-        "    mkdir -p /dev/usb-ffs/adb 2>/dev/null || true\n"
-        "    mount -t functionfs adb /dev/usb-ffs/adb -o rmode=0770,fmode=0660,uid=2000,gid=2000 2>/dev/null || true\n"
+        "if [ \"$NEED_PTP\" = 1 ]; then\n"
+        "  wait_ep /dev/usb-ffs/ptp || NEED_PTP=0\n"
         "fi\n"
-        "mkdir -p \"$G1/functions/ffs.adb\" 2>/dev/null || true\n"
-        "if [ -e \"$G1/configs/c.1/ffs.adb\" ] && [ -e \"$G1/configs/c.1/acm.gs0\" ] && [ \"$CUR_UDC\" = \"$UDC\" ]; then\n"
-        "    exit 0\n"
+        "if [ \"$NEED_ADB\" = 1 ]; then\n"
+        "  wait_ep /dev/usb-ffs/adb || NEED_ADB=0\n"
         "fi\n"
-        "echo \"none\" > \"$G1/UDC\" 2>/dev/null || echo \"\" > \"$G1/UDC\" 2>/dev/null || true\n"
+        "echo \"\" > \"$G1/UDC\" 2>/dev/null || echo \"none\" > \"$G1/UDC\" 2>/dev/null || true\n"
+        "rm -f \"$G1/configs/c.1/ffs.adb\" \"$G1/configs/c.1/ffs.mtp\" \"$G1/configs/c.1/ffs.ptp\" 2>/dev/null || true\n"
         "echo 0x18d1 > \"$G1/idVendor\" 2>/dev/null || true\n"
-        "echo 0x4ee2 > \"$G1/idProduct\" 2>/dev/null || true\n"
+        "echo \"$PID\" > \"$G1/idProduct\" 2>/dev/null || true\n"
         "echo 0x00 > \"$G1/bDeviceClass\" 2>/dev/null || true\n"
         "echo 0x00 > \"$G1/bDeviceSubClass\" 2>/dev/null || true\n"
         "echo 0x00 > \"$G1/bDeviceProtocol\" 2>/dev/null || true\n"
-        "echo \"ACM-ADB\" > \"$G1/configs/c.1/strings/0x409/configuration\" 2>/dev/null || true\n"
+        "echo \"$CFG\" > \"$G1/configs/c.1/strings/0x409/configuration\" 2>/dev/null || true\n"
+        "[ \"$NEED_MTP\" = 1 ] && ln -s \"$G1/functions/ffs.mtp\" \"$G1/configs/c.1/ffs.mtp\" 2>/dev/null || true\n"
+        "[ \"$NEED_PTP\" = 1 ] && ln -s \"$G1/functions/ffs.ptp\" \"$G1/configs/c.1/ffs.ptp\" 2>/dev/null || true\n"
+        "[ \"$NEED_ADB\" = 1 ] && ln -s \"$G1/functions/ffs.adb\" \"$G1/configs/c.1/ffs.adb\" 2>/dev/null || true\n"
         "[ -e \"$G1/configs/c.1/acm.gs0\" ] || ln -s \"$G1/functions/acm.gs0\" \"$G1/configs/c.1/acm.gs0\" 2>/dev/null || true\n"
-        "rm -f \"$G1/configs/c.1/ffs.adb\" 2>/dev/null || true\n"
-        "ln -s \"$G1/functions/ffs.adb\" \"$G1/configs/c.1/ffs.adb\" 2>/dev/null || true\n"
         "if ! echo \"$UDC\" > \"$G1/UDC\" 2>/dev/null; then\n"
-        "    rm -f \"$G1/configs/c.1/ffs.adb\"\n"
-        "    echo 0xd001 > \"$G1/idProduct\" 2>/dev/null || true\n"
-        "    echo \"CDC-ACM\" > \"$G1/configs/c.1/strings/0x409/configuration\" 2>/dev/null || true\n"
-        "    echo \"$UDC\" > \"$G1/UDC\" 2>/dev/null || true\n"
+        "  rm -f \"$G1/configs/c.1/ffs.adb\" \"$G1/configs/c.1/ffs.mtp\" \"$G1/configs/c.1/ffs.ptp\" 2>/dev/null || true\n"
+        "  echo 0xd001 > \"$G1/idProduct\" 2>/dev/null || true\n"
+        "  echo \"CDC-ACM\" > \"$G1/configs/c.1/strings/0x409/configuration\" 2>/dev/null || true\n"
+        "  echo \"$UDC\" > \"$G1/UDC\" 2>/dev/null || true\n"
         "fi\n";
     unlink("/mnt/system_a/data/setup_usb_adb.sh");
     write_file_str("/mnt/system_a/data/setup_usb_adb.sh", setup_usb_adb_sh);
