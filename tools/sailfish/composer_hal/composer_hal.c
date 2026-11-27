@@ -1354,9 +1354,11 @@ static int32_t cli_on_transact(AIBinder *binder, uint32_t code,
         if ((rc = write_status_ok(out)) != STATUS_OK_VAL) return rc;
         return g_ndk.writeInt32(out, val);
     }
-    case TX_CLI_GET_DISPLAY_CAPABILITIES:
+    case TX_CLI_GET_DISPLAY_CAPABILITIES: {
+        int32_t caps[1] = { 3 }; /* DisplayCapability::BRIGHTNESS = 3 */
         if ((rc = write_status_ok(out)) != STATUS_OK_VAL) return rc;
-        return g_ndk.writeInt32Array(out, NULL, 0);
+        return g_ndk.writeInt32Array(out, caps, 1);
+    }
     case TX_CLI_GET_DISPLAY_CONFIGS: {
         int32_t cfgs[1] = { 0 };
         if ((rc = write_status_ok(out)) != STATUS_OK_VAL) return rc;
