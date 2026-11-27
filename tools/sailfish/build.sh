@@ -104,6 +104,16 @@ chmod +x "$OUT_DIR/initramfs_root/tools/wrap_preload"
 cp "$SCRIPT_DIR/power_hal/power_hal" "$OUT_DIR/initramfs_root/tools/power_hal"
 chmod +x "$OUT_DIR/initramfs_root/tools/power_hal"
 
+chmod +x "$SCRIPT_DIR/vibrator_hal/build.sh"
+"$SCRIPT_DIR/vibrator_hal/build.sh"
+cp "$SCRIPT_DIR/vibrator_hal/vibrator_hal" "$OUT_DIR/initramfs_root/tools/vibrator_hal"
+chmod +x "$OUT_DIR/initramfs_root/tools/vibrator_hal"
+
+chmod +x "$SCRIPT_DIR/lights_hal/build.sh"
+"$SCRIPT_DIR/lights_hal/build.sh"
+cp "$SCRIPT_DIR/lights_hal/lights_hal" "$OUT_DIR/initramfs_root/tools/lights_hal"
+chmod +x "$OUT_DIR/initramfs_root/tools/lights_hal"
+
 chmod +x "$SCRIPT_DIR/sensors_hal/build.sh"
 "$SCRIPT_DIR/sensors_hal/build.sh"
 cp "$SCRIPT_DIR/sensors_hal/sensors_hal" "$OUT_DIR/initramfs_root/tools/sensors_hal"

@@ -236,6 +236,8 @@ static void apply_profile_locked(int profile) {
     write_sysfs_str("/sys/devices/system/cpu/cpufreq/policy2/scaling_min_freq", p2_min);
     if (g_pwr.gpu_min_path[0])
         write_sysfs_str(g_pwr.gpu_min_path, gpu_min);
+    write_sysfs_str("/sys/bus/platform/devices/b00000.gpu/power/control",
+                    (profile == PROFILE_SLEEP) ? "auto\n" : "on\n");
     if (g_pwr.has_uclamp_topapp)
         write_sysfs_str("/dev/cpuctl/top-app/cpu.uclamp.min", uclamp_min);
 }

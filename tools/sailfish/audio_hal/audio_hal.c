@@ -31,6 +31,7 @@
 #define DESC_ICONFIG       "android.hardware.audio.core.IConfig"
 #define DESC_IMODULE       "android.hardware.audio.core.IModule"
 #define DESC_ISTREAM_OUT   "android.hardware.audio.core.IStreamOut"
+#define DESC_ISTREAM_IN    "android.hardware.audio.core.IStreamIn"
 #define DESC_ISTREAM_COMM  "android.hardware.audio.core.IStreamCommon"
 #define DESC_IFACTORY      "android.hardware.audio.effect.IFactory"
 #define DESC_BT_FACTORY    "android.hardware.bluetooth.audio.IBluetoothAudioProviderFactory"
@@ -109,6 +110,7 @@ static struct {
 static AIBinder_Class *g_cls_config;
 static AIBinder_Class *g_cls_module;
 static AIBinder_Class *g_cls_stream_out;
+static AIBinder_Class *g_cls_stream_in;
 static AIBinder_Class *g_cls_stream_comm;
 static AIBinder_Class *g_cls_factory;
 static AIBinder_Class *g_cls_bt_factory;
@@ -244,12 +246,92 @@ static int alsa_ctl_set(int ctl_fd, const char *name, long val, const char *enum
     return rc;
 }
 
-static void alsa_set_speaker_route(bool enable) {
+static _Atomic int g_active_out_port = 1; /* 1=Speaker, 3=Earpiece, 4=Headphones */
+
+static void alsa_set_out_route(int port_id, bool enable) {
     int ctl = open("/dev/snd/controlC0", O_RDWR);
     if (ctl < 0) return;
-    if (enable)
+
+    if (!enable) {
+        alsa_ctl_set(ctl, "QUAT_MI2S_RX Audio Mixer MultiMedia1", 0, NULL);
+        alsa_ctl_set(ctl, "SLIMBUS_6_RX Audio Mixer MultiMedia1", 0, NULL);
+        alsa_ctl_set(ctl, "SLIM RX0 MUX", 0, "ZERO");
+        alsa_ctl_set(ctl, "SLIM RX1 MUX", 0, "ZERO");
+        alsa_ctl_set(ctl, "RX INT0_1 MIX1 INP0", 0, "ZERO");
+        alsa_ctl_set(ctl, "RX INT1_1 MIX1 INP0", 0, "ZERO");
+        alsa_ctl_set(ctl, "RX INT2_1 MIX1 INP0", 0, "ZERO");
+        alsa_ctl_set(ctl, "COMP1 Switch", 0, NULL);
+        alsa_ctl_set(ctl, "COMP2 Switch", 0, NULL);
+        close(ctl);
+        return;
+    }
+
+    if (port_id == 4) {
+        /* 3.5mm Headphones (WCD9335 HPHL + HPHR over SLIMBUS_6_RX) */
+        alsa_ctl_set(ctl, "QUAT_MI2S_RX Audio Mixer MultiMedia1", 0, NULL);
+        alsa_ctl_set(ctl, "RX INT0_1 MIX1 INP0", 0, "ZERO");
+        alsa_ctl_set(ctl, "SLIMBUS_6_RX Audio Mixer MultiMedia1", 1, NULL);
+        alsa_ctl_set(ctl, "SLIM RX0 MUX", 0, "AIF4_PB");
+        alsa_ctl_set(ctl, "SLIM RX1 MUX", 0, "AIF4_PB");
+        alsa_ctl_set(ctl, "RX INT1_1 MIX1 INP0", 0, "RX0");
+        alsa_ctl_set(ctl, "RX INT2_1 MIX1 INP0", 0, "RX1");
+        alsa_ctl_set(ctl, "RX INT1 DEM MUX", 0, "CLSH_DSM_OUT");
+        alsa_ctl_set(ctl, "RX INT2 DEM MUX", 0, "CLSH_DSM_OUT");
+        alsa_ctl_set(ctl, "RX1 Digital Volume", 84, NULL);
+        alsa_ctl_set(ctl, "RX2 Digital Volume", 84, NULL);
+        alsa_ctl_set(ctl, "COMP1 Switch", 1, NULL);
+        alsa_ctl_set(ctl, "COMP2 Switch", 1, NULL);
+    } else if (port_id == 3) {
+        /* Earpiece (WCD9335 EAR over SLIMBUS_6_RX) */
+        alsa_ctl_set(ctl, "QUAT_MI2S_RX Audio Mixer MultiMedia1", 0, NULL);
+        alsa_ctl_set(ctl, "RX INT1_1 MIX1 INP0", 0, "ZERO");
+        alsa_ctl_set(ctl, "RX INT2_1 MIX1 INP0", 0, "ZERO");
+        alsa_ctl_set(ctl, "COMP1 Switch", 0, NULL);
+        alsa_ctl_set(ctl, "COMP2 Switch", 0, NULL);
+        alsa_ctl_set(ctl, "SLIMBUS_6_RX Audio Mixer MultiMedia1", 1, NULL);
+        alsa_ctl_set(ctl, "SLIM RX0 MUX", 0, "AIF4_PB");
+        alsa_ctl_set(ctl, "RX INT0_1 MIX1 INP0", 0, "RX0");
+        alsa_ctl_set(ctl, "RX INT0 DEM MUX", 0, "CLSH_DSM_OUT");
+        alsa_ctl_set(ctl, "RX0 Digital Volume", 84, NULL);
+    } else {
+        /* Speaker (TFA9891 over QUAT_MI2S_RX) */
+        alsa_ctl_set(ctl, "SLIMBUS_6_RX Audio Mixer MultiMedia1", 0, NULL);
+        alsa_ctl_set(ctl, "COMP1 Switch", 0, NULL);
+        alsa_ctl_set(ctl, "COMP2 Switch", 0, NULL);
         alsa_ctl_set(ctl, "Amp Input", 0, "Left");
-    alsa_ctl_set(ctl, "QUAT_MI2S_RX Audio Mixer MultiMedia1", enable ? 1 : 0, NULL);
+        alsa_ctl_set(ctl, "QUAT_MI2S_RX Audio Mixer MultiMedia1", 1, NULL);
+    }
+    close(ctl);
+}
+
+static void alsa_set_speaker_route(bool enable) {
+    alsa_set_out_route(atomic_load(&g_active_out_port), enable);
+}
+
+static void alsa_set_mic_route(bool enable) {
+    int ctl = open("/dev/snd/controlC0", O_RDWR);
+    if (ctl < 0) return;
+    if (enable) {
+        int r1 = alsa_ctl_set(ctl, "MultiMedia2 Mixer SLIMBUS_0_TX", 1, NULL);
+        int r2 = alsa_ctl_set(ctl, "AIF1_CAP Mixer SLIM TX7", 1, NULL);
+        int r3 = alsa_ctl_set(ctl, "AIF1_CAP Mixer SLIM TX8", 1, NULL);
+        int r4 = alsa_ctl_set(ctl, "SLIM TX7 MUX", 0, "DEC7");
+        int r5 = alsa_ctl_set(ctl, "SLIM TX8 MUX", 0, "DEC8");
+        int r6 = alsa_ctl_set(ctl, "ADC MUX7", 0, "DMIC");
+        int r7 = alsa_ctl_set(ctl, "DMIC MUX7", 0, "DMIC2");
+        int r8 = alsa_ctl_set(ctl, "ADC MUX8", 0, "DMIC");
+        int r9 = alsa_ctl_set(ctl, "DMIC MUX8", 0, "DMIC5");
+        log_msg("MIC route ON: mm2=%d tx7=%d tx8=%d m7=%d m8=%d a7=%d d7=%d a8=%d d8=%d",
+                r1, r2, r3, r4, r5, r6, r7, r8, r9);
+    } else {
+        alsa_ctl_set(ctl, "MultiMedia2 Mixer SLIMBUS_0_TX", 0, NULL);
+        alsa_ctl_set(ctl, "AIF1_CAP Mixer SLIM TX7", 0, NULL);
+        alsa_ctl_set(ctl, "AIF1_CAP Mixer SLIM TX8", 0, NULL);
+        alsa_ctl_set(ctl, "SLIM TX7 MUX", 0, "ZERO");
+        alsa_ctl_set(ctl, "SLIM TX8 MUX", 0, "ZERO");
+        alsa_ctl_set(ctl, "DMIC MUX7", 0, "ZERO");
+        alsa_ctl_set(ctl, "DMIC MUX8", 0, "ZERO");
+    }
     close(ctl);
 }
 
@@ -321,7 +403,66 @@ static int alsa_pcm_open_speaker(void) {
         close(fd);
         return -1;
     }
-    log_msg("Opened ALSA speaker /dev/snd/pcmC0D0p (48kHz S16_LE 2ch 4x960)");
+    log_msg("Opened ALSA output /dev/snd/pcmC0D0p (port=%d 48kHz S16_LE 2ch 6x960)",
+            atomic_load(&g_active_out_port));
+    return fd;
+}
+
+static int g_mic_hw_channels = 2;
+
+static int alsa_pcm_open_mic(void) {
+    alsa_set_mic_route(true);
+    int fd = open("/dev/snd/pcmC0D1c", O_RDWR);
+    if (fd < 0) {
+        log_msg("open /dev/snd/pcmC0D1c failed: %s", strerror(errno));
+        return -1;
+    }
+    struct snd_pcm_hw_params hw;
+    int ch = 2;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        ch = (attempt == 0) ? 2 : 1;
+        param_init(&hw);
+        param_set_mask(&hw, SNDRV_PCM_HW_PARAM_ACCESS, SNDRV_PCM_ACCESS_RW_INTERLEAVED);
+        param_set_mask(&hw, SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_FORMAT_S16_LE);
+        param_set_mask(&hw, SNDRV_PCM_HW_PARAM_SUBFORMAT, SNDRV_PCM_SUBFORMAT_STD);
+        param_set_min_max(&hw, SNDRV_PCM_HW_PARAM_CHANNELS, (unsigned int)ch, (unsigned int)ch);
+        param_set_min_max(&hw, SNDRV_PCM_HW_PARAM_RATE, 48000, 48000);
+        param_set_min_max(&hw, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, 320, 1024);
+        param_set_min_max(&hw, SNDRV_PCM_HW_PARAM_PERIODS, 2, 8);
+        if (ioctl(fd, SNDRV_PCM_IOCTL_HW_PARAMS, &hw) == 0)
+            break;
+        if (attempt == 1) {
+            log_msg("MIC HW_PARAMS failed (2ch and 1ch): %s", strerror(errno));
+            close(fd);
+            return -1;
+        }
+    }
+    g_mic_hw_channels = ch;
+    unsigned int psize = hw.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min;
+    unsigned int pcnt  = hw.intervals[SNDRV_PCM_HW_PARAM_PERIODS - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min;
+    if (psize < 160) psize = 480;
+    if (pcnt < 2) pcnt = 4;
+
+    struct snd_pcm_sw_params sw;
+    memset(&sw, 0, sizeof(sw));
+    sw.tstamp_mode = SNDRV_PCM_TSTAMP_NONE;
+    sw.period_step = 1;
+    sw.avail_min = psize;
+    sw.start_threshold = psize;
+    sw.stop_threshold = psize * pcnt;
+    sw.boundary = psize * pcnt;
+    while (sw.boundary * 2 <= (1UL << 30)) sw.boundary *= 2;
+    if (ioctl(fd, SNDRV_PCM_IOCTL_SW_PARAMS, &sw) < 0) {
+        log_msg("MIC SW_PARAMS failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (ioctl(fd, SNDRV_PCM_IOCTL_PREPARE) < 0) {
+        log_msg("MIC PREPARE failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    log_msg("Opened ALSA mic /dev/snd/pcmC0D1c (48kHz S16_LE %dch %ux%u)", ch, pcnt, psize);
     return fd;
 }
 
@@ -520,17 +661,22 @@ static void write_format_pcm16(AParcel *p) {
     parcel_end(p, s);
 }
 
-static int32_t write_ch_layout_stereo_elem(AParcel *p, const void *arr, size_t idx) {
-    (void)arr; (void)idx;
+static int32_t write_ch_layout_mask_elem(AParcel *p, const void *arr, size_t idx) {
+    int32_t mask = ((const int32_t *)arr)[idx];
     g_bn.writeInt32(p, 1); /* non-null */
     g_bn.writeInt32(p, 3); /* AudioChannelLayout::layoutMask */
-    g_bn.writeInt32(p, 3); /* LAYOUT_STEREO = FL|FR = 3 */
+    g_bn.writeInt32(p, mask);
     return STATUS_OK;
 }
 
 static void write_ch_layout_stereo(AParcel *p) {
     g_bn.writeInt32(p, 3); /* layoutMask */
     g_bn.writeInt32(p, 3); /* LAYOUT_STEREO */
+}
+
+static void write_ch_layout_mono(AParcel *p) {
+    g_bn.writeInt32(p, 3); /* layoutMask */
+    g_bn.writeInt32(p, 1); /* LAYOUT_MONO */
 }
 
 static int32_t g_bt_sample_rate = 44100;
@@ -541,13 +687,17 @@ static int32_t write_profile_elem(AParcel *p, const void *arr, size_t idx) {
     int32_t rates_spk[1] = { 48000 };
     int32_t rates_bt_all[2] = { 44100, 48000 };
     int32_t rates_bt_one[1] = { g_bt_sample_rate > 0 ? g_bt_sample_rate : 44100 };
-    int32_t dummy = 0;
+    int32_t ch_stereo[1] = { 3 };
+    int32_t ch_mono[1] = { 1 };
     g_bn.writeInt32(p, 1); /* non-null */
     int32_t s = parcel_begin(p);
     write_str(p, "");
     g_bn.writeInt32(p, 1);
     write_format_pcm16(p);
-    g_bn.writeParcelableArray(p, &dummy, 1, write_ch_layout_stereo_elem);
+    if (mode == 3)
+        g_bn.writeParcelableArray(p, ch_mono, 1, write_ch_layout_mask_elem);
+    else
+        g_bn.writeParcelableArray(p, ch_stereo, 1, write_ch_layout_mask_elem);
     if (mode == 2)
         g_bn.writeInt32Array(p, rates_bt_one, 1);
     else if (mode == 1)
@@ -607,6 +757,18 @@ static void write_port_ext_speaker(AParcel *p) {
     write_port_ext_device(p, 140 /* OUT_SPEAKER */, "", "", NULL, 1 /* DEFAULT_DEVICE */);
 }
 
+static void write_port_ext_earpiece(AParcel *p) {
+    write_port_ext_device(p, 141 /* OUT_SPEAKER_EARPIECE */, "", "", NULL, 0);
+}
+
+static void write_port_ext_headphones(AParcel *p) {
+    write_port_ext_device(p, 136 /* OUT_HEADPHONE */, "analog", "", NULL, 0);
+}
+
+static void write_port_ext_mic(AParcel *p) {
+    write_port_ext_device(p, 9 /* IN_MICROPHONE */, "", "bottom", NULL, 1 /* DEFAULT_DEVICE */);
+}
+
 static char g_bt_ext_addr[64] = "";
 
 static void write_port_ext_bt_a2dp(AParcel *p, bool connected) {
@@ -632,10 +794,19 @@ static void write_port_ext_mix(AParcel *p, int32_t handle) {
     parcel_end(p, s);
 }
 
+static bool port_is_input(int32_t port_id) {
+    return (port_id == 5 || port_id == 6);
+}
+
 static void write_audio_port(AParcel *p, int32_t port_id) {
-    int32_t prof_mode = (port_id >= 13) ? 2 : (port_id >= 11 ? 1 : 0);
+    bool is_in = port_is_input(port_id);
+    int32_t prof_mode = is_in ? 3 : ((port_id >= 13) ? 2 : (port_id >= 11 ? 1 : 0));
     const char *name = "primary output";
     if (port_id == 1) name = "Speaker";
+    else if (port_id == 3) name = "Earpiece";
+    else if (port_id == 4) name = "Wired Headphones";
+    else if (port_id == 5) name = "Built-In Mic";
+    else if (port_id == 6) name = "primary input";
     else if (port_id == 11) name = "BT A2DP Out";
     else if (port_id == 12) name = "a2dp output";
     else if (port_id >= 13) name = "BT A2DP Connected";
@@ -644,16 +815,22 @@ static void write_audio_port(AParcel *p, int32_t port_id) {
     g_bn.writeInt32(p, port_id);
     write_str(p, name);
     g_bn.writeParcelableArray(p, &prof_mode, 1, write_profile_elem);
-    /* AudioIoFlags: output (tag=1) */
+    /* AudioIoFlags: input (tag=0) or output (tag=1) */
     g_bn.writeInt32(p, 1); /* non-null */
-    g_bn.writeInt32(p, 1); /* tag=output */
-    g_bn.writeInt32(p, port_id == 2 ? (1 << 1) : 0); /* PRIMARY = bit 1 */
+    g_bn.writeInt32(p, is_in ? 0 : 1);
+    g_bn.writeInt32(p, port_id == 2 ? (1 << 1) : 0); /* PRIMARY = bit 1 for primary output */
     g_bn.writeParcelableArray(p, NULL, 0, write_empty_elem); /* extraAudioDescriptors */
     g_bn.writeParcelableArray(p, NULL, 0, write_empty_elem); /* gains */
     /* AudioPortExt */
     g_bn.writeInt32(p, 1); /* non-null */
     if (port_id == 1)
         write_port_ext_speaker(p);
+    else if (port_id == 3)
+        write_port_ext_earpiece(p);
+    else if (port_id == 4)
+        write_port_ext_headphones(p);
+    else if (port_id == 5)
+        write_port_ext_mic(p);
     else if (port_id == 11)
         write_port_ext_bt_a2dp(p, false);
     else if (port_id >= 13)
@@ -689,7 +866,10 @@ static void write_port_cfg(AParcel *p, const port_cfg_t *c) {
     parcel_end(p, sr);
     /* AudioChannelLayout */
     g_bn.writeInt32(p, 1);
-    write_ch_layout_stereo(p);
+    if (port_is_input(c->port_id))
+        write_ch_layout_mono(p);
+    else
+        write_ch_layout_stereo(p);
     /* AudioFormatDescription */
     g_bn.writeInt32(p, 1);
     write_format_pcm16(p);
@@ -697,12 +877,18 @@ static void write_port_cfg(AParcel *p, const port_cfg_t *c) {
     g_bn.writeInt32(p, 0);
     /* AudioIoFlags */
     g_bn.writeInt32(p, 1);
-    g_bn.writeInt32(p, 1); /* output */
+    g_bn.writeInt32(p, port_is_input(c->port_id) ? 0 : 1);
     g_bn.writeInt32(p, c->port_id == 2 ? (1 << 1) : 0);
     /* AudioPortExt */
     g_bn.writeInt32(p, 1);
     if (c->port_id == 1)
         write_port_ext_speaker(p);
+    else if (c->port_id == 3)
+        write_port_ext_earpiece(p);
+    else if (c->port_id == 4)
+        write_port_ext_headphones(p);
+    else if (c->port_id == 5)
+        write_port_ext_mic(p);
     else if (c->port_id == 11)
         write_port_ext_bt_a2dp(p, false);
     else if (c->port_id >= 13)
@@ -821,6 +1007,7 @@ _Static_assert(sizeof(stream_reply_t) == 56, "stream_reply_t must be 56 bytes");
 typedef struct stream_out {
     pthread_mutex_t lock;
     bool is_bt_a2dp;
+    bool is_input;
     fmq_t cmd_mq;
     fmq_t reply_mq;
     fmq_t data_mq;
@@ -1076,6 +1263,149 @@ static void *stream_worker(void *arg) {
     return NULL;
 }
 
+static void *stream_in_worker(void *arg) {
+    stream_out_t *st = (stream_out_t *)arg;
+    int16_t pcm_buf[8192];
+
+    struct sched_param sp = { .sched_priority = 10 };
+    (void)sched_setscheduler(0, SCHED_FIFO, &sp);
+    log_msg("Input stream worker thread started");
+
+    int burst_logs = 0;
+    while (!atomic_load(&st->stop)) {
+        if (fmq_avail_read(&st->cmd_mq) < sizeof(stream_cmd_t)) {
+            fmq_ef_wait(&st->cmd_mq, FMQ_FLAG_NOT_EMPTY, 50);
+            continue;
+        }
+        stream_cmd_t cmd;
+        if (fmq_read_bytes(&st->cmd_mq, &cmd, sizeof(cmd)) != sizeof(cmd))
+            continue;
+
+        stream_reply_t rep;
+        memset(&rep, 0, sizeof(rep));
+        rep.status = STATUS_OK;
+        rep.latency_ms = 20;
+
+        switch (cmd.tag) {
+        case CMD_EXIT:
+            atomic_store(&st->stop, true);
+            break;
+        case CMD_GET_STATUS:
+            break;
+        case CMD_START:
+            if (st->pcm_fd < 0)
+                st->pcm_fd = alsa_pcm_open_mic();
+            st->state = STATE_ACTIVE;
+            break;
+        case CMD_BURST: {
+            int32_t req = cmd.val;
+            if (req < 0) req = 0;
+            if ((size_t)req > sizeof(pcm_buf) / 2) req = (int32_t)(sizeof(pcm_buf) / 2);
+            req &= ~1; /* 2-byte mono S16_LE frames */
+            int frames = req / 2;
+            int16_t mono_buf[4096];
+            if (frames > 4096) frames = 4096;
+            req = frames * 2;
+            memset(pcm_buf, 0, (size_t)frames * 4);
+            if (st->pcm_fd < 0)
+                st->pcm_fd = alsa_pcm_open_mic();
+            int read_err = 0;
+            int total_read = 0;
+            if (st->pcm_fd >= 0 && frames > 0) {
+                int hw_ch = g_mic_hw_channels;
+                int off = 0;
+                while (off < frames) {
+                    struct snd_xferi xfer;
+                    memset(&xfer, 0, sizeof(xfer));
+                    xfer.buf = pcm_buf + off * hw_ch;
+                    xfer.frames = (snd_pcm_uframes_t)(frames - off);
+                    if (ioctl(st->pcm_fd, SNDRV_PCM_IOCTL_READI_FRAMES, &xfer) < 0) {
+                        if (errno == EPIPE) {
+                            ioctl(st->pcm_fd, SNDRV_PCM_IOCTL_PREPARE);
+                            continue;
+                        }
+                        read_err = errno;
+                        usleep((useconds_t)((unsigned long long)(frames - off) * 1000000ULL / 48000ULL));
+                        break;
+                    }
+                    if (xfer.result <= 0) break;
+                    off += (int)xfer.result;
+                }
+                total_read = off;
+            } else if (frames > 0) {
+                usleep((useconds_t)((unsigned long long)frames * 1000000ULL / 48000ULL));
+            }
+            int p0 = 0, p1 = 0;
+            bool skip_pop = (st->frames_written < 4800); /* suppress first 100ms DMIC power-on DC pop */
+            for (int i = 0; i < frames; i++) {
+                int s0 = pcm_buf[i * g_mic_hw_channels];
+                int s1 = (g_mic_hw_channels >= 2) ? pcm_buf[i * g_mic_hw_channels + 1] : 0;
+                int a0 = s0 < 0 ? -s0 : s0;
+                int a1 = s1 < 0 ? -s1 : s1;
+                if (a0 > p0) p0 = a0;
+                if (a1 > p1) p1 = a1;
+                /* Apply +24dB (16x) digital mic gain with clamping */
+                int amp = s0 * 16;
+                if (amp > 32767) amp = 32767;
+                else if (amp < -32768) amp = -32768;
+                mono_buf[i] = (g_mod.mic_mute || skip_pop) ? 0 : (int16_t)amp;
+            }
+            if (burst_logs < 6) {
+                burst_logs++;
+                log_msg("MIC burst #%d: req=%d read=%d err=%d peak_dmic2=%d peak_dmic5=%d",
+                        burst_logs, frames, total_read, read_err, p0, p1);
+            }
+            if (req > 0) {
+                fmq_write_bytes(&st->data_mq, mono_buf, (size_t)req);
+                st->frames_written += frames;
+                rep.fmq_byte_count = req;
+            }
+            st->state = STATE_ACTIVE;
+            break;
+        }
+        case CMD_STANDBY:
+            if (st->pcm_fd >= 0) {
+                ioctl(st->pcm_fd, SNDRV_PCM_IOCTL_DROP);
+                close(st->pcm_fd);
+                st->pcm_fd = -1;
+                alsa_set_mic_route(false);
+            }
+            st->state = STATE_STANDBY;
+            break;
+        case CMD_PAUSE:
+            st->state = STATE_PAUSED;
+            break;
+        case CMD_FLUSH:
+        case CMD_DRAIN:
+            if (st->pcm_fd >= 0) {
+                ioctl(st->pcm_fd, SNDRV_PCM_IOCTL_DROP);
+                ioctl(st->pcm_fd, SNDRV_PCM_IOCTL_PREPARE);
+            }
+            st->state = STATE_IDLE;
+            break;
+        default:
+            break;
+        }
+
+        int64_t t = now_ns();
+        rep.observable.frames = st->frames_written;
+        rep.observable.time_ns = t;
+        rep.hardware.frames = st->frames_written;
+        rep.hardware.time_ns = t;
+        rep.state = st->state;
+        fmq_write_bytes(&st->reply_mq, &rep, sizeof(rep));
+    }
+
+    if (st->pcm_fd >= 0) {
+        ioctl(st->pcm_fd, SNDRV_PCM_IOCTL_DROP);
+        close(st->pcm_fd);
+        st->pcm_fd = -1;
+        alsa_set_mic_route(false);
+    }
+    log_msg("Input stream worker thread exiting");
+    return NULL;
+}
+
 static void stream_close(stream_out_t *st) {
     if (!st) return;
     if (st->worker_started) {
@@ -1177,6 +1507,37 @@ static binder_status_t on_transact_stream_out(AIBinder *b, transaction_code_t co
     case 10: /* getRecommendedLatencyModes */
         g_bn.writeInt32(out, STATUS_OK);
         g_bn.writeInt32Array(out, NULL, 0);
+        return STATUS_OK;
+    default:
+        g_bn.writeInt32(out, EX_UNSUPPORTED_OPERATION);
+        write_str(out, "unsupported");
+        return STATUS_OK;
+    }
+}
+
+static binder_status_t on_transact_stream_in(AIBinder *b, transaction_code_t code,
+                                             const AParcel *in, AParcel *out) {
+    if (handle_common_meta(code, out) == STATUS_OK) return STATUS_OK;
+    stream_out_t *st = (stream_out_t *)g_bn.getUserData(b);
+    switch (code) {
+    case 1: /* getStreamCommon */
+        g_bn.writeInt32(out, STATUS_OK);
+        g_bn.writeStrongBinder(out, st->common_binder);
+        return STATUS_OK;
+    case 2: /* getActiveMicrophones */
+        g_bn.writeInt32(out, STATUS_OK);
+        g_bn.writeParcelableArray(out, NULL, 0, write_empty_elem);
+        return STATUS_OK;
+    case 7: /* updateMetadata */
+    case 9: /* setHwGain */
+        (void)in;
+        g_bn.writeInt32(out, STATUS_OK);
+        return STATUS_OK;
+    case 8: /* getHwGain */
+        g_bn.writeInt32(out, STATUS_OK);
+        g_bn.writeInt32(out, 2);
+        g_bn.writeFloat(out, 1.0f);
+        g_bn.writeFloat(out, 1.0f);
         return STATUS_OK;
     default:
         g_bn.writeInt32(out, EX_UNSUPPORTED_OPERATION);
@@ -1416,8 +1777,11 @@ static binder_status_t on_transact_module(AIBinder *b, transaction_code_t code,
 
     case 6: { /* connectExternalDevice(in AudioPort) -> AudioPort */
         if (!is_a2dp) {
-            g_bn.writeInt32(out, EX_UNSUPPORTED_OPERATION);
-            write_str(out, "not a2dp");
+            /* Support wired 3.5mm headphone jack connect on primary module */
+            log_msg("IModule/default: connectExternalDevice -> Wired Headphones (port 4)");
+            g_bn.writeInt32(out, STATUS_OK);
+            g_bn.writeInt32(out, 1);
+            write_audio_port(out, 4);
             return STATUS_OK;
         }
         char addr[64];
@@ -1468,7 +1832,8 @@ static binder_status_t on_transact_module(AIBinder *b, transaction_code_t code,
     case 9: { /* getAudioPort(portId) */
         int32_t pid = 0;
         g_bn.readInt32(in, &pid);
-        bool valid = is_a2dp ? (pid == 11 || pid == 12 || pid == g_bt.ext_port_id) : (pid == 1 || pid == 2);
+        bool valid = is_a2dp ? (pid == 11 || pid == 12 || pid == g_bt.ext_port_id)
+                             : (pid >= 1 && pid <= 6);
         if (!valid) {
             g_bn.writeInt32(out, EX_ILLEGAL_ARGUMENT);
             write_str(out, "unknown port");
@@ -1502,9 +1867,9 @@ static binder_status_t on_transact_module(AIBinder *b, transaction_code_t code,
             g_bn.writeInt32(out, STATUS_OK);
             g_bn.writeParcelableArray(out, ids, n, write_audio_port_elem);
         } else {
-            int32_t ids[2] = { 1, 2 };
+            int32_t ids[6] = { 1, 2, 3, 4, 5, 6 };
             g_bn.writeInt32(out, STATUS_OK);
-            g_bn.writeParcelableArray(out, ids, 2, write_audio_port_elem);
+            g_bn.writeParcelableArray(out, ids, 6, write_audio_port_elem);
         }
         return STATUS_OK;
     }
@@ -1517,10 +1882,67 @@ static binder_status_t on_transact_module(AIBinder *b, transaction_code_t code,
             g_bn.writeInt32(out, STATUS_OK);
             g_bn.writeParcelableArray(out, rts, n, write_route_elem);
         } else {
-            route_def_t rt = { 2, 1 };
+            route_def_t rts[4] = { { 2, 1 }, { 2, 3 }, { 2, 4 }, { 5, 6 } };
             g_bn.writeInt32(out, STATUS_OK);
-            g_bn.writeParcelableArray(out, &rt, 1, write_route_elem);
+            g_bn.writeParcelableArray(out, rts, 4, write_route_elem);
         }
+        return STATUS_OK;
+    }
+
+    case 14: { /* openInputStream */
+        stream_out_t *st = calloc(1, sizeof(*st));
+        if (!st) {
+            g_bn.writeInt32(out, EX_ILLEGAL_ARGUMENT);
+            write_str(out, "oom");
+            return STATUS_OK;
+        }
+        pthread_mutex_init(&st->lock, NULL);
+        st->is_input = true;
+        st->pcm_fd = -1;
+        st->state = STATE_STANDBY;
+        st->hw_vol[0] = 1.0f;
+        st->hw_vol[1] = 1.0f;
+        if (!fmq_create(&st->cmd_mq, sizeof(stream_cmd_t), 16) ||
+            !fmq_create(&st->reply_mq, sizeof(stream_reply_t), 16) ||
+            !fmq_create(&st->data_mq, 1, 16384)) {
+            on_destroy_stream_out(st);
+            g_bn.writeInt32(out, EX_ILLEGAL_ARGUMENT);
+            write_str(out, "fmq alloc failed");
+            return STATUS_OK;
+        }
+        st->common_binder = g_bn.newBinder(g_cls_stream_comm, st);
+        AIBinder *in_binder = g_bn.newBinder(g_cls_stream_in, st);
+        if (g_bn.markVintfStability) {
+            g_bn.markVintfStability(st->common_binder);
+            g_bn.markVintfStability(in_binder);
+        }
+        if (pthread_create(&st->worker, NULL, stream_in_worker, st) == 0)
+            st->worker_started = true;
+
+        log_msg("openInputStream: created mic stream & FMQs (cmd=%d rep=%d data=%d)",
+                st->cmd_mq.fd, st->reply_mq.fd, st->data_mq.fd);
+
+        g_bn.writeInt32(out, STATUS_OK);
+        g_bn.writeInt32(out, 1); /* OpenInputStreamReturn non-null */
+        int32_t ret_s = parcel_begin(out);
+        g_bn.writeStrongBinder(out, in_binder);
+        /* StreamDescriptor */
+        g_bn.writeInt32(out, 1);
+        int32_t sd = parcel_begin(out);
+        g_bn.writeInt32(out, 1);
+        write_mq_descriptor(out, &st->cmd_mq);
+        g_bn.writeInt32(out, 1);
+        write_mq_descriptor(out, &st->reply_mq);
+        g_bn.writeInt32(out, 2);    /* frameSizeBytes = 1ch mono * 2B */
+        g_bn.writeInt64(out, 3840); /* bufferSizeFrames = 4 * 960 */
+        /* StreamDescriptor::AudioBuffer (union tag=0 fmq) */
+        g_bn.writeInt32(out, 1);
+        g_bn.writeInt32(out, 0);
+        g_bn.writeInt32(out, 1);
+        write_mq_descriptor(out, &st->data_mq);
+        parcel_end(out, sd);
+        parcel_end(out, ret_s);
+        g_bn.decStrong(in_binder);
         return STATUS_OK;
     }
 
@@ -1612,7 +2034,26 @@ static binder_status_t on_transact_module(AIBinder *b, transaction_code_t code,
             if (!g_mod.patches[i].in_use && slot < 0) slot = i;
         }
         if (slot >= 0) g_mod.patches[slot] = pt;
+        int new_out_port = 0;
+        if (!is_a2dp && pt.dst_cnt > 0) {
+            for (int i = 0; i < 32; i++) {
+                if (g_mod.cfgs[i].in_use && g_mod.cfgs[i].id == pt.dst_ids[0]) {
+                    int pid = g_mod.cfgs[i].port_id;
+                    if (pid == 1 || pid == 3 || pid == 4)
+                        new_out_port = pid;
+                    break;
+                }
+            }
+        }
         pthread_mutex_unlock(&g_mod.lock);
+
+        if (new_out_port > 0) {
+            int prev = atomic_exchange(&g_active_out_port, new_out_port);
+            if (prev != new_out_port) {
+                log_msg("IModule/default: switched output route port %d -> %d", prev, new_out_port);
+                alsa_set_out_route(new_out_port, true);
+            }
+        }
 
         g_bn.writeInt32(out, STATUS_OK);
         g_bn.writeInt32(out, 1);
@@ -1629,7 +2070,7 @@ static binder_status_t on_transact_module(AIBinder *b, transaction_code_t code,
         g_bn.readInt32(in, &port_id);
         g_bn.setDataPosition(in, pstart + psz);
 
-        if (port_id != 1 && port_id != 2) port_id = 1;
+        if (!is_a2dp && (port_id < 1 || port_id > 6)) port_id = 1;
         port_cfg_t cfg;
         memset(&cfg, 0, sizeof(cfg));
         pthread_mutex_lock(&g_mod.lock);
@@ -1946,14 +2387,17 @@ int main(void) {
     if (!load_binder_ndk())
         return 1;
 
-    /* Pre-populate default speaker & primary output port configs */
+    /* Pre-populate default speaker, primary output, mic, & primary input port configs */
     g_mod.cfgs[0] = (port_cfg_t){ .id = 101, .port_id = 1, .sample_rate = 48000, .in_use = true };
     g_mod.cfgs[1] = (port_cfg_t){ .id = 102, .port_id = 2, .sample_rate = 48000, .in_use = true };
-    g_mod.next_cfg_id = 102;
+    g_mod.cfgs[2] = (port_cfg_t){ .id = 103, .port_id = 5, .sample_rate = 48000, .in_use = true };
+    g_mod.cfgs[3] = (port_cfg_t){ .id = 104, .port_id = 6, .sample_rate = 48000, .in_use = true };
+    g_mod.next_cfg_id = 104;
 
     g_cls_config      = g_bn.Class_define(DESC_ICONFIG, on_create_passthrough, on_destroy_noop, on_transact_config);
     g_cls_module      = g_bn.Class_define(DESC_IMODULE, on_create_passthrough, on_destroy_noop, on_transact_module);
     g_cls_stream_out  = g_bn.Class_define(DESC_ISTREAM_OUT, on_create_passthrough, on_destroy_stream_out, on_transact_stream_out);
+    g_cls_stream_in   = g_bn.Class_define(DESC_ISTREAM_IN,  on_create_passthrough, on_destroy_stream_out, on_transact_stream_in);
     g_cls_stream_comm = g_bn.Class_define(DESC_ISTREAM_COMM, on_create_passthrough, on_destroy_noop, on_transact_stream_comm);
     g_cls_factory     = g_bn.Class_define(DESC_IFACTORY, on_create_passthrough, on_destroy_noop, on_transact_factory);
     g_cls_bt_factory  = g_bn.Class_define(DESC_BT_FACTORY, on_create_passthrough, on_destroy_noop, on_transact_bt_factory);

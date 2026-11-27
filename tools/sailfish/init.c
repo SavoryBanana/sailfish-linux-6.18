@@ -1887,6 +1887,10 @@ static void overlay_prop_file(const char *src, const char *tmp, const char *fall
         fputs("ro.bluetooth.a2dp_offload.supported=false\n", out);
         fputs("persist.bluetooth.a2dp_offload.disabled=true\n", out);
         fputs("ro.lockscreen.disable.default=false\n", out);
+        fputs("debug.hwui.use_buffer_age=false\n", out);
+        fputs("debug.hwui.use_partial_updates=false\n", out);
+        fputs("ro.surface_flinger.has_wide_color_display=false\n", out);
+        fputs("ro.surface_flinger.has_HDR_display=false\n", out);
     }
     fclose(in);
     fclose(out);
@@ -3269,6 +3273,7 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    setprop sys.use_memfd true\n"
         "    setprop debug.gralloc.gfx_ubwc_disable 1\n"
         "    setprop debug.gralloc.enable_fb_ubwc 0\n"
+        "    export FD_MESA_DEBUG noubwc\n"
         "    setprop service.sf.prime_shader_cache 0\n"
         "    setprop ro.surface_flinger.supports_background_blur 1\n"
         "    setprop persist.sys.sf.disable_blurs 0\n"
@@ -3493,6 +3498,18 @@ static bool prepare_android_rootfs(bool for_shell) {
         "\n"
         "service sailfish_power_aidl /system/bin/android.hardware.power-service.sailfish\n"
         "    interface aidl android.hardware.power.IPower/default\n"
+        "    class hal\n"
+        "    user root\n"
+        "    group system\n"
+        "\n"
+        "service sailfish_vibrator_aidl /system/bin/android.hardware.vibrator-service.sailfish\n"
+        "    interface aidl android.hardware.vibrator.IVibrator/default\n"
+        "    class hal\n"
+        "    user root\n"
+        "    group system input\n"
+        "\n"
+        "service sailfish_lights_aidl /system/bin/android.hardware.light-service.sailfish\n"
+        "    interface aidl android.hardware.light.ILights/default\n"
         "    class hal\n"
         "    user root\n"
         "    group system\n"
@@ -3818,7 +3835,33 @@ static bool prepare_android_rootfs(bool for_shell) {
         }
     }
 
-    /* Automated: Install AIDL Power HAL stub binary for HintManagerService (IPower/default) */
+    /* Automated: Optional zero-repartition GMS overlayfs from persistent /data/local/gms.
+     * Uses read-only multi-lowerdir overlayfs so system_a stays untouched and artd AOT works. */
+    static const struct {
+        const char *gms_dir;
+        const char *sys_dir;
+        const char *label;
+    } gms_overlays[] = {
+        { "/mnt/system_a/data/local/gms/product",    "/mnt/system_a/system/product",    "/system/product" },
+        { "/mnt/system_a/data/local/gms/system_ext", "/mnt/system_a/system/system_ext", "/system/system_ext" },
+    };
+    for (size_t gi = 0; gi < sizeof(gms_overlays) / sizeof(gms_overlays[0]); gi++) {
+        struct stat gst;
+        if (stat(gms_overlays[gi].gms_dir, &gst) == 0 && S_ISDIR(gst.st_mode)) {
+            char opts[512];
+            snprintf(opts, sizeof(opts), "lowerdir=%s:%s",
+                     gms_overlays[gi].gms_dir, gms_overlays[gi].sys_dir);
+            if (mount("overlay", gms_overlays[gi].sys_dir, "overlay", MS_RDONLY, opts) == 0) {
+                char gmsg[256];
+                snprintf(gmsg, sizeof(gmsg),
+                         "[+] Automated: Mounted GMS overlayfs %s -> %s (ro)\n",
+                         gms_overlays[gi].gms_dir, gms_overlays[gi].label);
+                usb_write(gmsg);
+            }
+        }
+    }
+
+    /* Automated: Install AIDL Power HAL binary for HintManagerService (IPower/default) */
     if (access("/tools/power_hal", F_OK) == 0) {
         const char *pwr_dst = "/mnt/system_a/system/bin/android.hardware.power-service.sailfish";
         umount_all(pwr_dst);
@@ -3835,6 +3878,50 @@ static bool prepare_android_rootfs(bool for_shell) {
             if (bind_mount_clean("/tmp/power_hal", pwr_dst) == 0) {
                 set_selinux_label(pwr_dst, "u:object_r:hal_power_default_exec:s0");
                 usb_write("[+] Automated: Bind-mounted /system/bin/android.hardware.power-service.sailfish\n");
+            }
+        }
+    }
+
+    /* Automated: Install AIDL Vibrator HAL (IVibrator/default over PMI8994 SPMI haptics) */
+    if (access("/tools/vibrator_hal", F_OK) == 0) {
+        const char *vib_dst = "/mnt/system_a/system/bin/android.hardware.vibrator-service.sailfish";
+        const char *vib_lbl = "u:object_r:hal_vibrator_default_exec:s0";
+        umount_all(vib_dst);
+        unlink(vib_dst);
+        if (copy_file("/tools/vibrator_hal", vib_dst)) {
+            chmod(vib_dst, 0755);
+            set_selinux_label(vib_dst, vib_lbl);
+            usb_write("[+] Automated: Installed /system/bin/android.hardware.vibrator-service.sailfish\n");
+        } else if (copy_file("/tools/vibrator_hal", "/tmp/vibrator_hal")) {
+            chmod("/tmp/vibrator_hal", 0755);
+            set_selinux_label("/tmp/vibrator_hal", vib_lbl);
+            int vfd = open(vib_dst, O_WRONLY | O_CREAT | O_EXCL, 0755);
+            if (vfd >= 0) close(vfd);
+            if (bind_mount_clean("/tmp/vibrator_hal", vib_dst) == 0) {
+                set_selinux_label(vib_dst, vib_lbl);
+                usb_write("[+] Automated: Bind-mounted /system/bin/android.hardware.vibrator-service.sailfish\n");
+            }
+        }
+    }
+
+    /* Automated: Install AIDL Lights HAL (ILights/default over PMI8994 LPG RGB LED) */
+    if (access("/tools/lights_hal", F_OK) == 0) {
+        const char *lgt_dst = "/mnt/system_a/system/bin/android.hardware.light-service.sailfish";
+        const char *lgt_lbl = "u:object_r:hal_light_default_exec:s0";
+        umount_all(lgt_dst);
+        unlink(lgt_dst);
+        if (copy_file("/tools/lights_hal", lgt_dst)) {
+            chmod(lgt_dst, 0755);
+            set_selinux_label(lgt_dst, lgt_lbl);
+            usb_write("[+] Automated: Installed /system/bin/android.hardware.light-service.sailfish\n");
+        } else if (copy_file("/tools/lights_hal", "/tmp/lights_hal")) {
+            chmod("/tmp/lights_hal", 0755);
+            set_selinux_label("/tmp/lights_hal", lgt_lbl);
+            int lfd = open(lgt_dst, O_WRONLY | O_CREAT | O_EXCL, 0755);
+            if (lfd >= 0) close(lfd);
+            if (bind_mount_clean("/tmp/lights_hal", lgt_dst) == 0) {
+                set_selinux_label(lgt_dst, lgt_lbl);
+                usb_write("[+] Automated: Bind-mounted /system/bin/android.hardware.light-service.sailfish\n");
             }
         }
     }
@@ -4071,6 +4158,16 @@ static bool prepare_android_rootfs(bool for_shell) {
             "        <name>android.hardware.wifi.hostapd</name>\n"
             "        <version>1</version>\n"
             "        <fqname>IHostapd/default</fqname>\n"
+            "    </hal>\n"
+            "    <hal format=\"aidl\">\n"
+            "        <name>android.hardware.vibrator</name>\n"
+            "        <version>2</version>\n"
+            "        <fqname>IVibrator/default</fqname>\n"
+            "    </hal>\n"
+            "    <hal format=\"aidl\">\n"
+            "        <name>android.hardware.light</name>\n"
+            "        <version>2</version>\n"
+            "        <fqname>ILights/default</fqname>\n"
             "    </hal>\n"
             "    <hal format=\"hidl\">\n"
             "        <name>android.hardware.health</name>\n"
@@ -4635,7 +4732,7 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "                /system/bin/cmd settings put global window_animation_scale 1.0 2>/dev/null || true\n"
                     "                /system/bin/cmd settings put global transition_animation_scale 1.0 2>/dev/null || true\n"
                     "                /system/bin/cmd settings put global animator_duration_scale 1.0 2>/dev/null || true\n"
-                    "                /system/bin/cmd lock_settings set-disabled true 2>/dev/null || /system/bin/locksettings set-disabled true 2>/dev/null || true\n"
+                    "                /system/bin/cmd lock_settings set-disabled false 2>/dev/null || /system/bin/locksettings set-disabled false 2>/dev/null || true\n"
                     "                /system/bin/cmd package disable-user --user 0 com.android.nfc 2>/dev/null || true\n"
                     "                /system/bin/cmd settings put global adb_enabled 0 2>/dev/null || true\n"
                     "                touch /data/.sailfish_provisioned 2>/dev/null || true\n"
@@ -4680,7 +4777,7 @@ static bool prepare_android_rootfs(bool for_shell) {
                     "            echo 0 > /sys/class/graphics/fb0/blank 2>/dev/null || true\n"
                     "            echo 0 > /sys/class/backlight/994000.dsi.0/bl_power 2>/dev/null || true\n"
                     "            echo 96 > /sys/class/backlight/994000.dsi.0/brightness 2>/dev/null || true\n"
-                    "            /system/bin/cmd lock_settings set-disabled true 2>/dev/null || /system/bin/locksettings set-disabled true 2>/dev/null || true\n"
+                    "            /system/bin/cmd lock_settings set-disabled false 2>/dev/null || /system/bin/locksettings set-disabled false 2>/dev/null || true\n"
                     "            /system/bin/cmd input keyevent 224 2>/dev/null || true\n"
                     "            /system/bin/cmd window dismiss-keyguard 2>/dev/null || true\n"
                     "            /system/bin/cmd statusbar collapse 2>/dev/null || true\n"
@@ -5548,6 +5645,7 @@ static void boot_android_init(const char *stage) {
                 "ANDROID_ART_ROOT=/apex/com.android.art",
                 "ANDROID_I18N_ROOT=/apex/com.android.i18n",
                 "ANDROID_TZDATA_ROOT=/apex/com.android.tzdata",
+                "FD_MESA_DEBUG=noubwc",
                 "TERM=linux",
                 NULL
             };

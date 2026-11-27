@@ -992,4 +992,12 @@ config INPUT_STPMIC1_ONKEY
 	  To compile this driver as a module, choose M here: the
 	  module will be called stpmic1_onkey.
 
+config INPUT_QCOM_SPMI_HAPTICS
+	tristate "Qualcomm PMI8994 SPMI Haptics support"
+	depends on SPMI || COMPILE_TEST
+	select INPUT_FF_MEMLESS
+	help
+	  Say Y to enable support for the Qualcomm PMI8994 SPMI haptics
+	  LRA/ERM actuator driver.
+
 endif
