@@ -357,8 +357,9 @@ static void encode_plane_layouts(meta_writer_t *w, const sailfish_gralloc_ints_t
     const int64_t COMP_R = 1024, COMP_G = 2048, COMP_B = 4096, COMP_A = 1073741824;
 
     if (info->format == HAL_FMT_YCBCR_420_888 || info->format == HAL_FMT_YCRCB_420_SP) {
-        uint64_t y_size = (uint64_t)info->stride_bytes * info->height;
-        uint64_t uv_size = (uint64_t)info->stride_bytes * ((info->height + 1) / 2);
+        uint64_t h_aligned = (info->height + 1U) & ~1U;
+        uint64_t y_size = (uint64_t)info->stride_bytes * h_aligned;
+        uint64_t uv_size = (uint64_t)info->stride_bytes * (h_aligned / 2);
         mw_i64(w, 2); /* 2 planes: Y, interleaved UV */
         /* Plane 0: Y */
         mw_i64(w, 1);
@@ -381,6 +382,49 @@ static void encode_plane_layouts(meta_writer_t *w, const sailfish_gralloc_ints_t
         mw_i64(w, (int64_t)((info->width + 1) / 2));
         mw_i64(w, (int64_t)((info->height + 1) / 2));
         mw_i64(w, (int64_t)uv_size);
+        mw_i64(w, 2);
+        mw_i64(w, 2);
+        return;
+    }
+
+    if (info->format == HAL_FMT_YV12) {
+        uint64_t h_aligned = (info->height + 1U) & ~1U;
+        uint64_t y_stride = info->stride_bytes;
+        uint64_t c_stride = ((y_stride / 2) + 15U) & ~15U;
+        uint64_t y_size = y_stride * h_aligned;
+        uint64_t c_size = c_stride * (h_aligned / 2);
+        mw_i64(w, 3); /* 3 planes: Y, Cr, Cb */
+        /* Plane 0: Y */
+        mw_i64(w, 1);
+        mw_plane_component(w, COMP_Y, 0, 8);
+        mw_i64(w, 0);
+        mw_i64(w, 8);
+        mw_i64(w, (int64_t)y_stride);
+        mw_i64(w, (int64_t)info->width);
+        mw_i64(w, (int64_t)info->height);
+        mw_i64(w, (int64_t)y_size);
+        mw_i64(w, 1);
+        mw_i64(w, 1);
+        /* Plane 1: Cr */
+        mw_i64(w, 1);
+        mw_plane_component(w, COMP_CR, 0, 8);
+        mw_i64(w, (int64_t)y_size);
+        mw_i64(w, 8);
+        mw_i64(w, (int64_t)c_stride);
+        mw_i64(w, (int64_t)((info->width + 1) / 2));
+        mw_i64(w, (int64_t)((info->height + 1) / 2));
+        mw_i64(w, (int64_t)c_size);
+        mw_i64(w, 2);
+        mw_i64(w, 2);
+        /* Plane 2: Cb */
+        mw_i64(w, 1);
+        mw_plane_component(w, COMP_CB, 0, 8);
+        mw_i64(w, (int64_t)(y_size + c_size));
+        mw_i64(w, 8);
+        mw_i64(w, (int64_t)c_stride);
+        mw_i64(w, (int64_t)((info->width + 1) / 2));
+        mw_i64(w, (int64_t)((info->height + 1) / 2));
+        mw_i64(w, (int64_t)c_size);
         mw_i64(w, 2);
         mw_i64(w, 2);
         return;

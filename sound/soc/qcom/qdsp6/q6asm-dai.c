@@ -4,6 +4,7 @@
 
 #include <dt-bindings/sound/qcom,q6asm.h>
 #include <linux/init.h>
+#include <linux/iommu.h>
 #include <linux/err.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -233,14 +234,14 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 	prtd->pcm_count = snd_pcm_lib_period_bytes(substream);
 	prtd->pcm_irq_pos = 0;
 	/* rate and channels are sent to audio driver */
-	if (prtd->state == Q6ASM_STREAM_RUNNING) {
+	if (prtd->state != Q6ASM_STREAM_IDLE) {
 		/* clear the previous setup if any  */
 		q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
 		q6asm_unmap_memory_regions(substream->stream,
 					   prtd->audio_client);
 		q6routing_stream_close(soc_prtd->dai_link->id,
 					 substream->stream);
-		prtd->state = Q6ASM_STREAM_STOPPED;
+		prtd->state = Q6ASM_STREAM_IDLE;
 	}
 
 	ret = q6asm_map_memory_regions(substream->stream, prtd->audio_client,

@@ -238,13 +238,18 @@ static irqreturn_t rmi_f12_attention(int irq, void *ctx)
 		drvdata->attn_data.data += valid_bytes;
 		drvdata->attn_data.size -= valid_bytes;
 	} else {
+		int read_len = sensor->pkt_size;
+		if (f12->data1 &&
+		    f12->data1_offset + f12->data1->reg_size < read_len)
+			read_len = f12->data1_offset + f12->data1->reg_size;
 		retval = rmi_read_block(rmi_dev, f12->data_addr,
-					sensor->data_pkt, sensor->pkt_size);
+					sensor->data_pkt, read_len);
 		if (retval < 0) {
 			dev_err(&fn->dev, "Failed to read object data. Code: %d.\n",
 				retval);
 			return IRQ_RETVAL(retval);
 		}
+		valid_bytes = read_len - f12->data1_offset;
 	}
 
 	if (f12->data1)
@@ -470,6 +475,9 @@ static int rmi_f12_probe(struct rmi_function *fn)
 		sensor->nbr_fingers = item->num_subpackets;
 		sensor->report_abs = 1;
 		sensor->attn_size += item->reg_size;
+		dev_info(&fn->dev, "F12 pkt_size=%d, reading data1 only (%u+%lu=%lu bytes)\n",
+			 sensor->pkt_size, f12->data1_offset, item->reg_size,
+			 f12->data1_offset + item->reg_size);
 	}
 
 	item = rmi_get_register_desc_item(&f12->data_reg_desc, 2);

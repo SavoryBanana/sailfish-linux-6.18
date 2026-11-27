@@ -4,14 +4,17 @@
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <dt-bindings/sound/qcom,q6afe.h>
 #include <sound/soc.h>
 #include <sound/soc-dapm.h>
 #include <sound/pcm.h>
 #include "common.h"
+#include "qdsp6/q6afe.h"
 
 #define SLIM_MAX_TX_PORTS 16
 #define SLIM_MAX_RX_PORTS 16
 #define WCD9335_DEFAULT_MCLK_RATE	9600000
+#define MI2S_BCLK_RATE			1536000
 
 static int apq8096_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 				      struct snd_pcm_hw_params *params)
@@ -60,7 +63,36 @@ end:
 	return ret;
 }
 
+static int apq8096_snd_startup(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+
+	if (cpu_dai->id == QUATERNARY_MI2S_RX) {
+		snd_soc_dai_set_sysclk(cpu_dai,
+				       Q6AFE_LPASS_CLK_ID_QUAD_MI2S_IBIT,
+				       MI2S_BCLK_RATE,
+				       SNDRV_PCM_STREAM_PLAYBACK);
+		snd_soc_dai_set_fmt(cpu_dai, SND_SOC_DAIFMT_BP_FP);
+	}
+	return 0;
+}
+
+static void apq8096_snd_shutdown(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+
+	if (cpu_dai->id == QUATERNARY_MI2S_RX) {
+		snd_soc_dai_set_sysclk(cpu_dai,
+				       Q6AFE_LPASS_CLK_ID_QUAD_MI2S_IBIT,
+				       0, SNDRV_PCM_STREAM_PLAYBACK);
+	}
+}
+
 static const struct snd_soc_ops apq8096_ops = {
+	.startup = apq8096_snd_startup,
+	.shutdown = apq8096_snd_shutdown,
 	.hw_params = msm_snd_hw_params,
 };
 

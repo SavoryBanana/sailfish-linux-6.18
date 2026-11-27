@@ -26,6 +26,7 @@ enum {
     ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
 
 /* Standard Android native_handle_t header */
+#ifndef NATIVE_HANDLE_H_
 typedef struct native_handle {
     int version; /* sizeof(native_handle_t) */
     int numFds;
@@ -34,6 +35,7 @@ typedef struct native_handle {
 } native_handle_t;
 
 typedef const native_handle_t *buffer_handle_t;
+#endif
 
 /*
  * Sailfish Gralloc 5 native handle payload layout:

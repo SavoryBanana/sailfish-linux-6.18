@@ -13,6 +13,9 @@
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
+#include <dt-bindings/sound/qcom,q6afe.h>
+#include <dt-bindings/sound/qcom,q6asm.h>
+#include <dt-bindings/sound/qcom,wcd9335.h>
 #include <dt-bindings/thermal/thermal.h>
 
 / {
@@ -111,13 +114,15 @@
 
 	gpio-keys {
 		compatible = "gpio-keys";
+		pinctrl-names = "default";
+		pinctrl-0 = <&vol_up_default>;
 
 		key-vol-up {
 			label = "Volume Up";
-			gpios = <&pm8994_gpios 2 GPIO_ACTIVE_LOW>;
+			gpios = <&tlmm 126 GPIO_ACTIVE_LOW>;
 			linux,code = <KEY_VOLUMEUP>;
 			wakeup-source;
-			debounce-interval = <15>;
+			debounce-interval = <20>;
 		};
 	};
 
@@ -347,7 +352,7 @@
 
 		rmi4-f01@1 {
 			reg = <0x01>;
-			syna,nosleep-mode = <1>;
+			syna,nosleep-mode = <2>;
 		};
 
 		rmi4-f12@12 {
@@ -421,7 +426,7 @@
 };
 
 &slimbam {
-	status = "disabled";
+	status = "okay";
 };
 
 &mdp_smmu {
@@ -557,7 +562,7 @@
 };
 
 &lpass_q6_smmu {
-	status = "disabled";
+	status = "okay";
 };
 
 &cryptobam {
@@ -935,6 +940,12 @@
 		qcom,drive-strength = <PMIC_GPIO_STRENGTH_LOW>;
 		power-source = <PM8994_GPIO_S4>;
 	};
+
+	audio_mclk: divclk1-state {
+		pins = "gpio15";
+		function = PMIC_GPIO_FUNC_FUNC1;
+		power-source = <PM8994_GPIO_S4>;
+	};
 };
 
 &pcie_phy {
@@ -987,6 +998,205 @@
 		interconnect-names = "memory", "imem";
 		dmas = <&ipa_bam 2>, <&ipa_bam 3>, <&ipa_bam 4>, <&ipa_bam 5>;
 		dma-names = "ap_lan_rx", "cmd_tx", "ap_modem_tx", "ap_modem_rx";
+	};
+};
+
+/ {
+	div1_mclk: div1-clk {
+		compatible = "gpio-gate-clock";
+		pinctrl-names = "default";
+		pinctrl-0 = <&audio_mclk>;
+		#clock-cells = <0>;
+		clocks = <&rpmcc RPM_SMD_DIV_CLK1>;
+		enable-gpios = <&pm8994_gpios 15 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&adsp_pil {
+	status = "okay";
+};
+
+&q6asmdai {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	dai@0 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA1>;
+	};
+
+	dai@1 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA2>;
+	};
+
+	dai@2 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA3>;
+	};
+};
+
+&blsp2_i2c1 {
+	/delete-property/ dmas;
+	/delete-property/ dma-names;
+	clock-frequency = <400000>;
+	status = "okay";
+
+	tfa9891_amp: audio-codec@34 {
+		compatible = "nxp,tfa9891";
+		reg = <0x34>;
+		vddd-supply = <&vreg_s4a_1p8>;
+		reset-gpios = <&pm8994_gpios 5 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+	};
+};
+
+&q6afedai {
+	dai@22 {
+		reg = <QUATERNARY_MI2S_RX>;
+		qcom,sd-lines = <1>;
+	};
+};
+
+&slim_msm {
+	status = "okay";
+
+	slim@1 {
+		reg = <1>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		tasha_ifd: tas-ifd@0,0 {
+			compatible = "slim217,1a0";
+			reg = <0 0>;
+		};
+
+		wcd9335: codec@1,0 {
+			compatible = "slim217,1a0";
+			reg = <1 0>;
+
+			clock-names = "mclk", "slimbus";
+			clocks = <&div1_mclk>,
+				 <&rpmcc RPM_SMD_BB_CLK1>;
+			interrupt-parent = <&tlmm>;
+			interrupts = <54 IRQ_TYPE_LEVEL_HIGH>,
+				     <53 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "intr1", "intr2";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+
+			pinctrl-0 = <&cdc_reset_active &wcd_intr_default>;
+			pinctrl-names = "default";
+
+			reset-gpios = <&tlmm 64 GPIO_ACTIVE_LOW>;
+			slim-ifc-dev = <&tasha_ifd>;
+
+			#sound-dai-cells = <1>;
+
+			vdd-buck-supply = <&vreg_s4a_1p8>;
+			vdd-buck-sido-supply = <&vreg_s4a_1p8>;
+			vdd-tx-supply = <&vreg_s4a_1p8>;
+			vdd-rx-supply = <&vreg_s4a_1p8>;
+			vdd-io-supply = <&vreg_s4a_1p8>;
+		};
+	};
+};
+
+&sound {
+	compatible = "qcom,apq8096-sndcard";
+	model = "Pixel Sailfish";
+	pinctrl-names = "default";
+	pinctrl-0 = <&quat_mi2s_active>;
+	audio-routing = "RX_BIAS", "MCLK";
+
+	mm1-dai-link {
+		link-name = "MultiMedia1";
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA1>;
+		};
+	};
+
+	mm2-dai-link {
+		link-name = "MultiMedia2";
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA2>;
+		};
+	};
+
+	mm3-dai-link {
+		link-name = "MultiMedia3";
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA3>;
+		};
+	};
+
+	slim-dai-link {
+		link-name = "SLIM Playback";
+		cpu {
+			sound-dai = <&q6afedai SLIMBUS_6_RX>;
+		};
+		platform {
+			sound-dai = <&q6routing>;
+		};
+		codec {
+			sound-dai = <&wcd9335 AIF4_PB>;
+		};
+	};
+
+	slimcap-dai-link {
+		link-name = "SLIM Capture";
+		cpu {
+			sound-dai = <&q6afedai SLIMBUS_0_TX>;
+		};
+		platform {
+			sound-dai = <&q6routing>;
+		};
+		codec {
+			sound-dai = <&wcd9335 AIF1_CAP>;
+		};
+	};
+
+	speaker-dai-link {
+		link-name = "Speaker";
+		cpu {
+			sound-dai = <&q6afedai QUATERNARY_MI2S_RX>;
+		};
+		platform {
+			sound-dai = <&q6routing>;
+		};
+		codec {
+			sound-dai = <&tfa9891_amp>;
+		};
+	};
+};
+
+&tlmm {
+	cdc_reset_active: cdc-reset-active-state {
+		pins = "gpio64";
+		function = "gpio";
+		drive-strength = <16>;
+		bias-disable;
+		output-high;
+	};
+
+	wcd_intr_default: wcd-intr-default-state {
+		pins = "gpio53", "gpio54";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		input-enable;
+	};
+
+	vol_up_default: vol-up-default-state {
+		pins = "gpio126";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+		input-enable;
+	};
+
+	quat_mi2s_active: quat-mi2s-active-state {
+		pins = "gpio58", "gpio59", "gpio60", "gpio61";
+		function = "qua_mi2s";
+		drive-strength = <8>;
+		bias-disable;
 	};
 };
 

@@ -48,6 +48,7 @@
 #define TFA989X_CURRENTSENSE4		0x49
 
 #define TFA9890_REVISION		0x80
+#define TFA9891_REVISION		0x92
 #define TFA9895_REVISION		0x12
 #define TFA9897_REVISION		0x97
 
@@ -216,6 +217,11 @@ static const struct tfa989x_rev tfa9890_rev = {
 	.init	= tfa9890_init,
 };
 
+static const struct tfa989x_rev tfa9891_rev = {
+	.rev	= TFA9891_REVISION,
+	.init	= tfa9890_init,
+};
+
 static const struct reg_sequence tfa9895_reg_init[] = {
 	/* some other registers must be set for optimal amplifier behaviour */
 	{ TFA989X_BAT_PROT, 0x13ab },
@@ -345,6 +351,10 @@ static int tfa989x_i2c_probe(struct i2c_client *i2c)
 		tfa989x->rcv_gpiod = devm_gpiod_get_optional(dev, "rcv", GPIOD_OUT_LOW);
 		if (IS_ERR(tfa989x->rcv_gpiod))
 			return PTR_ERR(tfa989x->rcv_gpiod);
+	} else {
+		struct gpio_desc *rst = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
+		if (IS_ERR(rst))
+			return PTR_ERR(rst);
 	}
 
 	regmap = devm_regmap_init_i2c(i2c, &tfa989x_regmap);
@@ -405,6 +415,7 @@ static int tfa989x_i2c_probe(struct i2c_client *i2c)
 
 static const struct of_device_id tfa989x_of_match[] = {
 	{ .compatible = "nxp,tfa9890", .data = &tfa9890_rev },
+	{ .compatible = "nxp,tfa9891", .data = &tfa9891_rev },
 	{ .compatible = "nxp,tfa9895", .data = &tfa9895_rev },
 	{ .compatible = "nxp,tfa9897", .data = &tfa9897_rev },
 	{ }

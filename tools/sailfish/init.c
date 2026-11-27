@@ -1847,12 +1847,12 @@ static void overlay_prop_file(const char *src, const char *tmp, const char *fall
         } else if (append_defaults &&
                    strncmp(line, "ro.surface_flinger.supports_background_blur=",
                            sizeof("ro.surface_flinger.supports_background_blur=") - 1) == 0) {
-            fputs("ro.surface_flinger.supports_background_blur=0\n", out);
+            fputs("ro.surface_flinger.supports_background_blur=1\n", out);
             saw_sf_blur = true;
         } else if (append_defaults &&
                    strncmp(line, "persist.sys.sf.disable_blurs=",
                            sizeof("persist.sys.sf.disable_blurs=") - 1) == 0) {
-            fputs("persist.sys.sf.disable_blurs=1\n", out);
+            fputs("persist.sys.sf.disable_blurs=0\n", out);
             saw_disable_blurs = true;
         } else {
             fputs(line, out);
@@ -1867,9 +1867,26 @@ static void overlay_prop_file(const char *src, const char *tmp, const char *fall
         if (!saw_wifi_iface)
             fputs("wifi.interface=wlan0\n", out);
         if (!saw_sf_blur)
-            fputs("ro.surface_flinger.supports_background_blur=0\n", out);
+            fputs("ro.surface_flinger.supports_background_blur=1\n", out);
         if (!saw_disable_blurs)
-            fputs("persist.sys.sf.disable_blurs=1\n", out);
+            fputs("persist.sys.sf.disable_blurs=0\n", out);
+        /* Enable standard Android 17 Bluetooth profiles (disabled by default on GSI)
+         * and force software A2DP encoding so BT headsets connect without Q6DSP offload */
+        fputs("bluetooth.profile.a2dp.source.enabled=true\n", out);
+        fputs("bluetooth.profile.avrcp.target.enabled=true\n", out);
+        fputs("bluetooth.profile.hfp.ag.enabled=true\n", out);
+        fputs("bluetooth.profile.hid.host.enabled=true\n", out);
+        fputs("bluetooth.profile.hid.device.enabled=true\n", out);
+        fputs("bluetooth.profile.pan.nap.enabled=true\n", out);
+        fputs("bluetooth.profile.pan.panu.enabled=true\n", out);
+        fputs("bluetooth.profile.opp.enabled=true\n", out);
+        fputs("bluetooth.profile.pbap.server.enabled=true\n", out);
+        fputs("bluetooth.profile.map.server.enabled=true\n", out);
+        fputs("bluetooth.profile.gatt.enabled=true\n", out);
+        fputs("bluetooth.profile.bas.client.enabled=true\n", out);
+        fputs("ro.bluetooth.a2dp_offload.supported=false\n", out);
+        fputs("persist.bluetooth.a2dp_offload.disabled=true\n", out);
+        fputs("ro.lockscreen.disable.default=false\n", out);
     }
     fclose(in);
     fclose(out);
@@ -1992,7 +2009,8 @@ static void overlay_usb_configfs_rc(void) {
         "    exec_background - root root -- /system/bin/sh /data/setup_usb_adb.sh ptp_adb ${sys.usb.controller}\n"
         "\n"
         "on property:sys.boot_completed=1\n"
-        "    exec_background - root root -- /system/bin/sh /data/setup_usb_adb.sh init_port ${sys.usb.controller}\n",
+        "    exec_background - root root -- /system/bin/sh /data/setup_usb_adb.sh init_port ${sys.usb.controller}\n"
+        "    exec_background - root root -- /system/bin/cmd lock_settings set-disabled false\n",
         udc_name);
 
     const char *dst_rc = "/mnt/system_a/system/etc/init/hw/init.usb.configfs.rc";
@@ -2693,7 +2711,8 @@ static void stage_oem_modem_firmware(void) {
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         if (strcmp(de->d_name, "mba.mbn") == 0 ||
-            strncmp(de->d_name, "modem.", 6) == 0) {
+            strncmp(de->d_name, "modem.", 6) == 0 ||
+            strncmp(de->d_name, "adsp.", 5) == 0) {
             char src[256], dst[256];
             snprintf(src, sizeof(src), "%s/%s", fw_dir, de->d_name);
             snprintf(dst, sizeof(dst), "/tools/firmware/%s", de->d_name);
@@ -2703,6 +2722,24 @@ static void stage_oem_modem_firmware(void) {
         }
     }
     closedir(d);
+
+    /* Kick any offline remoteproc (e.g. adsp) now that firmware is staged in /tools/firmware */
+    DIR *rd = opendir("/sys/class/remoteproc");
+    if (rd) {
+        struct dirent *rde;
+        while ((rde = readdir(rd)) != NULL) {
+            if (strncmp(rde->d_name, "remoteproc", 10) != 0) continue;
+            char st_path[128], nm_path[128], st_val[32] = {0}, nm_val[64] = {0};
+            snprintf(st_path, sizeof(st_path), "/sys/class/remoteproc/%s/state", rde->d_name);
+            snprintf(nm_path, sizeof(nm_path), "/sys/class/remoteproc/%s/name", rde->d_name);
+            read_first_line(st_path, st_val, sizeof(st_val));
+            read_first_line(nm_path, nm_val, sizeof(nm_val));
+            if (strstr(nm_val, "adsp") && strcmp(st_val, "offline") == 0) {
+                write_str(st_path, "start\n");
+            }
+        }
+        closedir(rd);
+    }
 
     if (kfd >= 0) {
         int len = snprintf(kbuf, sizeof(kbuf),
@@ -2959,7 +2996,6 @@ static bool prepare_android_rootfs(bool for_shell) {
             const char *fallback_label;
         } sys_stubs[] = {
             { "/tools/pause_stub", "/mnt/system_a/system/bin/odsign", "/tmp/odsign_stub", "u:object_r:system_file:s0" },
-            { "/tools/pause_stub", "/mnt/system_a/system/bin/audioserver", "/tmp/audioserver_stub", "u:object_r:audioserver_exec:s0" },
             { "/tools/pause_stub", "/mnt/system_a/system/bin/traced", "/tmp/traced_stub", "u:object_r:traced_exec:s0" },
             { "/tools/pause_stub", "/mnt/system_a/system/bin/traced_probes", "/tmp/traced_probes_stub", "u:object_r:traced_probes_exec:s0" },
             { "/tools/vdc_stub", "/mnt/system_a/system/bin/flags_health_check", "/tmp/flags_health_check_stub", "u:object_r:system_file:s0" },
@@ -3234,8 +3270,8 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    setprop debug.gralloc.gfx_ubwc_disable 1\n"
         "    setprop debug.gralloc.enable_fb_ubwc 0\n"
         "    setprop service.sf.prime_shader_cache 0\n"
-        "    setprop ro.surface_flinger.supports_background_blur 0\n"
-        "    setprop persist.sys.sf.disable_blurs 1\n"
+        "    setprop ro.surface_flinger.supports_background_blur 1\n"
+        "    setprop persist.sys.sf.disable_blurs 0\n"
         "%s"
         "    copy /data/ld.config.sailfish.txt /linkerconfig/ld.config.txt\n"
         "    chmod 0644 /linkerconfig/ld.config.txt\n"
@@ -3439,6 +3475,22 @@ static bool prepare_android_rootfs(bool for_shell) {
         "    class hal\n"
         "    user root\n"
         "    group graphics drmrpc system\n"
+        "\n"
+        "service sailfish_audio_aidl /system/bin/android.hardware.audio.service-aidl.sailfish\n"
+        "    interface aidl android.hardware.audio.core.IConfig/default\n"
+        "    interface aidl android.hardware.audio.core.IModule/default\n"
+        "    interface aidl android.hardware.audio.core.IModule/a2dp\n"
+        "    interface aidl android.hardware.audio.effect.IFactory/default\n"
+        "    interface aidl android.hardware.bluetooth.audio.IBluetoothAudioProviderFactory/default\n"
+        "    class hal\n"
+        "    user root\n"
+        "    group audio system\n"
+        "\n"
+        "service sailfish_hostapd_aidl /system/bin/android.hardware.wifi.hostapd-service.sailfish\n"
+        "    interface aidl android.hardware.wifi.hostapd.IHostapd/default\n"
+        "    class hal\n"
+        "    user root\n"
+        "    group wifi net_raw net_admin inet\n"
         "\n"
         "service sailfish_power_aidl /system/bin/android.hardware.power-service.sailfish\n"
         "    interface aidl android.hardware.power.IPower/default\n"
@@ -3652,19 +3704,52 @@ static bool prepare_android_rootfs(bool for_shell) {
             bind_mount_clean("/tmp/composer_hal", dst);
         }
     }
+    if (access("/tools/audio_hal", F_OK) == 0) {
+        const char *dst = "/mnt/system_a/system/bin/android.hardware.audio.service-aidl.sailfish";
+        umount_all(dst);
+        unlink(dst);
+        if (copy_file("/tools/audio_hal", dst)) {
+            chmod(dst, 0755);
+            set_selinux_label(dst, "u:object_r:hal_audio_default_exec:s0");
+            usb_write("[+] Automated: Installed native ALSA AIDL Audio HAL service\n");
+        } else if (copy_file("/tools/audio_hal", "/tmp/audio_hal")) {
+            chmod("/tmp/audio_hal", 0755);
+            set_selinux_label("/tmp/audio_hal", "u:object_r:hal_audio_default_exec:s0");
+            int fd = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0755);
+            if (fd >= 0) close(fd);
+            bind_mount_clean("/tmp/audio_hal", dst);
+        }
+    }
+    if (access("/tools/hostapd_hal", F_OK) == 0) {
+        const char *dst = "/mnt/system_a/system/bin/android.hardware.wifi.hostapd-service.sailfish";
+        umount_all(dst);
+        unlink(dst);
+        if (copy_file("/tools/hostapd_hal", dst)) {
+            chmod(dst, 0755);
+            set_selinux_label(dst, "u:object_r:hal_wifi_hostapd_default_exec:s0");
+            usb_write("[+] Automated: Installed native AIDL IHostapd HAL service\n");
+        } else if (copy_file("/tools/hostapd_hal", "/tmp/hostapd_hal")) {
+            chmod("/tmp/hostapd_hal", 0755);
+            set_selinux_label("/tmp/hostapd_hal", "u:object_r:hal_wifi_hostapd_default_exec:s0");
+            int fd = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0755);
+            if (fd >= 0) close(fd);
+            bind_mount_clean("/tmp/hostapd_hal", dst);
+        }
+    }
     /* Overlay read-only /vendor/lib64/hw and /vendor/lib/hw with tmpfs so mapper.sailfish.so
      * is visible to sphal/AServiceManager_openDeclaredPassthroughHal, while omitting legacy
      * QCOM gralloc.msm8996.so so Mesa Freedreno cleanly uses u_gralloc_fallback. */
     struct {
         const char *src_mapper;
+        const char *src_gralloc;
         const char *tmp_dir;
         const char *vendor_hw;
         const char *sys_hw;
         const char *tag;
     } mapper_overlays[] = {
-        { "/tools/mapper.sailfish.so",    "/vendor_hw64",
+        { "/tools/mapper.sailfish.so",    "/tools/gralloc.default.so",    "/vendor_hw64",
           "/mnt/system_a/vendor/lib64/hw", "/mnt/system_a/system/lib64/hw/mapper.sailfish.so", "64-bit" },
-        { "/tools/mapper.sailfish.so.32", "/vendor_hw32",
+        { "/tools/mapper.sailfish.so.32", "/tools/gralloc.default.so.32", "/vendor_hw32",
           "/mnt/system_a/vendor/lib/hw",   "/mnt/system_a/system/lib/hw/mapper.sailfish.so",   "32-bit" },
     };
     for (int m = 0; m < 2; m++) {
@@ -3708,6 +3793,14 @@ static bool prepare_android_rootfs(bool for_shell) {
             if (copy_file(mapper_overlays[m].src_mapper, mdst)) {
                 chmod(mdst, 0644);
                 set_selinux_label(mdst, "u:object_r:same_process_hal_file:s0");
+            }
+            if (access(mapper_overlays[m].src_gralloc, F_OK) == 0) {
+                char gdst[512];
+                snprintf(gdst, sizeof(gdst), "%s/gralloc.default.so", mapper_overlays[m].tmp_dir);
+                if (copy_file(mapper_overlays[m].src_gralloc, gdst)) {
+                    chmod(gdst, 0644);
+                    set_selinux_label(gdst, "u:object_r:same_process_hal_file:s0");
+                }
             }
             if (bind_mount_clean(mapper_overlays[m].tmp_dir, mapper_overlays[m].vendor_hw) == 0) {
                 char msg[192];
@@ -3957,6 +4050,28 @@ static bool prepare_android_rootfs(bool for_shell) {
             "        <name>android.hardware.graphics.composer3</name>\n"
             "        <version>1</version>\n"
             "        <fqname>IComposer/default</fqname>\n"
+            "    </hal>\n"
+            "    <hal format=\"aidl\">\n"
+            "        <name>android.hardware.audio.core</name>\n"
+            "        <version>5</version>\n"
+            "        <fqname>IConfig/default</fqname>\n"
+            "        <fqname>IModule/default</fqname>\n"
+            "        <fqname>IModule/a2dp</fqname>\n"
+            "    </hal>\n"
+            "    <hal format=\"aidl\">\n"
+            "        <name>android.hardware.bluetooth.audio</name>\n"
+            "        <version>2</version>\n"
+            "        <fqname>IBluetoothAudioProviderFactory/default</fqname>\n"
+            "    </hal>\n"
+            "    <hal format=\"aidl\">\n"
+            "        <name>android.hardware.audio.effect</name>\n"
+            "        <version>5</version>\n"
+            "        <fqname>IFactory/default</fqname>\n"
+            "    </hal>\n"
+            "    <hal format=\"aidl\">\n"
+            "        <name>android.hardware.wifi.hostapd</name>\n"
+            "        <version>1</version>\n"
+            "        <fqname>IHostapd/default</fqname>\n"
             "    </hal>\n"
             "    <hal format=\"hidl\">\n"
             "        <name>android.hardware.health</name>\n"
@@ -4330,26 +4445,14 @@ static bool prepare_android_rootfs(bool for_shell) {
     /* Stock Android 17 /system/lib64/libui.so runs unmodified with Gralloc 5 (IAllocator V2 + IMapper5). */
     umount_all("/mnt/system_a/system/lib64/libui.so");
 
-    /* Automated: Short-circuit AudioSystem/mediautils service wait stubs so StartAudioService
-     * returns in 0ms instead of starving system_server for 75s+ Watchdog timeouts, and skip
-     * synchronous binderDied() in registerSoundTriggerCaptureStateListener (0x5f2e0 -> 0x5f4d8)
-     * so ExternalCaptureStateTracker does not spin-loop at 85%+ CPU across system_server/logd. */
-    static const unsigned char audiobase_ret_null[12] = {
-        0x5f, 0x24, 0x03, 0xd5, /* bti c */
-        0x1f, 0x01, 0x00, 0xf9, /* str xzr, [x8] */
-        0xc0, 0x03, 0x5f, 0xd6  /* ret */
-    };
+    /* Automated: Skip synchronous binderDied() in registerSoundTriggerCaptureStateListener
+     * (0x5f2e0 -> 0x5f4d8) so ExternalCaptureStateTracker does not spin-loop when SoundTrigger
+     * is absent, while keeping all AudioSystem/audioserver binder paths stock for AIDL Audio HAL. */
     static const unsigned char audiobase_skip_capture_die[4] = {
         0x7e, 0x00, 0x00, 0x14  /* b 0x5f4d8 (return 0 without binderDied) */
     };
     const struct bin_patch audiobase_patches[] = {
-        { 0x3c7a0, audiobase_ret_null, sizeof(audiobase_ret_null) },
-        { 0x3c7ac, audiobase_ret_null, sizeof(audiobase_ret_null) },
-        { 0x42da0, audiobase_ret_null, sizeof(audiobase_ret_null) },
-        { 0x42dac, audiobase_ret_null, sizeof(audiobase_ret_null) },
         { 0x5f2e0, audiobase_skip_capture_die, sizeof(audiobase_skip_capture_die) },
-        { 0x63f04, audiobase_ret_null, sizeof(audiobase_ret_null) },
-        { 0x6afa0, audiobase_ret_null, sizeof(audiobase_ret_null) },
     };
     patch_and_bind_lib(
         "/mnt/system_a/system/lib64/libaudiobase.so", "/tmp/libaudiobase.so",

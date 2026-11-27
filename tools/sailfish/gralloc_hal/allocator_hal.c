@@ -240,6 +240,7 @@ static bool compute_layout(const buf_desc_info_t *d, sailfish_gralloc_ints_t *ou
 
     uint32_t stride_px;
     uint32_t stride_bytes;
+    uint32_t h_gpu_aligned = ((uint32_t)d->height + 31U) & ~31U;
     uint64_t total_size;
 
     if (resolved == HAL_FMT_BLOB) {
@@ -250,13 +251,13 @@ static bool compute_layout(const buf_desc_info_t *d, sailfish_gralloc_ints_t *ou
                resolved == HAL_FMT_YV12) {
         stride_px = ((uint32_t)d->width + 63U) & ~63U;
         stride_bytes = stride_px;
-        uint32_t h_aligned = ((uint32_t)d->height + 1U) & ~1U;
-        total_size = ((uint64_t)stride_bytes * h_aligned * 3ULL / 2ULL) * layers;
+        /* Pad allocation to 32-row aligned height + guard page for Adreno 530 GMEM tiles */
+        total_size = ((uint64_t)stride_bytes * h_gpu_aligned * 3ULL / 2ULL) * layers + 4096ULL;
     } else {
-        /* 64-pixel alignment matches Mesa Freedreno u_gralloc_fallback (FD530 gmem_align_w=64) */
+        /* 64-pixel pitch + 32-row height alignment for Adreno 530 (FD530) GMEM tiles */
         stride_px = ((uint32_t)d->width + 63U) & ~63U;
         stride_bytes = stride_px * bpp;
-        total_size = (uint64_t)stride_bytes * (uint64_t)d->height * layers;
+        total_size = (uint64_t)stride_bytes * (uint64_t)h_gpu_aligned * layers + 4096ULL;
     }
 
     total_size = (total_size + 4095ULL) & ~4095ULL;
