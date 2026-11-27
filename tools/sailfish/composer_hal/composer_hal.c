@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -366,6 +367,29 @@ struct drm_mode_closefb { uint32_t fb_id, pad; };
 #define DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD   _IOWR('d', 0xC1, struct drm_syncobj_handle)
 #define DRM_IOCTL_MODE_CLOSEFB           _IOWR('d', 0xD0, struct drm_mode_closefb)
 
+struct drm_wait_vblank_request {
+    uint32_t type;
+    uint32_t sequence;
+    unsigned long signal;
+};
+
+struct drm_wait_vblank_reply {
+    uint32_t type;
+    uint32_t sequence;
+    long tval_sec;
+    long tval_usec;
+};
+
+union drm_wait_vblank {
+    struct drm_wait_vblank_request request;
+    struct drm_wait_vblank_reply reply;
+};
+
+#define DRM_VBLANK_RELATIVE        0x00000001U
+#define DRM_VBLANK_HIGH_CRTC_SHIFT 1U
+#define DRM_VBLANK_SECONDARY       0x20000000U
+#define DRM_IOCTL_WAIT_VBLANK      _IOWR('d', 0x3a, union drm_wait_vblank)
+
 #define MAX_CLIENT_SLOTS 32
 #define MAX_LAYERS       128
 
@@ -386,7 +410,7 @@ static struct {
     pthread_mutex_t lock;
     int card_fd;
     uint32_t conn_id, prop_conn_crtc_id;
-    uint32_t crtc_id, prop_crtc_active, prop_crtc_mode_id, prop_crtc_out_fence_ptr;
+    uint32_t crtc_id, crtc_index, prop_crtc_active, prop_crtc_mode_id, prop_crtc_out_fence_ptr;
     uint32_t mode_blob_id;
     uint32_t plane_id;
     uint32_t p_fb, p_crtc, p_sx, p_sy, p_sw, p_sh, p_cx, p_cy, p_cw, p_ch, p_infence;
@@ -562,6 +586,7 @@ static bool drm_init_locked(void) {
     g_disp.conn_id = chosen_conn;
     g_disp.prop_conn_crtc_id = drm_find_prop(fd, chosen_conn, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID", NULL);
     g_disp.crtc_id = chosen_crtc;
+    g_disp.crtc_index = crtc_idx;
     g_disp.prop_crtc_active = drm_find_prop(fd, chosen_crtc, DRM_MODE_OBJECT_CRTC, "ACTIVE", NULL);
     g_disp.prop_crtc_mode_id = drm_find_prop(fd, chosen_crtc, DRM_MODE_OBJECT_CRTC, "MODE_ID", NULL);
     g_disp.prop_crtc_out_fence_ptr = drm_find_prop(fd, chosen_crtc, DRM_MODE_OBJECT_CRTC, "OUT_FENCE_PTR", NULL);
@@ -772,13 +797,6 @@ static int drm_commit_present_locked(int slot, int acquire_fence) {
     if (g_disp.p_infence && acquire_fence >= 0)
         areq_add_prop(&req, g_disp.p_infence, (uint64_t)(int64_t)acquire_fence);
 
-    if (g_disp.prev_out_fence >= 0) {
-        struct pollfd pfd = { .fd = g_disp.prev_out_fence, .events = POLLIN };
-        (void)poll(&pfd, 1, 100);
-        close(g_disp.prev_out_fence);
-        g_disp.prev_out_fence = -1;
-    }
-
     if (!g_disp.p_infence && acquire_fence >= 0) {
         struct pollfd pfd = { .fd = acquire_fence, .events = POLLIN };
         (void)poll(&pfd, 1, 500);
@@ -797,8 +815,17 @@ static int drm_commit_present_locked(int slot, int acquire_fence) {
 
     int ret = ioctl(g_disp.card_fd, DRM_IOCTL_MODE_ATOMIC, &ma);
     if (ret < 0 && errno == EBUSY) {
-        ma.flags = 0;
-        ret = ioctl(g_disp.card_fd, DRM_IOCTL_MODE_ATOMIC, &ma);
+        if (g_disp.prev_out_fence >= 0) {
+            struct pollfd pfd = { .fd = g_disp.prev_out_fence, .events = POLLIN };
+            (void)poll(&pfd, 1, 35);
+            close(g_disp.prev_out_fence);
+            g_disp.prev_out_fence = -1;
+            ret = ioctl(g_disp.card_fd, DRM_IOCTL_MODE_ATOMIC, &ma);
+        }
+        if (ret < 0 && errno == EBUSY) {
+            ma.flags = 0;
+            ret = ioctl(g_disp.card_fd, DRM_IOCTL_MODE_ATOMIC, &ma);
+        }
     }
     if (ret < 0 && !g_disp.need_modeset) {
         ma.flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
@@ -809,6 +836,10 @@ static int drm_commit_present_locked(int slot, int acquire_fence) {
         close(acquire_fence);
 
     if (ret == 0) {
+        if (g_disp.prev_out_fence >= 0) {
+            close(g_disp.prev_out_fence);
+            g_disp.prev_out_fence = -1;
+        }
         if (g_disp.need_modeset) {
             set_backlight_sysfs(0, g_last_brightness);
             g_disp.need_modeset = false;
@@ -909,12 +940,19 @@ static void send_on_vsync(AIBinder *cb, int64_t display, int64_t ts_ns, int32_t 
 
 static void *vsync_thread_fn(void *arg) {
     (void)arg;
+    struct sched_param sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.sched_priority = 2;
+    (void)pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
     struct timespec next_ts;
+    bool hw_vblank_logged = false;
     clock_gettime(CLOCK_MONOTONIC, &next_ts);
     for (;;) {
         pthread_mutex_lock(&g_disp.lock);
         bool en = g_disp.vsync_enabled && g_disp.crtc_active && g_disp.callback != NULL;
         int32_t period = g_disp.vsync_period_ns;
+        int card_fd = g_disp.card_fd;
+        uint32_t crtc_idx = g_disp.crtc_index;
         AIBinder *cb = g_disp.callback;
         if (cb) g_ndk.incStrong(cb);
         pthread_mutex_unlock(&g_disp.lock);
@@ -927,13 +965,40 @@ static void *vsync_thread_fn(void *arg) {
             continue;
         }
 
-        next_ts.tv_nsec += period;
-        while (next_ts.tv_nsec >= 1000000000L) {
-            next_ts.tv_nsec -= 1000000000L;
-            next_ts.tv_sec += 1;
+        int64_t now_ns = 0;
+        bool got_hw = false;
+        if (card_fd >= 0) {
+            union drm_wait_vblank vbl;
+            memset(&vbl, 0, sizeof(vbl));
+            vbl.request.type = DRM_VBLANK_RELATIVE;
+            if (crtc_idx == 1)
+                vbl.request.type |= DRM_VBLANK_SECONDARY;
+            else if (crtc_idx > 1)
+                vbl.request.type |= (crtc_idx << DRM_VBLANK_HIGH_CRTC_SHIFT);
+            vbl.request.sequence = 1;
+            if (ioctl(card_fd, DRM_IOCTL_WAIT_VBLANK, &vbl) == 0) {
+                now_ns = (int64_t)vbl.reply.tval_sec * 1000000000LL +
+                         (int64_t)vbl.reply.tval_usec * 1000LL;
+                got_hw = true;
+                if (!hw_vblank_logged) {
+                    hw_vblank_logged = true;
+                    kmsg_log("<6>sailfish_composer_hal: hardware DRM VBLANK VSYNC active\n");
+                }
+            }
         }
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_ts, NULL);
-        int64_t now_ns = (int64_t)next_ts.tv_sec * 1000000000LL + next_ts.tv_nsec;
+
+        if (!got_hw) {
+            next_ts.tv_nsec += period;
+            while (next_ts.tv_nsec >= 1000000000L) {
+                next_ts.tv_nsec -= 1000000000L;
+                next_ts.tv_sec += 1;
+            }
+            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_ts, NULL);
+            now_ns = (int64_t)next_ts.tv_sec * 1000000000LL + next_ts.tv_nsec;
+        } else {
+            clock_gettime(CLOCK_MONOTONIC, &next_ts);
+        }
+
         send_on_vsync(cb, PRIMARY_DISPLAY_ID, now_ns, period);
         g_ndk.decStrong(cb);
     }

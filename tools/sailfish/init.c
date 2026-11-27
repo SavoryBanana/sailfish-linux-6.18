@@ -3494,7 +3494,7 @@ static bool prepare_android_rootfs(bool for_shell) {
         "service sailfish_power_aidl /system/bin/android.hardware.power-service.sailfish\n"
         "    interface aidl android.hardware.power.IPower/default\n"
         "    class hal\n"
-        "    user system\n"
+        "    user root\n"
         "    group system\n"
         "\n"
         "service sailfish_sensors_aidl /system/bin/android.hardware.sensors-service.sailfish\n"
@@ -5529,6 +5529,13 @@ static void boot_android_init(const char *stage) {
             if (g_ttygs_fd >= 0) {
                 dup2(g_ttygs_fd, 1);
                 dup2(g_ttygs_fd, 2);
+            }
+
+            /* Make Android's / (system_a) mount read-only so artd/dex2oat
+             * places AOT artifacts for /system APKs in /data/dalvik-cache
+             * instead of failing with ENOSPC trying to write /system/.../oat. */
+            if (mount(NULL, "/", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) != 0) {
+                mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL);
             }
 
             char *argv_stage[] = { (char *)"/system/bin/init", (char *)stage, NULL };
